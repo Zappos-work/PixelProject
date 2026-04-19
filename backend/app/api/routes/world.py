@@ -1,8 +1,25 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.db.session import get_db
-from app.schemas.world import WorldOverview
+from app.modules.auth.service import resolve_authenticated_user
+from app.schemas.world import (
+    PixelClaimRequest,
+    PixelClaimResponse,
+    PixelColor,
+    PixelPaintRequest,
+    PixelPaintResponse,
+    WorldOverview,
+    WorldPixelWindow,
+)
+from app.services.pixels import (
+    PIXEL_PALETTE,
+    PixelPlacementError,
+    claim_world_pixel,
+    get_visible_world_pixels,
+    paint_world_pixel,
+)
 from app.services.world import get_world_overview
 
 router = APIRouter()
@@ -12,3 +29,54 @@ router = APIRouter()
 async def world_overview(session: AsyncSession = Depends(get_db)) -> WorldOverview:
     return await get_world_overview(session)
 
+
+@router.get("/palette", response_model=list[PixelColor])
+async def world_palette() -> list[PixelColor]:
+    return [PixelColor.model_validate(color) for color in PIXEL_PALETTE]
+
+
+@router.get("/pixels", response_model=WorldPixelWindow)
+async def world_pixels(
+    min_x: int = Query(...),
+    max_x: int = Query(...),
+    min_y: int = Query(...),
+    max_y: int = Query(...),
+    session: AsyncSession = Depends(get_db),
+) -> WorldPixelWindow:
+    return await get_visible_world_pixels(session, min_x, max_x, min_y, max_y)
+
+
+@router.post("/claims", response_model=PixelClaimResponse)
+async def claim_pixel(
+    payload: PixelClaimRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> PixelClaimResponse:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, session, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    try:
+        return await claim_world_pixel(session, user, payload.x, payload.y, settings)
+    except PixelPlacementError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+
+@router.post("/pixels", response_model=PixelPaintResponse)
+async def paint_pixel(
+    payload: PixelPaintRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> PixelPaintResponse:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, session, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    try:
+        return await paint_world_pixel(session, user, payload.x, payload.y, payload.color_id, settings)
+    except PixelPlacementError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error

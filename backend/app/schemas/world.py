@@ -3,6 +3,8 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from app.schemas.auth import AuthUserSummary
+
 
 class Point(BaseModel):
     x: int
@@ -54,3 +56,54 @@ class WorldOverview(BaseModel):
     bounds: WorldBounds
     chunks: list[WorldChunkSummary]
     landmarks: list[WorldLandmark]
+
+
+class PixelColor(BaseModel):
+    id: int
+    hex: str
+    name: str
+
+
+class WorldPixelSummary(BaseModel):
+    id: UUID
+    x: int
+    y: int
+    chunk_x: int
+    chunk_y: int
+    color_id: int | None
+    owner_user_id: UUID | None
+    owner_public_id: int | None
+    owner_display_name: str | None
+    is_starter: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorldPixelWindow(BaseModel):
+    min_x: int
+    max_x: int
+    min_y: int
+    max_y: int
+    truncated: bool
+    pixels: list[WorldPixelSummary]
+
+
+class PixelClaimRequest(BaseModel):
+    x: int
+    y: int
+
+
+class PixelClaimResponse(BaseModel):
+    pixel: WorldPixelSummary
+    user: AuthUserSummary
+
+
+class PixelPaintRequest(BaseModel):
+    x: int
+    y: int
+    color_id: int
+
+
+class PixelPaintResponse(BaseModel):
+    pixel: WorldPixelSummary
+    user: AuthUserSummary

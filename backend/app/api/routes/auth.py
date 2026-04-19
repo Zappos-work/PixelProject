@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.db.session import get_db
 from app.modules.auth.service import (
+    AvatarUploadError,
     DisplayNameUpdateError,
     GoogleOAuthError,
     append_query_parameter,
@@ -18,6 +19,7 @@ from app.modules.auth.service import (
     normalize_frontend_redirect_url,
     resolve_authenticated_user,
     update_user_display_name,
+    upload_user_avatar,
     upsert_google_user,
 )
 from app.schemas.auth import AuthSessionStatus, AuthUserSummary, LogoutResponse, UpdateDisplayNameRequest
@@ -30,6 +32,17 @@ async def get_auth_session(request: Request, db: AsyncSession = Depends(get_db))
     settings = get_settings()
     user = await resolve_authenticated_user(request, db, settings)
     return build_auth_status(user, settings)
+
+
+@router.get("/me", response_model=AuthUserSummary)
+async def get_current_user(request: Request, db: AsyncSession = Depends(get_db)) -> AuthUserSummary:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, db, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    return build_auth_user_summary(user, settings)
 
 
 @router.get("/google/login")
@@ -80,14 +93,15 @@ async def finish_google_login(request: Request, db: AsyncSession = Depends(get_d
 
     try:
         profile = await exchange_google_code_for_profile(code, settings)
-        user = await upsert_google_user(db, profile, settings)
+        user, is_new_user = await upsert_google_user(db, profile, settings)
     except GoogleOAuthError:
         return RedirectResponse(
             append_query_parameter(next_url, "auth", "error:google"),
             status_code=302,
         )
 
-    response = RedirectResponse(append_query_parameter(next_url, "auth", "success"), status_code=302)
+    redirect_url = append_query_parameter(next_url, "auth", "welcome-name" if is_new_user else "success")
+    response = RedirectResponse(redirect_url, status_code=302)
     await attach_user_session(response, db, user, request, settings)
     return response
 
@@ -117,4 +131,27 @@ async def patch_display_name(
     except DisplayNameUpdateError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 
-    return build_auth_user_summary(updated_user)
+    return build_auth_user_summary(updated_user, settings)
+
+
+@router.post("/profile/avatar-upload", response_model=AuthUserSummary)
+async def post_avatar_upload(
+    request: Request,
+    avatar: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+) -> AuthUserSummary:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, db, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    try:
+        contents = await avatar.read()
+        updated_user = await upload_user_avatar(db, user, avatar.filename, avatar.content_type, contents)
+    except AvatarUploadError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+    finally:
+        await avatar.close()
+
+    return build_auth_user_summary(updated_user, settings)

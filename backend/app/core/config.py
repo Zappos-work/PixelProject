@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     auth_cookie_secure: bool = False
     holder_start_amount: int = 128
     holder_start_limit: int = 1000
+    holder_regeneration_interval_seconds: int = 10
+    level_up_holders_step: int = 256
     world_origin_x: int = 0
     world_origin_y: int = 0
     world_chunk_size: int = 5000

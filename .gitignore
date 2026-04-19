@@ -8,6 +8,7 @@ Thumbs.db
 frontend/.next/
 frontend/node_modules/
 frontend/npm-debug.log*
+frontend/tsconfig.tsbuildinfo
 
 backend/.pytest_cache/
 backend/.mypy_cache/

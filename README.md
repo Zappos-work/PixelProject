@@ -671,3 +671,4 @@ The ongoing implementation status is tracked in:
 - `README.md` for the main product and architecture vision
 - `docs/project-foundation.md` for confirmed technical decisions
 - `docs/project-status.md` for the current local implementation snapshot
+- `docs/changelog.md` for release-by-release change tracking
