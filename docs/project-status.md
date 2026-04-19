@@ -14,7 +14,9 @@ Last updated: 2026-04-19
 - Monorepo-style project structure with dedicated `frontend`, `backend`, and `docs` folders.
 - FastAPI foundation with health endpoint and world overview endpoint.
 - World bootstrap that seeds a visible starter chunk ring around the origin.
-- First frontend world preview with draggable and zoomable chunk map.
+- Fullscreen frontend world viewport with minimal HUD instead of a dashboard-style landing page.
+- Info and login now open in modal windows instead of occupying the main page.
+- Grid toggle, dark mode toggle and a crosshair-style canvas cursor are now part of the viewport interaction.
 - Starter landmarks that make the world feel readable before real claim and pixel systems exist.
 
 ## Confirmed World Decisions
@@ -35,4 +37,3 @@ Last updated: 2026-04-19
 ## Recommended Next Implementation Step
 
 - Build the first backend-backed claim bootstrap flow so a starter Area can exist inside the seeded world.
-

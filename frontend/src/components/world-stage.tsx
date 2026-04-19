@@ -1,8 +1,8 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { WorldChunk, WorldLandmark, WorldOverview } from "@/lib/api";
+import type { WorldChunk, WorldOverview } from "@/lib/api";
 
 type WorldStageProps = {
   world: WorldOverview;
@@ -16,6 +16,12 @@ type DragState = {
   originY: number;
 };
 
+type PointerPosition = {
+  x: number;
+  y: number;
+  inside: boolean;
+};
+
 const TILE_SIZE = 172;
 const MIN_ZOOM = 0.65;
 const MAX_ZOOM = 1.8;
@@ -26,19 +32,30 @@ function clampZoom(value: number): number {
 }
 
 function buildPattern(chunk: WorldChunk): number[] {
-  return Array.from({ length: 16 }, (_, index) => {
-    return Math.abs(chunk.chunk_x * 11 + chunk.chunk_y * 7 + index * 13) % 5;
+  return Array.from({ length: 25 }, (_, index) => {
+    return Math.abs(chunk.chunk_x * 17 + chunk.chunk_y * 19 + index * 11) % 5;
   });
 }
 
-function toneLabel(landmark: WorldLandmark): string {
-  return `${landmark.name} (${landmark.kind})`;
+function buttonClass(isActive: boolean): string {
+  return isActive ? "hud-toggle is-active" : "hud-toggle";
 }
 
 export function WorldStage({ world }: WorldStageProps) {
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [showGrid, setShowGrid] = useState(true);
+  const [darkMode, setDarkMode] = useState(true);
+  const [activeModal, setActiveModal] = useState<"info" | "login" | null>(null);
+  const [pointer, setPointer] = useState<PointerPosition>({ x: 0, y: 0, inside: false });
   const dragState = useRef<DragState | null>(null);
+
+  useEffect(() => {
+    document.body.dataset.theme = darkMode ? "dark" : "light";
+    return () => {
+      delete document.body.dataset.theme;
+    };
+  }, [darkMode]);
 
   const scene = useMemo(() => {
     const columns = world.bounds.max_chunk_x - world.bounds.min_chunk_x + 1;
@@ -55,10 +72,8 @@ export function WorldStage({ world }: WorldStageProps) {
 
     const landmarkLayout = world.landmarks.map((landmark) => ({
       ...landmark,
-      left:
-        (landmark.chunk_x - world.bounds.min_chunk_x + landmark.offset_x) * TILE_SIZE,
-      top:
-        (world.bounds.max_chunk_y - landmark.chunk_y + landmark.offset_y) * TILE_SIZE,
+      left: (landmark.chunk_x - world.bounds.min_chunk_x + landmark.offset_x) * TILE_SIZE,
+      top: (world.bounds.max_chunk_y - landmark.chunk_y + landmark.offset_y) * TILE_SIZE,
     }));
 
     return {
@@ -75,7 +90,17 @@ export function WorldStage({ world }: WorldStageProps) {
     setZoom(clampZoom(nextZoom));
   }
 
+  function updatePointer(event: React.PointerEvent<HTMLDivElement>): void {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setPointer({
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top,
+      inside: true,
+    });
+  }
+
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>): void {
+    updatePointer(event);
     dragState.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -88,6 +113,8 @@ export function WorldStage({ world }: WorldStageProps) {
   }
 
   function handlePointerMove(event: React.PointerEvent<HTMLDivElement>): void {
+    updatePointer(event);
+
     if (dragState.current?.pointerId !== event.pointerId) {
       return;
     }
@@ -99,12 +126,14 @@ export function WorldStage({ world }: WorldStageProps) {
   }
 
   function handlePointerUp(event: React.PointerEvent<HTMLDivElement>): void {
-    if (dragState.current?.pointerId !== event.pointerId) {
-      return;
+    if (dragState.current?.pointerId === event.pointerId) {
+      dragState.current = null;
+      event.currentTarget.releasePointerCapture(event.pointerId);
     }
+  }
 
-    dragState.current = null;
-    event.currentTarget.releasePointerCapture(event.pointerId);
+  function handlePointerLeave(): void {
+    setPointer((current) => ({ ...current, inside: false }));
   }
 
   function handleWheel(event: React.WheelEvent<HTMLDivElement>): void {
@@ -114,45 +143,53 @@ export function WorldStage({ world }: WorldStageProps) {
   }
 
   return (
-    <section className="panel world-panel">
-      <div className="panel-header">
-        <p className="eyebrow">World Preview</p>
-        <h2>Starter world around the 0:0 origin</h2>
+    <main className={`world-shell ${darkMode ? "theme-dark" : "theme-light"}`}>
+      <div className="world-hud world-hud-left">
+        <button
+          aria-label="Open information"
+          className="hud-icon-button"
+          onClick={() => setActiveModal("info")}
+          type="button"
+        >
+          I
+        </button>
       </div>
 
-      <div className="world-toolbar">
-        <div className="world-chip">
-          <span>Loaded chunks</span>
-          <strong>{world.chunk_count}</strong>
-        </div>
-        <div className="world-chip">
-          <span>Visible span</span>
-          <strong>
-            {world.bounds.min_world_x} to {world.bounds.max_world_x}
-          </strong>
-        </div>
-        <div className="world-controls">
-          <button type="button" onClick={() => adjustZoom(zoom - ZOOM_STEP)}>
-            Zoom out
-          </button>
-          <span>{Math.round(zoom * 100)}%</span>
-          <button type="button" onClick={() => adjustZoom(zoom + ZOOM_STEP)}>
-            Zoom in
-          </button>
-          <button type="button" onClick={() => { setZoom(1); setOffset({ x: 0, y: 0 }); }}>
-            Reset
-          </button>
-        </div>
+      <div className="world-hud world-hud-right">
+        <button className="hud-login-button" onClick={() => setActiveModal("login")} type="button">
+          Login
+        </button>
+      </div>
+
+      <div className="world-hud world-hud-bottom">
+        <button
+          aria-label="Toggle grid"
+          className={buttonClass(showGrid)}
+          onClick={() => setShowGrid((current) => !current)}
+          type="button"
+        >
+          Grid
+        </button>
+        <button
+          aria-label="Toggle dark mode"
+          className={buttonClass(darkMode)}
+          onClick={() => setDarkMode((current) => !current)}
+          type="button"
+        >
+          {darkMode ? "Light" : "Dark"}
+        </button>
       </div>
 
       <div
-        className="world-viewport"
+        className={`world-viewport immersive ${showGrid ? "grid-visible" : "grid-hidden"}`}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
+        onPointerLeave={handlePointerLeave}
         onWheel={handleWheel}
       >
+        <div className="world-backdrop-glow" aria-hidden="true" />
         <div
           className="world-stage-positioner"
           style={{
@@ -169,6 +206,7 @@ export function WorldStage({ world }: WorldStageProps) {
               transform: `scale(${zoom})`,
             }}
           >
+            <div className="world-grid-layer" aria-hidden="true" />
             <div
               className="world-axis world-axis-horizontal"
               style={{ top: `${scene.originTop}px` }}
@@ -194,11 +232,6 @@ export function WorldStage({ world }: WorldStageProps) {
                     <span className={`world-pixel tone-${tone}`} key={`${chunk.id}-${index}`} />
                   ))}
                 </div>
-                <div className="world-chunk-copy">
-                  <p>{chunk.chunk_x}:{chunk.chunk_y}</p>
-                  <h3>{chunk.label}</h3>
-                  <span>{chunk.role}</span>
-                </div>
               </article>
             ))}
 
@@ -212,10 +245,6 @@ export function WorldStage({ world }: WorldStageProps) {
                 }}
               >
                 <span className={`world-landmark-dot tone-${landmark.tone}`} />
-                <div className="world-landmark-copy">
-                  <strong>{landmark.name}</strong>
-                  <span>{landmark.kind}</span>
-                </div>
               </div>
             ))}
 
@@ -230,26 +259,83 @@ export function WorldStage({ world }: WorldStageProps) {
             </div>
           </div>
         </div>
+
+        {pointer.inside ? (
+          <>
+            <div className="world-crosshair-line world-crosshair-horizontal" style={{ top: `${pointer.y}px` }} />
+            <div className="world-crosshair-line world-crosshair-vertical" style={{ left: `${pointer.x}px` }} />
+          </>
+        ) : null}
       </div>
 
-      <div className="world-stage-footer">
-        <p>
-          Drag the world to explore the seeded starter ring. Mouse wheel zoom is already wired in
-          so this can evolve naturally into the real chunk viewer later.
-        </p>
-        <div className="world-landmark-list">
-          {world.landmarks.map((landmark) => (
-            <article className="world-landmark-card" key={landmark.id}>
-              <div className="world-landmark-card-header">
-                <span className={`world-landmark-dot tone-${landmark.tone}`} />
-                <strong>{toneLabel(landmark)}</strong>
+      {activeModal === "info" ? (
+        <div className="modal-backdrop" onClick={() => setActiveModal(null)} role="presentation">
+          <section
+            aria-labelledby="info-title"
+            className="modal-window"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div>
+                <p className="modal-eyebrow">Information</p>
+                <h2 id="info-title">PixelProject overview</h2>
               </div>
-              <p>{landmark.description}</p>
-            </article>
-          ))}
+              <button className="modal-close" onClick={() => setActiveModal(null)} type="button">
+                Close
+              </button>
+            </div>
+
+            <div className="modal-sections">
+              <article className="modal-card">
+                <h3>Announcements</h3>
+                <p>The local foundation is live, the starter world is visible, and the next step is the first claim flow.</p>
+              </article>
+              <article className="modal-card">
+                <h3>Rules</h3>
+                <p>Canvas interaction rules, claim restrictions and moderation details will live here once the gameplay systems are implemented.</p>
+              </article>
+              <article className="modal-card">
+                <h3>Terms of Service</h3>
+                <p>Legal terms, privacy information and account policies are intentionally moved out of the landing screen and will be maintained here.</p>
+              </article>
+              <article className="modal-card">
+                <h3>World status</h3>
+                <p>The current seeded map spans from chunk -1:-1 to 1:1 around the origin, with a dark first-view mode to keep the empty canvas easier on the eyes.</p>
+              </article>
+            </div>
+          </section>
         </div>
-      </div>
-    </section>
+      ) : null}
+
+      {activeModal === "login" ? (
+        <div className="modal-backdrop" onClick={() => setActiveModal(null)} role="presentation">
+          <section
+            aria-labelledby="login-title"
+            className="modal-window login-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div>
+                <p className="modal-eyebrow">Account</p>
+                <h2 id="login-title">Login will start with Google</h2>
+              </div>
+              <button className="modal-close" onClick={() => setActiveModal(null)} type="button">
+                Close
+              </button>
+            </div>
+
+            <div className="modal-card">
+              <p>
+                The visual login entry is already reserved here. As soon as the auth module is built,
+                this modal will connect to Google OAuth and create the player account automatically.
+              </p>
+              <button className="google-button" disabled type="button">
+                Continue with Google
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+    </main>
   );
 }
-
