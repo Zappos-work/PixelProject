@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { WorldChunk, WorldOverview } from "@/lib/api";
+import type { WorldOverview } from "@/lib/api";
+import { APP_VERSION } from "@/lib/app-version";
 
 type WorldStageProps = {
   world: WorldOverview;
@@ -22,73 +23,409 @@ type PointerPosition = {
   inside: boolean;
 };
 
-const TILE_SIZE = 172;
-const MIN_ZOOM = 0.65;
-const MAX_ZOOM = 1.8;
-const ZOOM_STEP = 0.14;
+type CameraState = {
+  x: number;
+  y: number;
+  zoom: number;
+};
 
-function clampZoom(value: number): number {
-  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Number(value.toFixed(2))));
+type WorldEdge = {
+  key: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+
+type GridLine = {
+  key: string;
+  position: number;
+  major: boolean;
+};
+
+type PixelCoordinate = {
+  x: number;
+  y: number;
+};
+
+type ViewportSize = {
+  width: number;
+  height: number;
+};
+
+type ActiveWorldBounds = {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  width: number;
+  height: number;
+  centerX: number;
+  centerY: number;
+};
+
+const DEFAULT_ZOOM = 3;
+const DEFAULT_MIN_ZOOM = 0.05;
+const ABSOLUTE_MIN_ZOOM = 0.001;
+const MAX_ZOOM = 40;
+const GRID_THRESHOLD = 8;
+const GRID_MAJOR_STEP = 10;
+const ZOOM_FACTOR = 1.14;
+const WORLD_BORDER_WIDTH = 5;
+const FIT_WORLD_PADDING = 80;
+const PAN_PADDING_FACTOR = 0.18;
+const PAN_PADDING_MIN = 140;
+const CLICK_DISTANCE = 6;
+
+function clampZoom(value: number, minZoom: number): number {
+  return Math.min(MAX_ZOOM, Math.max(minZoom, Number(value.toFixed(4))));
 }
 
-function buildPattern(chunk: WorldChunk): number[] {
-  return Array.from({ length: 25 }, (_, index) => {
-    return Math.abs(chunk.chunk_x * 17 + chunk.chunk_y * 19 + index * 11) % 5;
-  });
+function snapScreen(value: number): number {
+  return Math.round(value);
 }
 
-function buttonClass(isActive: boolean): string {
+function modalButtonClass(isActive: boolean): string {
   return isActive ? "hud-toggle is-active" : "hud-toggle";
 }
 
 export function WorldStage({ world }: WorldStageProps) {
-  const [zoom, setZoom] = useState(1);
-  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const dragState = useRef<DragState | null>(null);
+  const [camera, setCamera] = useState<CameraState>({
+    x: 0,
+    y: 0,
+    zoom: DEFAULT_ZOOM,
+  });
   const [showGrid, setShowGrid] = useState(true);
   const [darkMode, setDarkMode] = useState(true);
   const [activeModal, setActiveModal] = useState<"info" | "login" | null>(null);
   const [pointer, setPointer] = useState<PointerPosition>({ x: 0, y: 0, inside: false });
-  const dragState = useRef<DragState | null>(null);
+  const [selectedPixel, setSelectedPixel] = useState<PixelCoordinate | null>(null);
+  const [viewportSize, setViewportSize] = useState<ViewportSize>({ width: 0, height: 0 });
+  const [isCentered, setIsCentered] = useState(false);
 
   useEffect(() => {
     document.body.dataset.theme = darkMode ? "dark" : "light";
+
     return () => {
       delete document.body.dataset.theme;
     };
   }, [darkMode]);
 
-  const scene = useMemo(() => {
-    const columns = world.bounds.max_chunk_x - world.bounds.min_chunk_x + 1;
-    const rows = world.bounds.max_chunk_y - world.bounds.min_chunk_y + 1;
-    const stageWidth = columns * TILE_SIZE;
-    const stageHeight = rows * TILE_SIZE;
+  useEffect(() => {
+    const viewport = viewportRef.current;
 
-    const chunkLayout = world.chunks.map((chunk) => ({
-      ...chunk,
-      left: (chunk.chunk_x - world.bounds.min_chunk_x) * TILE_SIZE,
-      top: (world.bounds.max_chunk_y - chunk.chunk_y) * TILE_SIZE,
-      pattern: buildPattern(chunk),
-    }));
+    if (viewport === null) {
+      return;
+    }
 
-    const landmarkLayout = world.landmarks.map((landmark) => ({
-      ...landmark,
-      left: (landmark.chunk_x - world.bounds.min_chunk_x + landmark.offset_x) * TILE_SIZE,
-      top: (world.bounds.max_chunk_y - landmark.chunk_y + landmark.offset_y) * TILE_SIZE,
-    }));
+    const syncSize = (): void => {
+      const rect = viewport.getBoundingClientRect();
+      setViewportSize({ width: rect.width, height: rect.height });
+    };
+
+    syncSize();
+
+    const observer = new ResizeObserver(() => {
+      syncSize();
+    });
+
+    observer.observe(viewport);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  const activeWorldBounds = useMemo<ActiveWorldBounds>(() => {
+    const activeChunks = world.chunks.filter((chunk) => chunk.is_active);
+
+    if (activeChunks.length === 0) {
+      const width = world.bounds.max_world_x - world.bounds.min_world_x;
+      const height = world.bounds.max_world_y - world.bounds.min_world_y;
+
+      return {
+        minX: world.bounds.min_world_x,
+        maxX: world.bounds.max_world_x,
+        minY: world.bounds.min_world_y,
+        maxY: world.bounds.max_world_y,
+        width,
+        height,
+        centerX: world.bounds.min_world_x + width / 2,
+        centerY: world.bounds.min_world_y + height / 2,
+      };
+    }
+
+    let minX = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+
+    for (const chunk of activeChunks) {
+      minX = Math.min(minX, chunk.origin_x);
+      maxX = Math.max(maxX, chunk.origin_x + chunk.width);
+      minY = Math.min(minY, chunk.origin_y);
+      maxY = Math.max(maxY, chunk.origin_y + chunk.height);
+    }
+
+    const width = maxX - minX;
+    const height = maxY - minY;
 
     return {
-      stageWidth,
-      stageHeight,
-      chunkLayout,
-      landmarkLayout,
-      originLeft: (0 - world.bounds.min_chunk_x) * TILE_SIZE,
-      originTop: (world.bounds.max_chunk_y - 0) * TILE_SIZE,
+      minX,
+      maxX,
+      minY,
+      maxY,
+      width,
+      height,
+      centerX: minX + width / 2,
+      centerY: minY + height / 2,
     };
-  }, [world]);
+  }, [world.bounds.max_world_x, world.bounds.max_world_y, world.bounds.min_world_x, world.bounds.min_world_y, world.chunks]);
 
-  function adjustZoom(nextZoom: number): void {
-    setZoom(clampZoom(nextZoom));
-  }
+  const fitZoom = useMemo(() => {
+    if (viewportSize.width === 0 || viewportSize.height === 0) {
+      return DEFAULT_ZOOM;
+    }
+
+    const availableWidth = Math.max(
+      viewportSize.width - FIT_WORLD_PADDING * 2 - WORLD_BORDER_WIDTH * 2,
+      1,
+    );
+    const availableHeight = Math.max(
+      viewportSize.height - FIT_WORLD_PADDING * 2 - WORLD_BORDER_WIDTH * 2,
+      1,
+    );
+    const widthZoom = availableWidth / Math.max(activeWorldBounds.width, 1);
+    const heightZoom = availableHeight / Math.max(activeWorldBounds.height, 1);
+
+    return Math.min(MAX_ZOOM, Number(Math.min(widthZoom, heightZoom).toFixed(4)));
+  }, [activeWorldBounds.height, activeWorldBounds.width, viewportSize.height, viewportSize.width]);
+
+  const minZoom = useMemo(() => {
+    return Math.max(
+      ABSOLUTE_MIN_ZOOM,
+      Math.min(DEFAULT_MIN_ZOOM, Number((fitZoom * 0.9).toFixed(4))),
+    );
+  }, [fitZoom]);
+
+  const screenToWorldPixel = useCallback((screenX: number, screenY: number): PixelCoordinate => {
+    return {
+      x: Math.floor((screenX - camera.x) / camera.zoom),
+      y: Math.floor((screenY - camera.y) / camera.zoom),
+    };
+  }, [camera.x, camera.y, camera.zoom]);
+
+  const clampCamera = useCallback((nextCamera: CameraState): CameraState => {
+    const zoom = clampZoom(nextCamera.zoom, minZoom);
+
+    if (viewportSize.width === 0 || viewportSize.height === 0) {
+      return {
+        ...nextCamera,
+        zoom,
+      };
+    }
+
+    const paddingX = Math.min(
+      viewportSize.width * 0.45,
+      Math.max(PAN_PADDING_MIN, world.chunk_size * zoom * PAN_PADDING_FACTOR),
+    );
+    const paddingY = Math.min(
+      viewportSize.height * 0.45,
+      Math.max(PAN_PADDING_MIN, world.chunk_size * zoom * PAN_PADDING_FACTOR),
+    );
+    const centeredX = viewportSize.width / 2 - activeWorldBounds.centerX * zoom;
+    const centeredY = viewportSize.height / 2 - activeWorldBounds.centerY * zoom;
+    const minCameraX = paddingX - activeWorldBounds.maxX * zoom;
+    const maxCameraX = viewportSize.width - paddingX - activeWorldBounds.minX * zoom;
+    const minCameraY = paddingY - activeWorldBounds.maxY * zoom;
+    const maxCameraY = viewportSize.height - paddingY - activeWorldBounds.minY * zoom;
+
+    return {
+      zoom,
+      x:
+        minCameraX > maxCameraX
+          ? centeredX
+          : Math.min(maxCameraX, Math.max(minCameraX, nextCamera.x)),
+      y:
+        minCameraY > maxCameraY
+          ? centeredY
+          : Math.min(maxCameraY, Math.max(minCameraY, nextCamera.y)),
+    };
+  }, [
+    activeWorldBounds.centerX,
+    activeWorldBounds.centerY,
+    activeWorldBounds.maxX,
+    activeWorldBounds.maxY,
+    activeWorldBounds.minX,
+    activeWorldBounds.minY,
+    minZoom,
+    viewportSize.height,
+    viewportSize.width,
+    world.chunk_size,
+  ]);
+
+  const hoverPixel = useMemo(() => {
+    if (!pointer.inside) {
+      return null;
+    }
+
+    return screenToWorldPixel(pointer.x, pointer.y);
+  }, [pointer.inside, pointer.x, pointer.y, screenToWorldPixel]);
+
+  useEffect(() => {
+    if (isCentered || viewportSize.width === 0 || viewportSize.height === 0) {
+      return;
+    }
+
+    const initialZoom = clampZoom(Math.min(DEFAULT_ZOOM, fitZoom), minZoom);
+    setCamera(
+      clampCamera({
+        x: viewportSize.width / 2 - activeWorldBounds.centerX * initialZoom,
+        y: viewportSize.height / 2 - activeWorldBounds.centerY * initialZoom,
+        zoom: initialZoom,
+      }),
+    );
+    setIsCentered(true);
+  }, [
+    activeWorldBounds.centerX,
+    activeWorldBounds.centerY,
+    clampCamera,
+    fitZoom,
+    isCentered,
+    minZoom,
+    viewportSize.height,
+    viewportSize.width,
+  ]);
+
+  useEffect(() => {
+    if (!isCentered || viewportSize.width === 0 || viewportSize.height === 0) {
+      return;
+    }
+
+    setCamera((current) => {
+      const clamped = clampCamera(current);
+
+      if (
+        clamped.x === current.x &&
+        clamped.y === current.y &&
+        clamped.zoom === current.zoom
+      ) {
+        return current;
+      }
+
+      return clamped;
+    });
+  }, [
+    activeWorldBounds.centerX,
+    activeWorldBounds.centerY,
+    activeWorldBounds.maxX,
+    activeWorldBounds.maxY,
+    activeWorldBounds.minX,
+    activeWorldBounds.minY,
+    clampCamera,
+    isCentered,
+    minZoom,
+    viewportSize.height,
+    viewportSize.width,
+    world.chunk_size,
+  ]);
+
+  const gridVisible = showGrid && camera.zoom >= GRID_THRESHOLD;
+  const gridLines = useMemo(() => {
+    if (!gridVisible || viewportSize.width === 0 || viewportSize.height === 0) {
+      return {
+        horizontal: [] as GridLine[],
+        vertical: [] as GridLine[],
+      };
+    }
+
+    const startX = Math.floor(-camera.x / camera.zoom) - 1;
+    const endX = Math.ceil((viewportSize.width - camera.x) / camera.zoom) + 1;
+    const startY = Math.floor(-camera.y / camera.zoom) - 1;
+    const endY = Math.ceil((viewportSize.height - camera.y) / camera.zoom) + 1;
+    const vertical: GridLine[] = [];
+    const horizontal: GridLine[] = [];
+
+    for (let x = startX; x <= endX; x += 1) {
+      vertical.push({
+        key: `v-${x}`,
+        position: snapScreen(camera.x + x * camera.zoom),
+        major: x % GRID_MAJOR_STEP === 0,
+      });
+    }
+
+    for (let y = startY; y <= endY; y += 1) {
+      horizontal.push({
+        key: `h-${y}`,
+        position: snapScreen(camera.y + y * camera.zoom),
+        major: y % GRID_MAJOR_STEP === 0,
+      });
+    }
+
+    return {
+      horizontal,
+      vertical,
+    };
+  }, [camera.x, camera.y, camera.zoom, gridVisible, viewportSize.height, viewportSize.width]);
+
+  const activeChunkEdges = useMemo(() => {
+    const activeChunks = world.chunks.filter((chunk) => chunk.is_active);
+    const chunkIndex = new Set(activeChunks.map((chunk) => `${chunk.chunk_x}:${chunk.chunk_y}`));
+    const edges: WorldEdge[] = [];
+
+    for (const chunk of activeChunks) {
+      const left = snapScreen(camera.x + chunk.origin_x * camera.zoom);
+      const top = snapScreen(camera.y + chunk.origin_y * camera.zoom);
+      const right = snapScreen(camera.x + (chunk.origin_x + chunk.width) * camera.zoom);
+      const bottom = snapScreen(camera.y + (chunk.origin_y + chunk.height) * camera.zoom);
+      const width = right - left;
+      const height = bottom - top;
+
+      if (!chunkIndex.has(`${chunk.chunk_x}:${chunk.chunk_y - 1}`)) {
+        edges.push({
+          key: `${chunk.id}-top`,
+          left: left - WORLD_BORDER_WIDTH,
+          top: top - WORLD_BORDER_WIDTH,
+          width: width + WORLD_BORDER_WIDTH * 2,
+          height: WORLD_BORDER_WIDTH,
+        });
+      }
+
+      if (!chunkIndex.has(`${chunk.chunk_x + 1}:${chunk.chunk_y}`)) {
+        edges.push({
+          key: `${chunk.id}-right`,
+          left: left + width,
+          top: top - WORLD_BORDER_WIDTH,
+          width: WORLD_BORDER_WIDTH,
+          height: height + WORLD_BORDER_WIDTH * 2,
+        });
+      }
+
+      if (!chunkIndex.has(`${chunk.chunk_x}:${chunk.chunk_y + 1}`)) {
+        edges.push({
+          key: `${chunk.id}-bottom`,
+          left: left - WORLD_BORDER_WIDTH,
+          top: top + height,
+          width: width + WORLD_BORDER_WIDTH * 2,
+          height: WORLD_BORDER_WIDTH,
+        });
+      }
+
+      if (!chunkIndex.has(`${chunk.chunk_x - 1}:${chunk.chunk_y}`)) {
+        edges.push({
+          key: `${chunk.id}-left`,
+          left: left - WORLD_BORDER_WIDTH,
+          top: top - WORLD_BORDER_WIDTH,
+          width: WORLD_BORDER_WIDTH,
+          height: height + WORLD_BORDER_WIDTH * 2,
+        });
+      }
+    }
+
+    return edges;
+  }, [camera.x, camera.y, camera.zoom, world.chunks]);
 
   function updatePointer(event: React.PointerEvent<HTMLDivElement>): void {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -100,13 +437,17 @@ export function WorldStage({ world }: WorldStageProps) {
   }
 
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>): void {
+    if (event.button !== 0) {
+      return;
+    }
+
     updatePointer(event);
     dragState.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      originX: offset.x,
-      originY: offset.y,
+      originX: camera.x,
+      originY: camera.y,
     };
 
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -115,20 +456,37 @@ export function WorldStage({ world }: WorldStageProps) {
   function handlePointerMove(event: React.PointerEvent<HTMLDivElement>): void {
     updatePointer(event);
 
-    if (dragState.current?.pointerId !== event.pointerId) {
+    const drag = dragState.current;
+
+    if (drag?.pointerId !== event.pointerId) {
       return;
     }
 
-    setOffset({
-      x: dragState.current.originX + event.clientX - dragState.current.startX,
-      y: dragState.current.originY + event.clientY - dragState.current.startY,
-    });
+    setCamera((current) =>
+      clampCamera({
+        ...current,
+        x: drag.originX + event.clientX - drag.startX,
+        y: drag.originY + event.clientY - drag.startY,
+      }),
+    );
   }
 
   function handlePointerUp(event: React.PointerEvent<HTMLDivElement>): void {
-    if (dragState.current?.pointerId === event.pointerId) {
-      dragState.current = null;
+    const drag = dragState.current;
+
+    if (drag?.pointerId !== event.pointerId) {
+      return;
+    }
+
+    dragState.current = null;
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) <= CLICK_DISTANCE) {
+      const rect = event.currentTarget.getBoundingClientRect();
+      setSelectedPixel(screenToWorldPixel(event.clientX - rect.left, event.clientY - rect.top));
     }
   }
 
@@ -138,21 +496,44 @@ export function WorldStage({ world }: WorldStageProps) {
 
   function handleWheel(event: React.WheelEvent<HTMLDivElement>): void {
     event.preventDefault();
-    const direction = event.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP;
-    adjustZoom(zoom + direction);
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    const anchorX = event.clientX - rect.left;
+    const anchorY = event.clientY - rect.top;
+
+    setCamera((current) => {
+      const zoomDirection = event.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
+      const nextZoom = clampZoom(current.zoom * zoomDirection, minZoom);
+
+      if (nextZoom === current.zoom) {
+        return current;
+      }
+
+      const worldX = (anchorX - current.x) / current.zoom;
+      const worldY = (anchorY - current.y) / current.zoom;
+
+      return clampCamera({
+        zoom: nextZoom,
+        x: anchorX - worldX * nextZoom,
+        y: anchorY - worldY * nextZoom,
+      });
+    });
   }
 
   return (
     <main className={`world-shell ${darkMode ? "theme-dark" : "theme-light"}`}>
       <div className="world-hud world-hud-left">
-        <button
-          aria-label="Open information"
-          className="hud-icon-button"
-          onClick={() => setActiveModal("info")}
-          type="button"
-        >
-          I
-        </button>
+        <div className="hud-stack">
+          <button
+            aria-label="Open information"
+            className="hud-icon-button"
+            onClick={() => setActiveModal("info")}
+            type="button"
+          >
+            I
+          </button>
+          <p className="hud-version">Version {APP_VERSION}</p>
+        </div>
       </div>
 
       <div className="world-hud world-hud-right">
@@ -161,10 +542,27 @@ export function WorldStage({ world }: WorldStageProps) {
         </button>
       </div>
 
+      <div className="world-hud world-hud-bottom-left">
+        <div className="coordinate-panel">
+          <div className="coordinate-row">
+            <span className="coordinate-label">Hover</span>
+            <span className="coordinate-value">
+              {hoverPixel === null ? "-- : --" : `${hoverPixel.x} : ${hoverPixel.y}`}
+            </span>
+          </div>
+          <div className="coordinate-row">
+            <span className="coordinate-label">Selected</span>
+            <span className="coordinate-value">
+              {selectedPixel === null ? "-- : --" : `${selectedPixel.x} : ${selectedPixel.y}`}
+            </span>
+          </div>
+        </div>
+      </div>
+
       <div className="world-hud world-hud-bottom">
         <button
           aria-label="Toggle grid"
-          className={buttonClass(showGrid)}
+          className={modalButtonClass(showGrid)}
           onClick={() => setShowGrid((current) => !current)}
           type="button"
         >
@@ -172,93 +570,57 @@ export function WorldStage({ world }: WorldStageProps) {
         </button>
         <button
           aria-label="Toggle dark mode"
-          className={buttonClass(darkMode)}
+          className={modalButtonClass(darkMode)}
           onClick={() => setDarkMode((current) => !current)}
           type="button"
         >
-          {darkMode ? "Light" : "Dark"}
+          Dark
         </button>
       </div>
 
       <div
-        className={`world-viewport immersive ${showGrid ? "grid-visible" : "grid-hidden"}`}
+        className={`world-viewport immersive ${gridVisible ? "grid-visible" : "grid-hidden"}`}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
         onPointerLeave={handlePointerLeave}
         onWheel={handleWheel}
+        ref={viewportRef}
       >
         <div className="world-backdrop-glow" aria-hidden="true" />
         <div
-          className="world-stage-positioner"
-          style={{
-            width: `${scene.stageWidth}px`,
-            height: `${scene.stageHeight}px`,
-            transform: `translate(-50%, -50%) translate(${offset.x}px, ${offset.y}px)`,
-          }}
+          aria-hidden="true"
+          className="world-pixel-grid"
         >
-          <div
-            className="world-stage"
-            style={{
-              width: `${scene.stageWidth}px`,
-              height: `${scene.stageHeight}px`,
-              transform: `scale(${zoom})`,
-            }}
-          >
-            <div className="world-grid-layer" aria-hidden="true" />
-            <div
-              className="world-axis world-axis-horizontal"
-              style={{ top: `${scene.originTop}px` }}
+          {gridLines.vertical.map((line) => (
+            <span
+              className={`world-grid-line world-grid-line-vertical ${line.major ? "is-major" : ""}`}
+              key={line.key}
+              style={{ left: `${line.position}px` }}
             />
-            <div
-              className="world-axis world-axis-vertical"
-              style={{ left: `${scene.originLeft}px` }}
+          ))}
+          {gridLines.horizontal.map((line) => (
+            <span
+              className={`world-grid-line world-grid-line-horizontal ${line.major ? "is-major" : ""}`}
+              key={line.key}
+              style={{ top: `${line.position}px` }}
             />
-
-            {scene.chunkLayout.map((chunk) => (
-              <article
-                className={`world-chunk world-chunk-${chunk.role}`}
-                key={chunk.id}
-                style={{
-                  left: `${chunk.left}px`,
-                  top: `${chunk.top}px`,
-                  width: `${TILE_SIZE}px`,
-                  height: `${TILE_SIZE}px`,
-                }}
-              >
-                <div className="world-chunk-pattern" aria-hidden="true">
-                  {chunk.pattern.map((tone, index) => (
-                    <span className={`world-pixel tone-${tone}`} key={`${chunk.id}-${index}`} />
-                  ))}
-                </div>
-              </article>
-            ))}
-
-            {scene.landmarkLayout.map((landmark) => (
-              <div
-                className="world-landmark"
-                key={landmark.id}
-                style={{
-                  left: `${landmark.left}px`,
-                  top: `${landmark.top}px`,
-                }}
-              >
-                <span className={`world-landmark-dot tone-${landmark.tone}`} />
-              </div>
-            ))}
-
-            <div
-              className="world-origin-marker"
-              style={{
-                left: `${scene.originLeft}px`,
-                top: `${scene.originTop}px`,
-              }}
-            >
-              <span>0:0</span>
-            </div>
-          </div>
+          ))}
         </div>
+        {activeChunkEdges.map((edge) => (
+          <div
+            aria-hidden="true"
+            className="world-limit"
+            key={edge.key}
+            style={{
+              left: `${edge.left}px`,
+              top: `${edge.top}px`,
+              width: `${edge.width}px`,
+              height: `${edge.height}px`,
+            }}
+          />
+        ))}
 
         {pointer.inside ? (
           <>
@@ -288,21 +650,35 @@ export function WorldStage({ world }: WorldStageProps) {
             <div className="modal-sections">
               <article className="modal-card">
                 <h3>Announcements</h3>
-                <p>The local foundation is live, the starter world is visible, and the next step is the first claim flow.</p>
+                <p>
+                  The landing view is now intentionally minimal: only the world viewport is visible,
+                  while project information stays inside modal windows.
+                </p>
               </article>
               <article className="modal-card">
                 <h3>Rules</h3>
-                <p>Canvas interaction rules, claim restrictions and moderation details will live here once the gameplay systems are implemented.</p>
+                <p>
+                  Claim rules, moderation rules and painting restrictions will appear here once the
+                  gameplay layer is connected to the live canvas.
+                </p>
               </article>
               <article className="modal-card">
                 <h3>Terms of Service</h3>
-                <p>Legal terms, privacy information and account policies are intentionally moved out of the landing screen and will be maintained here.</p>
+                <p>
+                  Legal notes, privacy details and account policies are kept out of the canvas view
+                  and will be maintained in this information area.
+                </p>
               </article>
               <article className="modal-card">
-                <h3>World status</h3>
-                <p>The current seeded map spans from chunk -1:-1 to 1:1 around the origin, with a dark first-view mode to keep the empty canvas easier on the eyes.</p>
+                <h3>World internals</h3>
+                <p>
+                  The backend still uses hidden chunks of {world.chunk_size} x {world.chunk_size}
+                  pixels, but chunk borders are not rendered in the frontend so the canvas stays
+                  visually clean.
+                </p>
               </article>
             </div>
+            <p className="modal-version">Version {APP_VERSION}</p>
           </section>
         </div>
       ) : null}
@@ -326,8 +702,8 @@ export function WorldStage({ world }: WorldStageProps) {
 
             <div className="modal-card">
               <p>
-                The visual login entry is already reserved here. As soon as the auth module is built,
-                this modal will connect to Google OAuth and create the player account automatically.
+                This entry point is reserved for Google OAuth. Once the auth module is implemented,
+                players will be able to sign in here and continue straight back into the canvas.
               </p>
               <button className="google-button" disabled type="button">
                 Continue with Google
