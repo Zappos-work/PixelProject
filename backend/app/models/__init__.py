@@ -1,5 +1,6 @@
+from app.models.auth_session import AuthSession
 from app.models.base import Base
+from app.models.user import User
 from app.models.world_chunk import WorldChunk
 
-__all__ = ["Base", "WorldChunk"]
-
+__all__ = ["AuthSession", "Base", "User", "WorldChunk"]

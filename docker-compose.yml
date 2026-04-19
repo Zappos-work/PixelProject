@@ -26,9 +26,18 @@ services:
       APP_NAME: ${APP_NAME:-PixelProject API}
       SECRET_KEY: ${SECRET_KEY:-change-me}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:3000}
+      FRONTEND_APP_URL: ${FRONTEND_APP_URL:-http://localhost:3000}
       SQL_ECHO: ${SQL_ECHO:-false}
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://pixelproject:pixelproject@db:5432/pixelproject}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/api/v1/auth/google/callback}
+      AUTH_SESSION_COOKIE_NAME: ${AUTH_SESSION_COOKIE_NAME:-pixelproject_session}
+      AUTH_SESSION_MAX_AGE_HOURS: ${AUTH_SESSION_MAX_AGE_HOURS:-720}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      HOLDER_START_AMOUNT: ${HOLDER_START_AMOUNT:-128}
+      HOLDER_START_LIMIT: ${HOLDER_START_LIMIT:-1000}
       WORLD_ORIGIN_X: ${WORLD_ORIGIN_X:-0}
       WORLD_ORIGIN_Y: ${WORLD_ORIGIN_Y:-0}
       WORLD_CHUNK_SIZE: ${WORLD_CHUNK_SIZE:-5000}

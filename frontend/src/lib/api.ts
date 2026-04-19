@@ -63,10 +63,32 @@ export type DashboardData = {
   world: WorldOverview;
 };
 
+export type AuthUser = {
+  id: string;
+  public_id: number;
+  display_name: string;
+  avatar_url: string | null;
+  holders: number;
+  holder_limit: number;
+  created_at: string;
+  last_login_at: string;
+  can_change_display_name: boolean;
+  next_display_name_change_at: string | null;
+};
+
+export type AuthSessionStatus = {
+  authenticated: boolean;
+  google_oauth_configured: boolean;
+  user: AuthUser | null;
+};
+
 const apiBaseUrl =
   process.env.API_SERVER_URL ??
   process.env.NEXT_PUBLIC_API_BASE_URL ??
   "http://backend:8000/api/v1";
+
+const clientApiBaseUrl =
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
 
 const fallbackHealth: HealthResponse = {
   status: "degraded",
@@ -100,6 +122,19 @@ const fallbackWorld: WorldOverview = {
   landmarks: [],
 };
 
+const fallbackAuthSession: AuthSessionStatus = {
+  authenticated: false,
+  google_oauth_configured: false,
+  user: null,
+};
+
+export type UpdateDisplayNameResult = {
+  ok: boolean;
+  user: AuthUser | null;
+  status: number | null;
+  error: string | null;
+};
+
 async function fetchJson<T>(path: string, fallback: T): Promise<T> {
   try {
     const response = await fetch(`${apiBaseUrl}${path}`, {
@@ -126,4 +161,83 @@ export async function getDashboardData(): Promise<DashboardData> {
     health,
     world,
   };
+}
+
+export function getClientApiBaseUrl(): string {
+  return clientApiBaseUrl;
+}
+
+export async function fetchAuthSession(): Promise<AuthSessionStatus> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/auth/session`, {
+      cache: "no-store",
+      credentials: "include",
+    });
+
+    if (!response.ok) {
+      throw new Error(`Request failed with status ${response.status}`);
+    }
+
+    return (await response.json()) as AuthSessionStatus;
+  } catch {
+    return fallbackAuthSession;
+  }
+}
+
+export async function logoutAuthSession(): Promise<boolean> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/auth/logout`, {
+      method: "POST",
+      credentials: "include",
+    });
+
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function updateDisplayName(displayName: string): Promise<UpdateDisplayNameResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/auth/profile/display-name`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      credentials: "include",
+      body: JSON.stringify({ display_name: displayName }),
+    });
+
+    if (!response.ok) {
+      let error = "Display name update failed.";
+
+      try {
+        const payload = (await response.json()) as { detail?: string };
+        error = payload.detail ?? error;
+      } catch {
+        // Ignore JSON parsing issues and fall back to the default message.
+      }
+
+      return {
+        ok: false,
+        user: null,
+        status: response.status,
+        error,
+      };
+    }
+
+    return {
+      ok: true,
+      user: (await response.json()) as AuthUser,
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      user: null,
+      status: null,
+      error: "Display name update failed.",
+    };
+  }
 }

@@ -4,7 +4,7 @@ Last updated: 2026-04-19
 
 ## Current Snapshot
 
-- Current frontend build marker: `0.0.2`.
+- Current frontend build marker: `0.0.5`.
 - Local development stack is running through Docker Compose.
 - Frontend is available on `http://localhost:3000`.
 - Backend API and docs are available on `http://localhost:8000`.
@@ -28,6 +28,10 @@ Last updated: 2026-04-19
 - Grid lines are now rendered from the same viewport coordinate system as the world border to keep both aligned.
 - Clicking the canvas now exposes pixel coordinates for debugging and placement control.
 - Camera panning is now clamped to dynamic chunk-coupled bounds instead of allowing infinite drift.
+- Google OAuth foundation is now wired through the backend with automatic user creation and cookie-based sessions.
+- The frontend account modal now talks to the live auth session endpoint and supports real login and logout flows.
+- Local Google OAuth credentials are now configured for localhost, and the backend login endpoint has been verified to redirect to Google correctly.
+- Signed-in players now see a centered holder HUD, a shop entry button, a fixed `#` public player number, and a profile flow built around a default avatar plus 30-day display-name changes.
 
 ## Confirmed World Decisions
 
@@ -40,7 +44,6 @@ Last updated: 2026-04-19
 ## Open Work Areas
 
 - Exact claim validity rules and first-claim bootstrapping by command.
-- Authentication with Google OAuth.
 - Real pixel storage, color palette handling, and paint history.
 - Live chunk subscriptions and WebSocket update strategy.
 - Future far-zoom support should avoid loading every pixel at once by using chunk-aware streaming or level-of-detail rendering.
@@ -48,4 +51,4 @@ Last updated: 2026-04-19
 
 ## Recommended Next Implementation Step
 
-- Build the first backend-backed claim bootstrap flow so a starter Area can exist inside the seeded world.
+- Finish the first local Google OAuth test with real client credentials, then continue with holder regeneration and claim bootstrapping.

@@ -1,8 +1,16 @@
 "use client";
 
+import Image from "next/image";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { WorldOverview } from "@/lib/api";
+import {
+  fetchAuthSession,
+  getClientApiBaseUrl,
+  logoutAuthSession,
+  updateDisplayName,
+  type AuthSessionStatus,
+  type WorldOverview,
+} from "@/lib/api";
 import { APP_VERSION } from "@/lib/app-version";
 
 type WorldStageProps = {
@@ -48,6 +56,11 @@ type PixelCoordinate = {
   y: number;
 };
 
+type ProfileMessage = {
+  tone: "error" | "success" | "info";
+  text: string;
+};
+
 type ViewportSize = {
   width: number;
   height: number;
@@ -77,6 +90,12 @@ const PAN_PADDING_FACTOR = 0.18;
 const PAN_PADDING_MIN = 140;
 const CLICK_DISTANCE = 6;
 
+const FALLBACK_AUTH_STATUS: AuthSessionStatus = {
+  authenticated: false,
+  google_oauth_configured: false,
+  user: null,
+};
+
 function clampZoom(value: number, minZoom: number): number {
   return Math.min(MAX_ZOOM, Math.max(minZoom, Number(value.toFixed(4))));
 }
@@ -89,6 +108,28 @@ function modalButtonClass(isActive: boolean): string {
   return isActive ? "hud-toggle is-active" : "hud-toggle";
 }
 
+function DefaultAvatarIcon() {
+  return (
+    <svg aria-hidden="true" className="account-avatar-icon" viewBox="0 0 24 24">
+      <path
+        d="M12 12.75a4.75 4.75 0 1 0 0-9.5 4.75 4.75 0 0 0 0 9.5Zm0 2.25c-4.12 0-7.5 2.41-7.5 5.38 0 .34.28.62.62.62h13.76c.34 0 .62-.28.62-.62 0-2.97-3.38-5.38-7.5-5.38Z"
+        fill="currentColor"
+      />
+    </svg>
+  );
+}
+
+function ShopIcon() {
+  return (
+    <svg aria-hidden="true" className="hud-button-icon" viewBox="0 0 24 24">
+      <path
+        d="M6.25 7.5A1.25 1.25 0 0 1 7.5 6.25h9A1.25 1.25 0 0 1 17.75 7.5v.75h1.1c.39 0 .71.29.75.67l.73 7.5a1.8 1.8 0 0 1-1.79 1.98H5.46a1.8 1.8 0 0 1-1.79-1.98l.73-7.5a.75.75 0 0 1 .75-.67h1.1V7.5Zm10 0v.75h-8.5V7.5c0-.14.11-.25.25-.25h8a.25.25 0 0 1 .25.25Zm-6 3.5a.75.75 0 0 0-1.5 0v1.75a.75.75 0 0 0 1.5 0V11Zm5 0a.75.75 0 0 0-1.5 0v1.75a.75.75 0 0 0 1.5 0V11Z"
+        fill="currentColor"
+      />
+    </svg>
+  );
+}
+
 export function WorldStage({ world }: WorldStageProps) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const dragState = useRef<DragState | null>(null);
@@ -99,11 +140,24 @@ export function WorldStage({ world }: WorldStageProps) {
   });
   const [showGrid, setShowGrid] = useState(true);
   const [darkMode, setDarkMode] = useState(true);
-  const [activeModal, setActiveModal] = useState<"info" | "login" | null>(null);
+  const [activeModal, setActiveModal] = useState<"info" | "login" | "shop" | null>(null);
+  const [authStatus, setAuthStatus] = useState<AuthSessionStatus>(FALLBACK_AUTH_STATUS);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [profileName, setProfileName] = useState("");
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [profileMessage, setProfileMessage] = useState<ProfileMessage | null>(null);
   const [pointer, setPointer] = useState<PointerPosition>({ x: 0, y: 0, inside: false });
   const [selectedPixel, setSelectedPixel] = useState<PixelCoordinate | null>(null);
   const [viewportSize, setViewportSize] = useState<ViewportSize>({ width: 0, height: 0 });
   const [isCentered, setIsCentered] = useState(false);
+
+  const refreshAuthStatus = useCallback(async (): Promise<void> => {
+    setAuthLoading(true);
+    const nextStatus = await fetchAuthSession();
+    setAuthStatus(nextStatus);
+    setAuthLoading(false);
+  }, []);
 
   useEffect(() => {
     document.body.dataset.theme = darkMode ? "dark" : "light";
@@ -112,6 +166,15 @@ export function WorldStage({ world }: WorldStageProps) {
       delete document.body.dataset.theme;
     };
   }, [darkMode]);
+
+  useEffect(() => {
+    void refreshAuthStatus();
+  }, [refreshAuthStatus]);
+
+  useEffect(() => {
+    setProfileName(authStatus.user?.display_name ?? "");
+    setProfileMessage(null);
+  }, [authStatus.user?.display_name]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -273,6 +336,37 @@ export function WorldStage({ world }: WorldStageProps) {
 
     return screenToWorldPixel(pointer.x, pointer.y);
   }, [pointer.inside, pointer.x, pointer.y, screenToWorldPixel]);
+
+  const normalizedProfileName = useMemo(() => {
+    return profileName.trim().replace(/\s+/g, " ");
+  }, [profileName]);
+
+  const hasDisplayNameChange = useMemo(() => {
+    if (!authStatus.user) {
+      return false;
+    }
+
+    return normalizedProfileName.length > 0 && normalizedProfileName !== authStatus.user.display_name;
+  }, [authStatus.user, normalizedProfileName]);
+
+  const nameChangeHint = useMemo(() => {
+    if (!authStatus.user) {
+      return "";
+    }
+
+    if (authStatus.user.can_change_display_name) {
+      return "You can change your display name now. After a successful update, the next rename unlocks in 30 days.";
+    }
+
+    if (authStatus.user.next_display_name_change_at) {
+      return `Next display name change: ${new Intl.DateTimeFormat("en-GB", {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }).format(new Date(authStatus.user.next_display_name_change_at))}`;
+    }
+
+    return "Display name changes are temporarily unavailable.";
+  }, [authStatus.user]);
 
   useEffect(() => {
     if (isCentered || viewportSize.width === 0 || viewportSize.height === 0) {
@@ -520,6 +614,54 @@ export function WorldStage({ world }: WorldStageProps) {
     });
   }
 
+  function handleGoogleLogin(): void {
+    const nextUrl = window.location.href;
+    const loginUrl = `${getClientApiBaseUrl()}/auth/google/login?next=${encodeURIComponent(nextUrl)}`;
+    window.location.assign(loginUrl);
+  }
+
+  async function handleLogout(): Promise<void> {
+    setAuthBusy(true);
+    await logoutAuthSession();
+    await refreshAuthStatus();
+    setAuthBusy(false);
+  }
+
+  async function handleDisplayNameSave(): Promise<void> {
+    if (!authStatus.user) {
+      return;
+    }
+
+    setProfileBusy(true);
+    setProfileMessage(null);
+
+    const result = await updateDisplayName(normalizedProfileName);
+
+    if (!result.ok || result.user === null) {
+      setProfileMessage({
+        tone: "error",
+        text: result.error ?? "Display name update failed.",
+      });
+      setProfileBusy(false);
+      return;
+    }
+
+    setAuthStatus((current) => ({
+      ...current,
+      user: result.user,
+    }));
+    setProfileName(result.user.display_name);
+    setProfileMessage({
+      tone: "success",
+      text: "Display name updated successfully.",
+    });
+    setProfileBusy(false);
+  }
+
+  const accountButtonLabel = authStatus.user
+    ? `${authStatus.user.display_name} #${authStatus.user.public_id}`
+    : "Login";
+
   return (
     <main className={`world-shell ${darkMode ? "theme-dark" : "theme-light"}`}>
       <div className="world-hud world-hud-left">
@@ -537,8 +679,18 @@ export function WorldStage({ world }: WorldStageProps) {
       </div>
 
       <div className="world-hud world-hud-right">
+        {authStatus.authenticated && authStatus.user ? (
+          <button
+            aria-label="Open shop"
+            className="hud-icon-button hud-shop-button"
+            onClick={() => setActiveModal("shop")}
+            type="button"
+          >
+            <ShopIcon />
+          </button>
+        ) : null}
         <button className="hud-login-button" onClick={() => setActiveModal("login")} type="button">
-          Login
+          {accountButtonLabel}
         </button>
       </div>
 
@@ -577,6 +729,17 @@ export function WorldStage({ world }: WorldStageProps) {
           Dark
         </button>
       </div>
+
+      {authStatus.authenticated && authStatus.user ? (
+        <div className="world-hud world-hud-bottom-center">
+          <div className="holder-panel">
+            <span className="holder-label">Holders</span>
+            <span className="holder-value">
+              {authStatus.user.holders} / {authStatus.user.holder_limit}
+            </span>
+          </div>
+        </div>
+      ) : null}
 
       <div
         className={`world-viewport immersive ${gridVisible ? "grid-visible" : "grid-hidden"}`}
@@ -693,21 +856,129 @@ export function WorldStage({ world }: WorldStageProps) {
             <div className="modal-header">
               <div>
                 <p className="modal-eyebrow">Account</p>
-                <h2 id="login-title">Login will start with Google</h2>
+                <h2 id="login-title">
+                  {authStatus.authenticated ? "Account profile" : "Continue with Google"}
+                </h2>
               </div>
               <button className="modal-close" onClick={() => setActiveModal(null)} type="button">
                 Close
               </button>
             </div>
 
+            {authStatus.authenticated && authStatus.user ? (
+              <div className="modal-card account-card">
+                <div className="account-header">
+                  {authStatus.user.avatar_url ? (
+                    <Image
+                      alt={authStatus.user.display_name}
+                      className="account-avatar"
+                      height={72}
+                      referrerPolicy="no-referrer"
+                      src={authStatus.user.avatar_url}
+                      width={72}
+                    />
+                  ) : (
+                    <div className="account-avatar account-avatar-fallback" aria-hidden="true">
+                      <DefaultAvatarIcon />
+                    </div>
+                  )}
+                  <div className="account-details">
+                    <h3>{authStatus.user.display_name}</h3>
+                    <p className="account-tag">#{authStatus.user.public_id}</p>
+                    <p>
+                      Holders: {authStatus.user.holders} / {authStatus.user.holder_limit}
+                    </p>
+                    <p>Default avatar active. Custom avatar settings can follow later.</p>
+                  </div>
+                </div>
+                <div className="account-name-editor">
+                  <label className="account-label" htmlFor="display-name-input">
+                    Display name
+                  </label>
+                  <input
+                    className="account-input"
+                    id="display-name-input"
+                    maxLength={24}
+                    onChange={(event) => setProfileName(event.target.value)}
+                    placeholder="Enter a display name"
+                    type="text"
+                    value={profileName}
+                  />
+                  <p className="account-helper">{nameChangeHint}</p>
+                  {profileMessage ? (
+                    <p className={`account-feedback is-${profileMessage.tone}`}>{profileMessage.text}</p>
+                  ) : null}
+                </div>
+                <div className="account-actions">
+                  <button
+                    className="google-button"
+                    disabled={
+                      authBusy ||
+                      profileBusy ||
+                      !authStatus.user.can_change_display_name ||
+                      !hasDisplayNameChange
+                    }
+                    onClick={() => void handleDisplayNameSave()}
+                    type="button"
+                  >
+                    {profileBusy ? "Saving..." : "Save display name"}
+                  </button>
+                  <button
+                    className="google-button google-button-secondary"
+                    disabled={authBusy || profileBusy}
+                    onClick={() => void handleLogout()}
+                    type="button"
+                  >
+                    {authBusy ? "Signing out..." : "Logout"}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="modal-card">
+                <p>
+                  Google OAuth is now the account entry point for PixelProject. The first successful
+                  login automatically creates the player account and returns to the canvas with an
+                  active session.
+                </p>
+                <button
+                  className="google-button"
+                  disabled={authLoading || authBusy || !authStatus.google_oauth_configured}
+                  onClick={handleGoogleLogin}
+                  type="button"
+                >
+                  {authLoading
+                    ? "Checking auth..."
+                    : authStatus.google_oauth_configured
+                      ? "Continue with Google"
+                      : "Google OAuth not configured"}
+                </button>
+              </div>
+            )}
+          </section>
+        </div>
+      ) : null}
+
+      {activeModal === "shop" ? (
+        <div className="modal-backdrop" onClick={() => setActiveModal(null)} role="presentation">
+          <section
+            aria-labelledby="shop-title"
+            className="modal-window login-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div>
+                <p className="modal-eyebrow">Shop</p>
+                <h2 id="shop-title">Player shop placeholder</h2>
+              </div>
+              <button className="modal-close" onClick={() => setActiveModal(null)} type="button">
+                Close
+              </button>
+            </div>
             <div className="modal-card">
               <p>
-                This entry point is reserved for Google OAuth. Once the auth module is implemented,
-                players will be able to sign in here and continue straight back into the canvas.
+                The shop entry point now exists for signed-in players. We can fill it with holder
+                upgrades, perks, cosmetics or supporter packs in the next steps.
               </p>
-              <button className="google-button" disabled type="button">
-                Continue with Google
-              </button>
             </div>
           </section>
         </div>

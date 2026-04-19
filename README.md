@@ -648,6 +648,20 @@ The repository now includes a first local development foundation:
 3. Open `http://localhost:3000`
 4. Open `http://localhost:8000/docs` for the backend API docs
 
+### Local Google OAuth Setup
+
+To test Google login locally, also fill these values in `.env`:
+
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REDIRECT_URI=http://localhost:8000/api/v1/auth/google/callback`
+- `FRONTEND_APP_URL=http://localhost:3000`
+
+The Google OAuth client should allow at least:
+
+- `http://localhost:8000/api/v1/auth/google/callback` as an authorized redirect URI
+- `http://localhost:3000` as an authorized JavaScript or app origin when required by the Google project setup
+
 This foundation is intentionally focused on project structure, local startup, and world bootstrapping so the gameplay systems can now be added step by step.
 
 ## Project Status Tracking

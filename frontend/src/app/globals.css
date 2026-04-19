@@ -175,11 +175,18 @@ select {
 .world-hud-right {
   top: 1rem;
   right: 1rem;
+  align-items: center;
 }
 
 .world-hud-bottom-left {
   left: 1rem;
   bottom: 1rem;
+}
+
+.world-hud-bottom-center {
+  left: 50%;
+  bottom: 1rem;
+  transform: translateX(-50%);
 }
 
 .world-hud-bottom {
@@ -213,12 +220,23 @@ select {
   padding: 0;
 }
 
+.hud-button-icon {
+  width: 22px;
+  height: 22px;
+}
+
 .hud-login-button {
   min-width: 104px;
   height: 52px;
   padding: 0 1.25rem;
   border-radius: 16px;
   font-weight: 700;
+}
+
+.hud-shop-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .hud-version {
@@ -277,6 +295,36 @@ select {
   font-size: 0.98rem;
   font-weight: 700;
   letter-spacing: 0.03em;
+}
+
+.holder-panel {
+  min-width: 166px;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--hud-border);
+  border-radius: 18px;
+  background: var(--hud-background);
+  color: var(--hud-text);
+  text-align: center;
+  backdrop-filter: blur(16px);
+}
+
+.holder-label,
+.holder-value {
+  display: block;
+}
+
+.holder-label {
+  color: var(--modal-copy);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.holder-value {
+  margin-top: 0.18rem;
+  font-size: 1rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
 }
 
 .modal-backdrop {
@@ -348,6 +396,101 @@ select {
   background: var(--modal-card);
 }
 
+.account-card {
+  display: grid;
+  gap: 1rem;
+}
+
+.account-header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.account-avatar {
+  width: 72px;
+  height: 72px;
+  border-radius: 22px;
+  object-fit: cover;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.account-avatar-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--hud-text);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.03));
+}
+
+.account-avatar-icon {
+  width: 36px;
+  height: 36px;
+}
+
+.account-details h3 {
+  margin: 0;
+  font-size: 1.2rem;
+}
+
+.account-tag {
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.account-details p {
+  margin: 0.4rem 0 0;
+  color: var(--modal-copy);
+}
+
+.account-name-editor {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.account-label {
+  color: var(--modal-copy);
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.account-input {
+  min-height: 50px;
+  border: 1px solid var(--hud-border);
+  border-radius: 16px;
+  padding: 0.8rem 0.95rem;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--hud-text);
+  outline: none;
+}
+
+.account-input:focus {
+  border-color: rgba(255, 255, 255, 0.24);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.account-helper,
+.account-feedback {
+  margin: 0;
+  color: var(--modal-copy);
+  line-height: 1.5;
+}
+
+.account-feedback.is-success {
+  color: #7dd3a5;
+}
+
+.account-feedback.is-error {
+  color: #f7a3a3;
+}
+
+.account-actions {
+  display: grid;
+  gap: 0.75rem;
+}
+
 .modal-card p {
   margin: 0.6rem 0 0;
   color: var(--modal-copy);
@@ -371,6 +514,14 @@ select {
   opacity: 0.68;
 }
 
+.google-button:not(:disabled) {
+  opacity: 1;
+}
+
+.google-button-secondary {
+  opacity: 0.92;
+}
+
 .google-button:disabled {
   cursor: not-allowed;
 }
@@ -392,6 +543,10 @@ select {
   .world-hud-bottom {
     right: 0.8rem;
     bottom: 0.8rem;
+  }
+
+  .world-hud-bottom-center {
+    bottom: 4.75rem;
   }
 
   .world-hud-bottom-left {
@@ -418,5 +573,14 @@ select {
   .coordinate-panel {
     min-width: 152px;
     padding: 0.72rem 0.82rem;
+  }
+
+  .holder-panel {
+    min-width: 148px;
+    padding: 0.72rem 0.86rem;
+  }
+
+  .account-header {
+    align-items: flex-start;
   }
 }
