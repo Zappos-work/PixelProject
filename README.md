@@ -1,7 +1,5 @@
 # PixelProject
 
-# PixelProject
-
 PixelProject is a professional browser-based multiplayer pixel canvas game.
 
 The main idea is to create a huge, expanding collaborative pixel artwork where many users build individual and shared artworks on one large world canvas. The project is inspired by large-scale pixel canvas concepts, but it will have its own gameplay systems, claiming rules, economy, moderation tools, and long-term progression.
@@ -607,9 +605,19 @@ Possible future features:
 
 ## Current Project Status
 
-The project is currently in the planning phase.
+The project is currently in the early local implementation phase.
 
-The main goal before implementation is to define:
+The current goal is to turn the planning into a stable local foundation while keeping the long-term architecture clean.
+
+Current implementation highlights:
+
+- Local Docker development stack
+- Frontend and backend foundation
+- PostgreSQL and Redis integration
+- Seeded starter world around the `0:0` origin
+- First visible world preview in the frontend
+
+The next major implementation goals are still to define and build:
 
 - Game rules
 - Technical architecture
@@ -620,4 +628,32 @@ The main goal before implementation is to define:
 - Deployment structure
 - Development standards
 
-This planning phase is important because the project should be professional, scalable, and understandable for multiple developers in the future.
+This transition phase is important because the project should become professional, scalable, and understandable for multiple developers in the future.
+
+---
+
+## Local Development Bootstrap
+
+The repository now includes a first local development foundation:
+
+- `frontend/` for Next.js and React
+- `backend/` for FastAPI
+- `docker-compose.yml` for local PostgreSQL, Redis, backend, and frontend
+- `docs/project-foundation.md` for the first confirmed technical decisions
+
+### First Local Start
+
+1. Copy `.env.example` to `.env`
+2. Run `docker compose up --build`
+3. Open `http://localhost:3000`
+4. Open `http://localhost:8000/docs` for the backend API docs
+
+This foundation is intentionally focused on project structure, local startup, and world bootstrapping so the gameplay systems can now be added step by step.
+
+## Project Status Tracking
+
+The ongoing implementation status is tracked in:
+
+- `README.md` for the main product and architecture vision
+- `docs/project-foundation.md` for confirmed technical decisions
+- `docs/project-status.md` for the current local implementation snapshot

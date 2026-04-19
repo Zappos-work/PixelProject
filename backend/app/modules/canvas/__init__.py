@@ -1,0 +1,2 @@
+"""Canvas module placeholder."""
+

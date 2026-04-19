@@ -1,0 +1,2 @@
+"""PixelProject backend application package."""
+
