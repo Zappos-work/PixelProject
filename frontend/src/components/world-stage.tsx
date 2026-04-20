@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import {
   claimWorldPixels,
@@ -25,9 +25,11 @@ import {
 } from "@/lib/api";
 import { APP_CHANGELOG } from "@/lib/app-changelog";
 import { APP_VERSION } from "@/lib/app-version";
-import { DEFAULT_COLOR_ID, PIXEL_PALETTE } from "@/lib/pixel-palette";
+import { OUTSIDE_ART_PATTERN_SIZE, type OutsideArtAsset } from "@/lib/outside-art-types";
+import { DEFAULT_COLOR_ID, PIXEL_PALETTE, PIXEL_PALETTE_DISPLAY_ROWS } from "@/lib/pixel-palette";
 
 type WorldStageProps = {
+  outsideArtAssets: OutsideArtAsset[];
   world: WorldOverview;
 };
 
@@ -65,6 +67,8 @@ type WorldBoundaryRect = {
   width: number;
   height: number;
 };
+
+type ActiveChunkViewportRect = WorldBoundaryRect;
 
 type WorldTile = {
   key: string;
@@ -190,6 +194,7 @@ const PERF_FRAME_GAP_THRESHOLD_MS = 42;
 const PERF_LOG_LIMIT = 500;
 const WORLD_TILE_SIZE = 1000;
 const WORLD_TILE_MARGIN = 1;
+const TRANSPARENT_COLOR_ID = 31;
 const BUILD_MODE_LABEL: Record<BuildMode, string> = {
   claim: "Holders",
   paint: "Normal",
@@ -789,8 +794,9 @@ function PencilIcon() {
   );
 }
 
-export function WorldStage({ world: initialWorld }: WorldStageProps) {
+export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStageProps) {
   const worldRenderCountRef = useRef(0);
+  const outsidePatternIdBase = useId().replace(/:/g, "");
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const buildPanelRef = useRef<HTMLDivElement | null>(null);
   const hoverCoordinateValueRef = useRef<HTMLSpanElement | null>(null);
@@ -865,6 +871,8 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
   const [areaInvitePublicId, setAreaInvitePublicId] = useState("");
   const [areaMessage, setAreaMessage] = useState<ProfileMessage | null>(null);
   worldRenderCountRef.current += 1;
+  const worldOutsidePatternId = `${outsidePatternIdBase}-outside-pattern`;
+  const worldOutsideMaskId = `${outsidePatternIdBase}-outside-mask`;
 
   const refreshAuthStatus = useCallback(async (showLoading = true): Promise<void> => {
     markPerfEvent("auth refresh start", showLoading ? "with loading" : "background");
@@ -1324,6 +1332,25 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
     };
   }, [camera.x, camera.y, camera.zoom, gridVisible, viewportSize.height, viewportSize.width]);
 
+  const activeChunkViewportRects = useMemo<ActiveChunkViewportRect[]>(() => {
+    return activeChunks
+      .map((chunk) => {
+        const left = snapScreen(camera.x + chunk.origin_x * camera.zoom);
+        const top = snapScreen(camera.y + chunk.origin_y * camera.zoom);
+        const right = snapScreen(camera.x + (chunk.origin_x + chunk.width) * camera.zoom);
+        const bottom = snapScreen(camera.y + (chunk.origin_y + chunk.height) * camera.zoom);
+
+        return {
+          key: chunk.id,
+          left,
+          top,
+          width: right - left,
+          height: bottom - top,
+        };
+      })
+      .filter((rect) => rect.width > 0 && rect.height > 0);
+  }, [activeChunks, camera.x, camera.y, camera.zoom]);
+
   const activeChunkBoundaryRects = useMemo(() => {
     const chunkIndex = new Set(activeChunks.map((chunk) => `${chunk.chunk_x}:${chunk.chunk_y}`));
     const rects: WorldBoundaryRect[] = [];
@@ -1775,6 +1802,7 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
       width: camera.zoom,
       height: camera.zoom,
       color: PIXEL_PALETTE[pixel.colorId]?.hex ?? "#ffffff",
+      isTransparent: pixel.colorId === TRANSPARENT_COLOR_ID,
       isSelected: selectedPixel?.x === pixel.x && selectedPixel?.y === pixel.y,
     }));
   }, [camera.x, camera.y, camera.zoom, pendingPaints, selectedPixel]);
@@ -1870,11 +1898,13 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
     }
 
     if (selectedPendingPaint) {
-      return "This color is staged locally. Keep painting with Space, then submit all pending pixels together.";
+      return selectedPendingPaint.colorId === TRANSPARENT_COLOR_ID
+        ? "This erase is staged locally. Keep brushing with Space, then submit all pending changes together."
+        : "This color is staged locally. Keep painting with Space, then submit all pending pixels together.";
     }
 
     if (canPaintSelectedPixel) {
-      return "Normal mode paints owned or contributed territory. Choose a palette color, press Space over cells, then submit.";
+      return "Normal mode paints owned or contributed territory. Choose a palette color or Transparent, press Space over cells, then submit.";
     }
 
     if (selectedPixelRecord === null || selectedPlacementState.isPendingClaim) {
@@ -2398,18 +2428,19 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
     markWorldTileDirty(nextPixel);
     setSelectedPixel({ x: nextPixel.x, y: nextPixel.y });
     setSelectedArea((currentArea) => {
-      if (
-        currentArea === null ||
-        nextPixel.area_id !== currentArea.id ||
-        nextPixel.color_id === null ||
-        previousPixel?.color_id !== null
-      ) {
+      if (currentArea === null || nextPixel.area_id !== currentArea.id) {
+        return currentArea;
+      }
+
+      const delta = Number(nextPixel.color_id !== null) - Number(previousPixel?.color_id !== null);
+
+      if (delta === 0) {
         return currentArea;
       }
 
       return {
         ...currentArea,
-        painted_pixels_count: currentArea.painted_pixels_count + 1,
+        painted_pixels_count: Math.max(0, currentArea.painted_pixels_count + delta),
       };
     });
   }, [markWorldTileDirty]);
@@ -2936,15 +2967,20 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
             ) : null}
             {activeBuildMode === "paint" ? (
               <div className="pixel-palette-grid">
-                {PIXEL_PALETTE.map((color) => (
-                  <button
-                    aria-label={`Select ${color.name}`}
-                    className={`pixel-color-button ${selectedColorId === color.id ? "is-active" : ""}`}
-                    key={color.id}
-                    onClick={() => setSelectedColorId(color.id)}
-                    style={{ backgroundColor: color.hex }}
-                    type="button"
-                  />
+                {PIXEL_PALETTE_DISPLAY_ROWS.map((row, rowIndex) => (
+                  <div className="pixel-palette-row" key={`palette-row-${rowIndex}`}>
+                    {row.map((color) => (
+                      <button
+                        aria-label={`Select ${color.name}`}
+                        className={`pixel-color-button ${color.id === TRANSPARENT_COLOR_ID ? "is-transparent" : ""} ${selectedColorId === color.id ? "is-active" : ""}`}
+                        key={color.id}
+                        onClick={() => setSelectedColorId(color.id)}
+                        style={color.hex === "transparent" ? undefined : { backgroundColor: color.hex }}
+                        title={color.name}
+                        type="button"
+                      />
+                    ))}
+                  </div>
                 ))}
               </div>
             ) : null}
@@ -3006,6 +3042,93 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
             />
           ))}
         </div>
+        <svg
+          aria-hidden="true"
+          className="world-outside-pattern"
+          height={viewportSize.height}
+          shapeRendering="crispEdges"
+          width={viewportSize.width}
+        >
+          <defs>
+            <pattern
+              height={OUTSIDE_ART_PATTERN_SIZE}
+              id={worldOutsidePatternId}
+              patternUnits="userSpaceOnUse"
+              width={OUTSIDE_ART_PATTERN_SIZE}
+            >
+              <rect
+                className="world-outside-pattern-base"
+                height={OUTSIDE_ART_PATTERN_SIZE}
+                width={OUTSIDE_ART_PATTERN_SIZE}
+              />
+              <path
+                d="M-22 56 L 70 -36 M 18 224 L 152 90 M 140 174 L 248 66"
+                fill="none"
+                opacity="0.6"
+                stroke="var(--world-outside-hatch)"
+                strokeWidth="10"
+              />
+              <path
+                d="M-10 144 L 92 42 M 112 244 L 244 112"
+                fill="none"
+                opacity="0.45"
+                stroke="var(--world-outside-hatch)"
+                strokeWidth="6"
+              />
+              <rect fill="var(--world-outside-hatch)" height="4" opacity="0.6" width="4" x="108" y="30" />
+              <rect fill="var(--world-outside-hatch)" height="4" opacity="0.45" width="4" x="192" y="100" />
+              <rect fill="var(--world-outside-hatch)" height="4" opacity="0.45" width="4" x="26" y="190" />
+              {outsideArtAssets.map((asset) => {
+                const centerX = asset.x + asset.size / 2;
+                const centerY = asset.y + asset.size / 2;
+
+                return (
+                  <image
+                    height={asset.size}
+                    href={asset.src}
+                    key={asset.key}
+                    opacity={asset.opacity}
+                    preserveAspectRatio="xMidYMid meet"
+                    style={{ imageRendering: "pixelated" }}
+                    transform={`rotate(${asset.rotation} ${centerX} ${centerY})`}
+                    width={asset.size}
+                    x={asset.x}
+                    y={asset.y}
+                  />
+                );
+              })}
+            </pattern>
+            <mask id={worldOutsideMaskId}>
+              <rect fill="white" height={viewportSize.height} width={viewportSize.width} x="0" y="0" />
+              {activeChunkViewportRects.map((rect) => (
+                <rect
+                  fill="black"
+                  height={rect.height}
+                  key={rect.key}
+                  width={rect.width}
+                  x={rect.left}
+                  y={rect.top}
+                />
+              ))}
+            </mask>
+          </defs>
+          <rect
+            fill="var(--world-outside-shade)"
+            height={viewportSize.height}
+            mask={`url(#${worldOutsideMaskId})`}
+            width={viewportSize.width}
+            x="0"
+            y="0"
+          />
+          <rect
+            fill={`url(#${worldOutsidePatternId})`}
+            height={viewportSize.height}
+            mask={`url(#${worldOutsideMaskId})`}
+            width={viewportSize.width}
+            x="0"
+            y="0"
+          />
+        </svg>
         <div className="world-claim-layer" aria-hidden="true">
           {renderedWorldTiles.map((tile) => (
             <span
@@ -3049,14 +3172,14 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
           ))}
           {renderedPendingPaints.map((pixel) => (
             <span
-              className={`world-pending-paint ${pixel.isSelected ? "is-selected" : ""}`}
+              className={`world-pending-paint ${pixel.isTransparent ? "is-transparent" : ""} ${pixel.isSelected ? "is-selected" : ""}`}
               key={pixel.key}
               style={{
                 left: `${pixel.left}px`,
                 top: `${pixel.top}px`,
                 width: `${pixel.width}px`,
                 height: `${pixel.height}px`,
-                backgroundColor: pixel.color,
+                ...(pixel.isTransparent ? {} : { backgroundColor: pixel.color }),
               }}
             />
           ))}

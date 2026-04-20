@@ -31,44 +31,47 @@ from app.schemas.world import (
 )
 from app.services.world import sync_world_growth
 
+# Palette ids are persisted in world_pixels.color_id.
+# Reordering or replacing existing ids changes historic art unless the data is migrated first.
+TRANSPARENT_COLOR_ID = 31
 PIXEL_PALETTE = [
-    {"id": 0, "hex": "#101418", "name": "Void"},
-    {"id": 1, "hex": "#1d2b53", "name": "Navy"},
-    {"id": 2, "hex": "#7e2553", "name": "Mulberry"},
-    {"id": 3, "hex": "#008751", "name": "Pine"},
-    {"id": 4, "hex": "#ab5236", "name": "Clay"},
-    {"id": 5, "hex": "#5f574f", "name": "Stone"},
-    {"id": 6, "hex": "#c2c3c7", "name": "Mist"},
-    {"id": 7, "hex": "#fff1e8", "name": "Ivory"},
-    {"id": 8, "hex": "#ff004d", "name": "Crimson"},
-    {"id": 9, "hex": "#ffa300", "name": "Amber"},
-    {"id": 10, "hex": "#ffec27", "name": "Signal Yellow"},
-    {"id": 11, "hex": "#00e436", "name": "Lime"},
-    {"id": 12, "hex": "#29adff", "name": "Sky"},
-    {"id": 13, "hex": "#83769c", "name": "Lilac"},
-    {"id": 14, "hex": "#ff77a8", "name": "Blush"},
-    {"id": 15, "hex": "#ffccaa", "name": "Peach"},
-    {"id": 16, "hex": "#291814", "name": "Umber"},
-    {"id": 17, "hex": "#111d35", "name": "Midnight"},
-    {"id": 18, "hex": "#422136", "name": "Wine"},
-    {"id": 19, "hex": "#125359", "name": "Lagoon"},
-    {"id": 20, "hex": "#742f29", "name": "Rust"},
-    {"id": 21, "hex": "#49333b", "name": "Dust"},
-    {"id": 22, "hex": "#a28879", "name": "Sand"},
-    {"id": 23, "hex": "#f3ef7d", "name": "Pollen"},
-    {"id": 24, "hex": "#be1250", "name": "Ruby"},
-    {"id": 25, "hex": "#ff6c24", "name": "Flare"},
-    {"id": 26, "hex": "#a8e72e", "name": "Acid"},
-    {"id": 27, "hex": "#00b543", "name": "Emerald"},
-    {"id": 28, "hex": "#065ab5", "name": "Azure"},
-    {"id": 29, "hex": "#754665", "name": "Mauve"},
-    {"id": 30, "hex": "#ff6e59", "name": "Coral"},
-    {"id": 31, "hex": "#ff9d81", "name": "Apricot"},
+    {"id": 0, "hex": "#000000", "name": "Black"},
+    {"id": 1, "hex": "#3c3c3c", "name": "Dark Gray"},
+    {"id": 2, "hex": "#787878", "name": "Gray"},
+    {"id": 3, "hex": "#d2d2d2", "name": "Light Gray"},
+    {"id": 4, "hex": "#ffffff", "name": "White"},
+    {"id": 5, "hex": "#600018", "name": "Deep Red"},
+    {"id": 6, "hex": "#ed1c24", "name": "Red"},
+    {"id": 7, "hex": "#ff7f27", "name": "Orange"},
+    {"id": 8, "hex": "#f6aa09", "name": "Gold"},
+    {"id": 9, "hex": "#f9dd3b", "name": "Yellow"},
+    {"id": 10, "hex": "#fffabc", "name": "Light Yellow"},
+    {"id": 11, "hex": "#0eb968", "name": "Dark Green"},
+    {"id": 12, "hex": "#13e67b", "name": "Green"},
+    {"id": 13, "hex": "#87ff5e", "name": "Light Green"},
+    {"id": 14, "hex": "#0c816e", "name": "Dark Teal"},
+    {"id": 15, "hex": "#10ae82", "name": "Teal"},
+    {"id": 16, "hex": "#13e1be", "name": "Light Teal"},
+    {"id": 17, "hex": "#60f7f2", "name": "Cyan"},
+    {"id": 18, "hex": "#28509e", "name": "Dark Blue"},
+    {"id": 19, "hex": "#4093e4", "name": "Blue"},
+    {"id": 20, "hex": "#6b50f6", "name": "Indigo"},
+    {"id": 21, "hex": "#99b1fb", "name": "Light Indigo"},
+    {"id": 22, "hex": "#780c99", "name": "Dark Purple"},
+    {"id": 23, "hex": "#aa38b9", "name": "Purple"},
+    {"id": 24, "hex": "#e09ff9", "name": "Light Purple"},
+    {"id": 25, "hex": "#cb007a", "name": "Dark Pink"},
+    {"id": 26, "hex": "#ec1f80", "name": "Pink"},
+    {"id": 27, "hex": "#f38da9", "name": "Light Pink"},
+    {"id": 28, "hex": "#684634", "name": "Dark Brown"},
+    {"id": 29, "hex": "#95682a", "name": "Brown"},
+    {"id": 30, "hex": "#f8b277", "name": "Beige"},
+    {"id": 31, "hex": "transparent", "name": "Transparent"},
 ]
 VALID_COLOR_IDS = {color["id"] for color in PIXEL_PALETTE}
 MAX_VISIBLE_PIXELS = 5000
 WORLD_TILE_SIZE = 1000
-WORLD_TILE_CACHE_DIR = Path(".tile-cache")
+WORLD_TILE_CACHE_DIR = Path(".tile-cache") / "palette-v2"
 WORLD_TILE_LAYERS = {"claims", "paint"}
 MAX_BATCH_CLAIM_PIXELS = 4096
 AREA_NAME_MAX_LENGTH = 80
@@ -105,6 +108,7 @@ def _hex_to_rgba(hex_color: str, alpha: int = 255) -> tuple[int, int, int, int]:
 PALETTE_RGBA = {
     color["id"]: _hex_to_rgba(color["hex"])
     for color in PIXEL_PALETTE
+    if color["hex"] != "transparent"
 }
 
 
@@ -746,6 +750,8 @@ async def paint_world_pixel(
     if color_id not in VALID_COLOR_IDS:
         raise PixelPlacementError("Invalid palette color.", 422)
 
+    normalized_color_id = None if color_id == TRANSPARENT_COLOR_ID else color_id
+
     await _validate_inside_active_world(session, x, y)
 
     pixel = await session.scalar(select(WorldPixel).where(WorldPixel.x == x, WorldPixel.y == y))
@@ -759,12 +765,14 @@ async def paint_world_pixel(
         raise PixelPlacementError("You can only paint inside owned or contributed areas.", 403)
 
     await apply_holder_regeneration(session, user, resolved_settings)
-    was_unpainted = pixel.color_id is None
-    pixel.color_id = color_id
+    previous_color_id = pixel.color_id
+    pixel.color_id = normalized_color_id
 
     if area is not None:
-        if was_unpainted:
+        if previous_color_id is None and normalized_color_id is not None:
             area.painted_pixels_count += 1
+        elif previous_color_id is not None and normalized_color_id is None:
+            area.painted_pixels_count = max(0, area.painted_pixels_count - 1)
         area.last_activity_at = datetime.now(timezone.utc)
 
     await session.commit()
