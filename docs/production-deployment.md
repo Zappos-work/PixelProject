@@ -169,10 +169,19 @@ BACKEND_CORS_ORIGINS=https://pixel.zappos-dev.work
 FRONTEND_APP_URL=https://pixel.zappos-dev.work
 GOOGLE_REDIRECT_URI=https://pixel.zappos-dev.work/api/v1/auth/google/callback
 NEXT_PUBLIC_API_BASE_URL=https://pixel.zappos-dev.work/api/v1
+WORLD_CHUNK_SIZE=4000
+WORLD_EXPANSION_BUFFER=0
+WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7
 POSTGRES_PASSWORD=<server secret>
 SECRET_KEY=<server secret>
 DATABASE_URL=postgresql+asyncpg://pixelproject:<server secret>@db:5432/pixelproject
 ```
+
+World growth variables:
+
+- `WORLD_CHUNK_SIZE=4000`: each active gameplay chunk is `4,000 x 4,000`.
+- `WORLD_EXPANSION_BUFFER=0`: border-buffer growth is disabled.
+- `WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7`: the active field expands after `70%` claimed Holder coverage.
 
 The PostgreSQL user password was also updated inside PostgreSQL:
 
@@ -378,11 +387,16 @@ git config --global --add safe.directory /opt/pixelproject
 cd /opt/pixelproject
 git fetch origin main
 git reset --hard origin/main
+export WORLD_CHUNK_SIZE=4000
+export WORLD_EXPANSION_BUFFER=0
+export WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7
 docker compose -f compose.prod.yml up -d --build --remove-orphans
 docker image prune -f
 docker compose -f compose.prod.yml ps
 curl -fsS https://pixel.zappos-dev.work/api/v1/health
 ```
+
+The workflow exports the current world growth values before `docker compose up` so an older server-local Compose default does not keep the backend on the previous `5,000 x 5,000` setup.
 
 The workflow uses `concurrency` group `pixelproject-production`, so only one production deployment should run at a time.
 

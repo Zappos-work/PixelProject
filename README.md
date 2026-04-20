@@ -424,10 +424,14 @@ The canvas should not be stored or loaded as one huge image.
 
 The world should be divided into chunks.
 
-Example:
+Current gameplay chunk rules:
 
-- 128x128 pixels per chunk
-- Or 256x256 pixels per chunk
+- Active gameplay chunks are `4,000 x 4,000` canvas pixels.
+- The world starts with one active chunk at the `0:0` origin.
+- When claimed Holder pixels reach `70%` of the current active field, the active field expands.
+- Expansion alternates around the origin: one chunk, diamond/cross radius 1, square radius 1, diamond/cross radius 2, and so on.
+
+Rendering can still use smaller internal tiles or cached images, such as the current Wplace-style `1,000 x 1,000` PNG tiles.
 
 The client only loads visible chunks.
 
@@ -615,7 +619,8 @@ Current implementation highlights:
 - First production Docker Compose deployment on `https://pixel.zappos-dev.work`
 - Frontend and backend foundation
 - PostgreSQL and Redis integration
-- Seeded starter world around the `0:0` origin
+- Single active starter chunk at the `0:0` origin
+- Staged world growth based on `70%` claimed Holder coverage
 - First visible world preview in the frontend
 
 The next major implementation goals are still to define and build:

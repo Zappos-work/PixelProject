@@ -29,6 +29,7 @@ from app.schemas.world import (
     WorldPixelSummary,
     WorldPixelWindow,
 )
+from app.services.world import sync_world_growth
 
 PIXEL_PALETTE = [
     {"id": 0, "hex": "#101418", "name": "Void"},
@@ -723,6 +724,7 @@ async def claim_world_pixels(
 
     await session.refresh(area)
     await session.refresh(user)
+    await sync_world_growth(session, resolved_settings)
 
     return PixelBatchClaimResponse(
         pixels=[build_world_pixel_summary(pixel, user) for pixel in claimed_pixels],

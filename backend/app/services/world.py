@@ -1,32 +1,17 @@
-from sqlalchemy import select
+from sqlalchemy import func, select, text, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.models.world_chunk import WorldChunk
+from app.models.world_pixel import WorldPixel
 from app.schemas.world import Point, WorldBounds, WorldChunkSummary, WorldLandmark, WorldOverview
 
-STARTER_CHUNK_COORDINATES = [
-    (-1, -1),
-    (0, -1),
-    (1, -1),
-    (-1, 0),
-    (0, 0),
-    (1, 0),
-    (-1, 1),
-    (0, 1),
-    (1, 1),
-]
+ORIGIN_CHUNK = (0, 0)
+MAX_GROWTH_STAGE_GUARD = 256
+MIN_EXPANSION_CLAIM_FILL_RATIO = 0.01
 
 CHUNK_LABELS = {
-    (-1, -1): "Southwest Verge",
-    (0, -1): "South Gate",
-    (1, -1): "Saffron Reach",
-    (-1, 0): "West Arcade",
     (0, 0): "Origin Anchor",
-    (1, 0): "East Relay",
-    (-1, 1): "Pine Frontier",
-    (0, 1): "North Watch",
-    (1, 1): "Amber Rise",
 }
 
 LANDMARK_BLUEPRINTS = [
@@ -34,73 +19,63 @@ LANDMARK_BLUEPRINTS = [
         "id": "origin-beacon",
         "name": "Origin Beacon",
         "kind": "anchor",
-        "description": "The first visible anchor for the shared world and future starter claim route.",
+        "description": "The first visible anchor for the shared world and future growth route.",
         "chunk_x": 0,
         "chunk_y": 0,
-        "offset_x": 0.38,
-        "offset_y": 0.42,
+        "offset_x": 0.5,
+        "offset_y": 0.5,
         "tone": "teal",
-    },
-    {
-        "id": "north-watch",
-        "name": "North Watch",
-        "kind": "lookout",
-        "description": "A northern lookout marker to make chunk growth and axis orientation readable at a glance.",
-        "chunk_x": 0,
-        "chunk_y": 1,
-        "offset_x": 0.56,
-        "offset_y": 0.28,
-        "tone": "gold",
-    },
-    {
-        "id": "west-arcade",
-        "name": "West Arcade",
-        "kind": "district",
-        "description": "A placeholder district for the first collaborative art lane and contributor experiments.",
-        "chunk_x": -1,
-        "chunk_y": 0,
-        "offset_x": 0.34,
-        "offset_y": 0.54,
-        "tone": "rose",
-    },
-    {
-        "id": "east-relay",
-        "name": "East Relay",
-        "kind": "district",
-        "description": "A visible east-side relay marker for future chunk unlock and realtime subscription testing.",
-        "chunk_x": 1,
-        "chunk_y": 0,
-        "offset_x": 0.62,
-        "offset_y": 0.46,
-        "tone": "sky",
-    },
-    {
-        "id": "south-gate",
-        "name": "South Gate",
-        "kind": "frontier",
-        "description": "A southern entry point reserved for future first-claim bootstrapping by command.",
-        "chunk_x": 0,
-        "chunk_y": -1,
-        "offset_x": 0.47,
-        "offset_y": 0.68,
-        "tone": "moss",
     },
 ]
 
 
-def chunk_origin(chunk_x: int, chunk_y: int) -> tuple[int, int]:
-    settings = get_settings()
-    origin_x = settings.world_origin_x + chunk_x * settings.world_chunk_size
-    origin_y = settings.world_origin_y + chunk_y * settings.world_chunk_size
+def chunk_origin(chunk_x: int, chunk_y: int, settings: Settings | None = None) -> tuple[int, int]:
+    resolved_settings = settings or get_settings()
+    origin_x = resolved_settings.world_origin_x + chunk_x * resolved_settings.world_chunk_size
+    origin_y = resolved_settings.world_origin_y + chunk_y * resolved_settings.world_chunk_size
     return origin_x, origin_y
+
+
+def get_growth_shape(stage: int) -> set[tuple[int, int]]:
+    if stage <= 0:
+        return {ORIGIN_CHUNK}
+
+    radius = (stage + 1) // 2
+
+    if stage % 2 == 1:
+        return {
+            (chunk_x, chunk_y)
+            for chunk_x in range(-radius, radius + 1)
+            for chunk_y in range(-radius, radius + 1)
+            if abs(chunk_x) + abs(chunk_y) <= radius
+        }
+
+    return {
+        (chunk_x, chunk_y)
+        for chunk_x in range(-radius, radius + 1)
+        for chunk_y in range(-radius, radius + 1)
+    }
+
+
+def get_required_growth_stage(coordinates: set[tuple[int, int]]) -> int:
+    if not coordinates:
+        return 0
+
+    for stage in range(MAX_GROWTH_STAGE_GUARD + 1):
+        if coordinates.issubset(get_growth_shape(stage)):
+            return stage
+
+    raise ValueError("World growth stage guard exceeded.")
 
 
 def get_chunk_role(chunk_x: int, chunk_y: int) -> str:
     if chunk_x == 0 and chunk_y == 0:
         return "origin"
-    if abs(chunk_x) == 1 and abs(chunk_y) == 1:
-        return "frontier"
-    return "starter"
+
+    if abs(chunk_x) + abs(chunk_y) == max(abs(chunk_x), abs(chunk_y)):
+        return "axis-growth"
+
+    return "growth"
 
 
 async def ensure_origin_chunk(session: AsyncSession) -> WorldChunk:
@@ -109,16 +84,26 @@ async def ensure_origin_chunk(session: AsyncSession) -> WorldChunk:
     existing_chunk = await session.scalar(
         select(WorldChunk).where(WorldChunk.chunk_x == 0, WorldChunk.chunk_y == 0)
     )
+    origin_x, origin_y = chunk_origin(0, 0, settings)
+
     if existing_chunk is not None:
+        existing_chunk.origin_x = origin_x
+        existing_chunk.origin_y = origin_y
+        existing_chunk.width = settings.world_chunk_size
+        existing_chunk.height = settings.world_chunk_size
+        existing_chunk.is_active = True
+        await session.commit()
+        await session.refresh(existing_chunk)
         return existing_chunk
 
     origin_chunk = WorldChunk(
         chunk_x=0,
         chunk_y=0,
-        origin_x=settings.world_origin_x,
-        origin_y=settings.world_origin_y,
+        origin_x=origin_x,
+        origin_y=origin_y,
         width=settings.world_chunk_size,
         height=settings.world_chunk_size,
+        is_active=True,
     )
     session.add(origin_chunk)
     await session.commit()
@@ -126,45 +111,142 @@ async def ensure_origin_chunk(session: AsyncSession) -> WorldChunk:
     return origin_chunk
 
 
-async def ensure_initial_chunks(session: AsyncSession) -> None:
-    settings = get_settings()
+async def sync_pixel_chunk_coordinates(
+    session: AsyncSession,
+    settings: Settings | None = None,
+) -> None:
+    resolved_settings = settings or get_settings()
+    await session.execute(
+        text(
+            """
+            UPDATE world_pixels
+            SET
+                chunk_x = FLOOR(((x - :origin_x)::numeric / :chunk_size))::integer,
+                chunk_y = FLOOR(((y - :origin_y)::numeric / :chunk_size))::integer
+            WHERE
+                chunk_x IS DISTINCT FROM FLOOR(((x - :origin_x)::numeric / :chunk_size))::integer
+                OR chunk_y IS DISTINCT FROM FLOOR(((y - :origin_y)::numeric / :chunk_size))::integer
+            """
+        ),
+        {
+            "origin_x": resolved_settings.world_origin_x,
+            "origin_y": resolved_settings.world_origin_y,
+            "chunk_size": resolved_settings.world_chunk_size,
+        },
+    )
 
+
+async def get_claimed_chunk_coordinates(session: AsyncSession) -> set[tuple[int, int]]:
+    result = await session.execute(
+        select(WorldPixel.chunk_x, WorldPixel.chunk_y)
+        .where(
+            WorldPixel.owner_user_id.is_not(None),
+            WorldPixel.is_starter.is_(False),
+        )
+        .distinct()
+    )
+    return {(chunk_x, chunk_y) for chunk_x, chunk_y in result.all()}
+
+
+async def count_claimed_pixels_in_shape(
+    session: AsyncSession,
+    coordinates: set[tuple[int, int]],
+) -> int:
+    if not coordinates:
+        return 0
+
+    return await session.scalar(
+        select(func.count())
+        .select_from(WorldPixel)
+        .where(
+            tuple_(WorldPixel.chunk_x, WorldPixel.chunk_y).in_(sorted(coordinates)),
+            WorldPixel.owner_user_id.is_not(None),
+            WorldPixel.is_starter.is_(False),
+        )
+    ) or 0
+
+
+async def sync_world_growth(
+    session: AsyncSession,
+    settings: Settings | None = None,
+) -> int:
+    resolved_settings = settings or get_settings()
+    chunk_size = resolved_settings.world_chunk_size
+    fill_ratio = max(
+        MIN_EXPANSION_CLAIM_FILL_RATIO,
+        min(1.0, resolved_settings.world_expansion_claim_fill_ratio),
+    )
+
+    await sync_pixel_chunk_coordinates(session, resolved_settings)
+    claimed_coordinates = await get_claimed_chunk_coordinates(session)
+    stage = get_required_growth_stage(claimed_coordinates)
+
+    while stage < MAX_GROWTH_STAGE_GUARD:
+        shape = get_growth_shape(stage)
+        claimed_pixels = await count_claimed_pixels_in_shape(session, shape)
+        capacity = len(shape) * chunk_size * chunk_size
+
+        if capacity <= 0 or claimed_pixels / capacity < fill_ratio:
+            break
+
+        stage += 1
+
+    active_coordinates = get_growth_shape(stage)
     result = await session.scalars(select(WorldChunk))
-    existing_chunks = {(chunk.chunk_x, chunk.chunk_y) for chunk in result.all()}
-    new_chunks = []
+    chunks = result.all()
+    existing_by_coordinate = {(chunk.chunk_x, chunk.chunk_y): chunk for chunk in chunks}
 
-    for chunk_x, chunk_y in STARTER_CHUNK_COORDINATES:
-        if (chunk_x, chunk_y) in existing_chunks:
+    for coordinate, chunk in existing_by_coordinate.items():
+        origin_x, origin_y = chunk_origin(chunk.chunk_x, chunk.chunk_y, resolved_settings)
+        chunk.origin_x = origin_x
+        chunk.origin_y = origin_y
+        chunk.width = chunk_size
+        chunk.height = chunk_size
+        chunk.is_active = coordinate in active_coordinates
+
+    for chunk_x, chunk_y in sorted(active_coordinates):
+        if (chunk_x, chunk_y) in existing_by_coordinate:
             continue
 
-        origin_x, origin_y = chunk_origin(chunk_x, chunk_y)
-        new_chunks.append(
+        origin_x, origin_y = chunk_origin(chunk_x, chunk_y, resolved_settings)
+        session.add(
             WorldChunk(
                 chunk_x=chunk_x,
                 chunk_y=chunk_y,
                 origin_x=origin_x,
                 origin_y=origin_y,
-                width=settings.world_chunk_size,
-                height=settings.world_chunk_size,
+                width=chunk_size,
+                height=chunk_size,
+                is_active=True,
             )
         )
 
-    if not new_chunks:
-        return
-
-    session.add_all(new_chunks)
     await session.commit()
+    return stage
+
+
+async def ensure_initial_chunks(session: AsyncSession) -> None:
+    await sync_world_growth(session)
 
 
 async def get_world_overview(session: AsyncSession) -> WorldOverview:
     settings = get_settings()
+    await sync_world_growth(session, settings)
 
     result = await session.scalars(select(WorldChunk).order_by(WorldChunk.chunk_y.desc(), WorldChunk.chunk_x))
     chunks = result.all()
-    min_chunk_x = min(chunk.chunk_x for chunk in chunks)
-    max_chunk_x = max(chunk.chunk_x for chunk in chunks)
-    min_chunk_y = min(chunk.chunk_y for chunk in chunks)
-    max_chunk_y = max(chunk.chunk_y for chunk in chunks)
+    active_chunks = [chunk for chunk in chunks if chunk.is_active]
+
+    if not active_chunks:
+        await ensure_origin_chunk(session)
+        result = await session.scalars(select(WorldChunk).order_by(WorldChunk.chunk_y.desc(), WorldChunk.chunk_x))
+        chunks = result.all()
+        active_chunks = [chunk for chunk in chunks if chunk.is_active]
+
+    min_chunk_x = min(chunk.chunk_x for chunk in active_chunks)
+    max_chunk_x = max(chunk.chunk_x for chunk in active_chunks)
+    min_chunk_y = min(chunk.chunk_y for chunk in active_chunks)
+    max_chunk_y = max(chunk.chunk_y for chunk in active_chunks)
 
     chunk_summaries = [
         WorldChunkSummary(
@@ -189,16 +271,16 @@ async def get_world_overview(session: AsyncSession) -> WorldOverview:
         origin=Point(x=settings.world_origin_x, y=settings.world_origin_y),
         chunk_size=settings.world_chunk_size,
         expansion_buffer=settings.world_expansion_buffer,
-        chunk_count=len(chunks),
+        chunk_count=len(active_chunks),
         bounds=WorldBounds(
             min_chunk_x=min_chunk_x,
             max_chunk_x=max_chunk_x,
             min_chunk_y=min_chunk_y,
             max_chunk_y=max_chunk_y,
-            min_world_x=min(chunk.origin_x for chunk in chunks),
-            max_world_x=max(chunk.origin_x + chunk.width for chunk in chunks),
-            min_world_y=min(chunk.origin_y for chunk in chunks),
-            max_world_y=max(chunk.origin_y + chunk.height for chunk in chunks),
+            min_world_x=min(chunk.origin_x for chunk in active_chunks),
+            max_world_x=max(chunk.origin_x + chunk.width for chunk in active_chunks),
+            min_world_y=min(chunk.origin_y for chunk in active_chunks),
+            max_world_y=max(chunk.origin_y + chunk.height for chunk in active_chunks),
         ),
         chunks=chunk_summaries,
         landmarks=landmarks,

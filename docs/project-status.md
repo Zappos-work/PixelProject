@@ -4,7 +4,7 @@ Last updated: 2026-04-20
 
 ## Current Snapshot
 
-- Current frontend build marker: `0.1.3`.
+- Current frontend build marker: `0.1.4`.
 - Local development stack is running through Docker Compose.
 - Frontend is available on `http://localhost:3000`.
 - Backend API and docs are available on `http://localhost:8000`.
@@ -19,7 +19,7 @@ Last updated: 2026-04-20
 
 - Monorepo-style project structure with dedicated `frontend`, `backend`, and `docs` folders.
 - FastAPI foundation with health endpoint and world overview endpoint.
-- World bootstrap that seeds a visible starter chunk ring around the origin.
+- World bootstrap that starts with a single active origin chunk.
 - Fullscreen frontend world viewport with minimal HUD instead of a dashboard-style landing page.
 - The visible frontend canvas is intentionally empty; backend chunk structure is not rendered.
 - Info and login now open in modal windows instead of occupying the main page.
@@ -65,22 +65,26 @@ Last updated: 2026-04-20
 - Area owners can edit the Area name and description and invite other players by public `#` number.
 - Holder claim submission now supports backend batch validation for multi-pixel tools.
 - The first rectangle claim tool is available by choosing two opposite corners while still rejecting existing claimed cells and requiring a valid connection route.
+- The world now starts as one `4,000 x 4,000` active chunk and expands at `70%` claimed Holder coverage.
+- Growth alternates between cross/diamond and square shapes: origin, diamond radius 1, square radius 1, diamond radius 2, and so on.
 - Production deployment notes are documented in `docs/production-deployment.md`, including DNS, Caddy routing, production environment variables, Google OAuth URLs, backups and GitHub Actions deploy preparation.
 
 ## Confirmed World Decisions
 
 - World origin is `0:0`.
-- Chunks currently use a size of `5,000 x 5,000`.
-- Backend chunk data is already seeded around the origin for later gameplay systems.
-- Backend chunks remain hidden in the frontend view.
-- The next growth logic should later create additional chunks when players approach the active border buffer.
+- Active gameplay chunks use a size of `4,000 x 4,000`.
+- The active world starts with only the origin chunk.
+- Existing inactive chunk rows may remain in the database for migration continuity, but only active chunks define the playable field.
+- Existing claimed pixels outside the origin chunk force the minimum growth stage needed to keep that territory active.
+- The active field expands when claimed Holder pixels reach `70%` of the currently active shape.
+- Expansion alternates between diamond/cross and square stages around the origin.
 
 ## Open Work Areas
 
 - Exact claim-shape editor tools beyond the first Space staging brush and rectangle tool, such as lasso or fill selection.
 - Pixel history, first-paint coin rewards, and moderation rollback tools.
 - Live chunk subscriptions and WebSocket update strategy.
-- Future far-zoom support should avoid loading every pixel at once by using chunk-aware streaming or level-of-detail rendering.
+- Future far-zoom support should avoid loading every pixel at once by using tile-aware streaming or level-of-detail rendering.
 - Holder/coin balancing, rate-limits, and broader gameplay systems beyond the first pixel-placement loop.
 - Production hardening: SSH lock-down, external backups, monitoring, and final GitHub Actions/Discord deploy notification verification.
 

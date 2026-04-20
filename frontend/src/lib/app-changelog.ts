@@ -6,6 +6,15 @@ export type ChangelogEntry = {
 
 export const APP_CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.1.4",
+    date: "2026-04-20",
+    changes: [
+      "Changed the active world to start with one 4000 x 4000 chunk at the origin.",
+      "Added staged world growth: the active field expands at 70% claimed Holder coverage, alternating cross/diamond and square shapes.",
+      "Refreshes the world overview after saved Holder claims so newly unlocked chunks appear without a full page reload.",
+    ],
+  },
+  {
     version: "0.1.3",
     date: "2026-04-20",
     changes: [

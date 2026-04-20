@@ -154,8 +154,8 @@ const fallbackWorld: WorldOverview = {
     x: 0,
     y: 0,
   },
-  chunk_size: 5000,
-  expansion_buffer: 5000,
+  chunk_size: 4000,
+  expansion_buffer: 0,
   chunk_count: 0,
   bounds: {
     min_chunk_x: 0,
@@ -163,9 +163,9 @@ const fallbackWorld: WorldOverview = {
     min_chunk_y: 0,
     max_chunk_y: 0,
     min_world_x: 0,
-    max_world_x: 5000,
+    max_world_x: 4000,
     min_world_y: 0,
-    max_world_y: 5000,
+    max_world_y: 4000,
   },
   chunks: [],
   landmarks: [],
@@ -302,6 +302,22 @@ export async function getDashboardData(): Promise<DashboardData> {
     health,
     world,
   };
+}
+
+export async function fetchWorldOverview(): Promise<WorldOverview> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/world/overview`, {
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      throw new Error(`Request failed with status ${response.status}`);
+    }
+
+    return (await response.json()) as WorldOverview;
+  } catch {
+    return fallbackWorld;
+  }
 }
 
 export function getClientApiBaseUrl(): string {

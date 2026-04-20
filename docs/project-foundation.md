@@ -6,8 +6,10 @@ This document captures the first confirmed implementation decisions after the pl
 
 - The world has a clear origin point at `0:0`.
 - The first world anchor is seeded from the backend bootstrap so a valid starting chunk exists in the database.
-- Chunks are currently configured as `5,000 x 5,000`.
-- The current expansion rule reserves a `5,000` pixel buffer near the world border before a new chunk should be created.
+- Active gameplay chunks are currently configured as `4,000 x 4,000`.
+- The active world starts with only the origin chunk.
+- The world expands when claimed Holder pixels reach `70%` of the currently active field.
+- Expansion alternates between diamond/cross and square stages around the origin.
 - The first implementation pass started local-only and Docker-based.
 - The first production domain is `pixel.zappos-dev.work`.
 - Production uses Docker Compose with Caddy as the reverse proxy.
@@ -18,8 +20,8 @@ This document captures the first confirmed implementation decisions after the pl
 - `backend`: FastAPI, SQLAlchemy, Redis integration and seeded world bootstrap.
 - `docker-compose.yml`: local development stack with frontend, backend, PostgreSQL and Redis.
 - `GET /api/v1/health`: verifies API, database and Redis state.
-- `GET /api/v1/world/overview`: returns the seeded world origin and current chunks.
-- A visible starter chunk ring is seeded so the local world is not empty.
+- `GET /api/v1/world/overview`: returns the world origin, active chunks, inactive migration chunks and current bounds.
+- A single active origin chunk is seeded so the local world has a controlled starting field.
 - The frontend already includes a first draggable and zoomable world preview.
 
 ## Current Production Foundation

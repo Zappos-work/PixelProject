@@ -8,6 +8,7 @@ import {
   fetchClaimArea,
   fetchAuthSession,
   fetchVisibleWorldPixels,
+  fetchWorldOverview,
   getClientApiBaseUrl,
   getWorldTileUrl,
   inviteAreaContributor,
@@ -788,7 +789,7 @@ function PencilIcon() {
   );
 }
 
-export function WorldStage({ world }: WorldStageProps) {
+export function WorldStage({ world: initialWorld }: WorldStageProps) {
   const worldRenderCountRef = useRef(0);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const buildPanelRef = useRef<HTMLDivElement | null>(null);
@@ -805,6 +806,7 @@ export function WorldStage({ world }: WorldStageProps) {
   const visiblePixelsRef = useRef<WorldPixel[]>([]);
   const pixelIndexRef = useRef<Map<string, WorldPixel>>(new Map());
   const activeWorldBoundsRef = useRef<ActiveWorldBounds | null>(null);
+  const activeChunksRef = useRef<WorldOverview["chunks"]>([]);
   const pendingClaimsRef = useRef<PixelCoordinate[]>([]);
   const pendingClaimMapRef = useRef<Set<string>>(new Set());
   const pendingPaintsRef = useRef<PendingPaint[]>([]);
@@ -828,6 +830,7 @@ export function WorldStage({ world }: WorldStageProps) {
     y: 0,
     zoom: DEFAULT_ZOOM,
   });
+  const [world, setWorld] = useState<WorldOverview>(initialWorld);
   const [showGrid, setShowGrid] = useState(true);
   const [darkMode, setDarkMode] = useState(true);
   const [activeModal, setActiveModal] = useState<"info" | "changelog" | "login" | "shop" | "avatar" | null>(null);
@@ -976,9 +979,11 @@ export function WorldStage({ world }: WorldStageProps) {
     }
   }, [buildPanelPosition, viewportSize.height, viewportSize.width]);
 
-  const activeWorldBounds = useMemo<ActiveWorldBounds>(() => {
-    const activeChunks = world.chunks.filter((chunk) => chunk.is_active);
+  const activeChunks = useMemo(() => {
+    return world.chunks.filter((chunk) => chunk.is_active);
+  }, [world.chunks]);
 
+  const activeWorldBounds = useMemo<ActiveWorldBounds>(() => {
     if (activeChunks.length === 0) {
       const width = world.bounds.max_world_x - world.bounds.min_world_x;
       const height = world.bounds.max_world_y - world.bounds.min_world_y;
@@ -1020,7 +1025,13 @@ export function WorldStage({ world }: WorldStageProps) {
       centerX: minX + width / 2,
       centerY: minY + height / 2,
     };
-  }, [world.bounds.max_world_x, world.bounds.max_world_y, world.bounds.min_world_x, world.bounds.min_world_y, world.chunks]);
+  }, [
+    activeChunks,
+    world.bounds.max_world_x,
+    world.bounds.max_world_y,
+    world.bounds.min_world_x,
+    world.bounds.min_world_y,
+  ]);
 
   const fitZoom = useMemo(() => {
     if (viewportSize.width === 0 || viewportSize.height === 0) {
@@ -1158,6 +1169,7 @@ export function WorldStage({ world }: WorldStageProps) {
   const currentUser = authStatus.user;
   currentUserRef.current = currentUser;
   activeWorldBoundsRef.current = activeWorldBounds;
+  activeChunksRef.current = activeChunks;
   activeBuildModeRef.current = activeBuildMode;
   claimToolRef.current = claimTool;
   rectangleAnchorRef.current = rectangleAnchor;
@@ -1295,7 +1307,6 @@ export function WorldStage({ world }: WorldStageProps) {
   }, [camera.x, camera.y, camera.zoom, gridVisible, viewportSize.height, viewportSize.width]);
 
   const activeChunkEdges = useMemo(() => {
-    const activeChunks = world.chunks.filter((chunk) => chunk.is_active);
     const chunkIndex = new Set(activeChunks.map((chunk) => `${chunk.chunk_x}:${chunk.chunk_y}`));
     const edges: WorldEdge[] = [];
 
@@ -1349,7 +1360,7 @@ export function WorldStage({ world }: WorldStageProps) {
     }
 
     return edges;
-  }, [camera.x, camera.y, camera.zoom, world.chunks]);
+  }, [activeChunks, camera.x, camera.y, camera.zoom]);
 
   const renderedWorldTiles = useMemo<WorldTile[]>(() => {
     if (viewportSize.width === 0 || viewportSize.height === 0) {
@@ -1521,6 +1532,7 @@ export function WorldStage({ world }: WorldStageProps) {
     }
 
     const bounds = activeWorldBoundsRef.current;
+    const activeChunks = activeChunksRef.current;
     const pixelMap = pixelIndexRef.current;
     const pendingClaimsMap = pendingClaimMapRef.current;
     const pendingPaintsMap = pendingPaintMapRef.current;
@@ -1539,11 +1551,17 @@ export function WorldStage({ world }: WorldStageProps) {
       };
     }
 
-    const isInsideWorld =
-      pixel.x >= bounds.minX &&
-      pixel.x < bounds.maxX &&
-      pixel.y >= bounds.minY &&
-      pixel.y < bounds.maxY;
+    const isInsideWorld = activeChunks.length === 0
+      ? pixel.x >= bounds.minX &&
+        pixel.x < bounds.maxX &&
+        pixel.y >= bounds.minY &&
+        pixel.y < bounds.maxY
+      : activeChunks.some((chunk) => (
+        pixel.x >= chunk.origin_x &&
+        pixel.x < chunk.origin_x + chunk.width &&
+        pixel.y >= chunk.origin_y &&
+        pixel.y < chunk.origin_y + chunk.height
+      ));
     const pixelRecord = pixelMap.get(pixelKey) ?? null;
     const isPendingClaim = pendingClaimsMap.has(pixelKey);
     const pendingPaint = pendingPaintsMap.get(pixelKey) ?? null;
@@ -2376,6 +2394,7 @@ export function WorldStage({ world }: WorldStageProps) {
     setAreaDraftName(result.area.name);
     setAreaDraftDescription(result.area.description);
     knownPaintableAreaIdsRef.current.add(result.area.id);
+    setWorld(await fetchWorldOverview());
     return -1;
   }
 

@@ -27,8 +27,9 @@ class Settings(BaseSettings):
     level_up_holders_step: int = 256
     world_origin_x: int = 0
     world_origin_y: int = 0
-    world_chunk_size: int = 5000
-    world_expansion_buffer: int = 5000
+    world_chunk_size: int = 4000
+    world_expansion_buffer: int = 0
+    world_expansion_claim_fill_ratio: float = 0.7
 
     @property
     def cors_origins(self) -> list[str]:

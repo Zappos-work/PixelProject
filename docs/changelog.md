@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4 - 2026-04-20
+
+- Changed the active world to start with one `4,000 x 4,000` chunk at the origin.
+- Added staged world growth: the active field expands at `70%` claimed Holder coverage, alternating cross/diamond and square shapes.
+- Refreshes the world overview after saved Holder claims so newly unlocked chunks appear without a full page reload.
+
 ## 0.1.3 - 2026-04-20
 
 - Allowed one-character display names during account setup and later rename windows.

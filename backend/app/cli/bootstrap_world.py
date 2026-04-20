@@ -5,7 +5,7 @@ from app.db.bootstrap import initialize_database
 
 async def main() -> None:
     await initialize_database()
-    print("Starter world ready.")
+    print("Origin world ready.")
 
 
 if __name__ == "__main__":
