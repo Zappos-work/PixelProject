@@ -6,6 +6,14 @@ export type ChangelogEntry = {
 
 export const APP_CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.1.3",
+    date: "2026-04-20",
+    changes: [
+      "Allowed one-character display names during account setup and later rename windows.",
+      "Updated the account helper text to show the new 1 to 24 character display-name range.",
+    ],
+  },
+  {
     version: "0.1.2",
     date: "2026-04-20",
     changes: [

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3 - 2026-04-20
+
+- Allowed one-character display names during account setup and later rename windows.
+- Updated the account helper text to show the new 1 to 24 character display-name range.
+
 ## 0.1.2 - 2026-04-20
 
 - Documented the first production deployment on `https://pixel.zappos-dev.work`.

@@ -1181,11 +1181,11 @@ export function WorldStage({ world }: WorldStageProps) {
     }
 
     if (currentUser.needs_display_name_setup) {
-      return "Choose your permanent display name now. After the first save, the next rename unlocks in 30 days.";
+      return "Choose your permanent display name now. 1 to 24 characters are allowed. After the first save, the next rename unlocks in 30 days.";
     }
 
     if (currentUser.can_change_display_name) {
-      return "You can change your display name now. After a successful update, the next rename unlocks in 30 days.";
+      return "You can change your display name now. 1 to 24 characters are allowed. After a successful update, the next rename unlocks in 30 days.";
     }
 
     if (currentUser.next_display_name_change_at) {
