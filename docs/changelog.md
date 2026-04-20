@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.5 - 2026-04-20
+
+- Made the first page render immediately with a local origin-world fallback instead of blocking server-side on API/database reads.
+- Moved live world overview refresh into the browser so the real active chunk state is loaded after the first paint.
+- Stopped `GET /api/v1/world/overview` from running full growth and pixel chunk synchronization on every request.
+- Added PostgreSQL indexes for growth counts and tile-window queries against large `world_pixels` datasets.
+- Added `python -m app.cli.warm_world_tiles` to pre-render cached world PNG tiles for active chunks.
+- Changed active chunk outline rendering from overlapping CSS strips to exact SVG rectangle geometry with outside-aligned borders.
+- Filtered tile requests against exact active chunks so inactive cross-corner regions are not requested.
+
 ## 0.1.4 - 2026-04-20
 
 - Changed the active world to start with one `4,000 x 4,000` chunk at the origin.

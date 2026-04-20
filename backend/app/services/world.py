@@ -169,6 +169,8 @@ async def count_claimed_pixels_in_shape(
 async def sync_world_growth(
     session: AsyncSession,
     settings: Settings | None = None,
+    *,
+    sync_pixels: bool = False,
 ) -> int:
     resolved_settings = settings or get_settings()
     chunk_size = resolved_settings.world_chunk_size
@@ -177,7 +179,9 @@ async def sync_world_growth(
         min(1.0, resolved_settings.world_expansion_claim_fill_ratio),
     )
 
-    await sync_pixel_chunk_coordinates(session, resolved_settings)
+    if sync_pixels:
+        await sync_pixel_chunk_coordinates(session, resolved_settings)
+
     claimed_coordinates = await get_claimed_chunk_coordinates(session)
     stage = get_required_growth_stage(claimed_coordinates)
 
@@ -226,12 +230,11 @@ async def sync_world_growth(
 
 
 async def ensure_initial_chunks(session: AsyncSession) -> None:
-    await sync_world_growth(session)
+    await ensure_origin_chunk(session)
 
 
 async def get_world_overview(session: AsyncSession) -> WorldOverview:
     settings = get_settings()
-    await sync_world_growth(session, settings)
 
     result = await session.scalars(select(WorldChunk).order_by(WorldChunk.chunk_y.desc(), WorldChunk.chunk_x))
     chunks = result.all()

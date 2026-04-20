@@ -92,6 +92,35 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(
         text(
             """
+            CREATE INDEX IF NOT EXISTS ix_world_pixels_growth_claimed_chunk
+            ON world_pixels (chunk_x, chunk_y)
+            WHERE owner_user_id IS NOT NULL AND is_starter IS FALSE
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_world_pixels_tile_paint_xy
+            ON world_pixels (x, y)
+            INCLUDE (color_id)
+            WHERE color_id IS NOT NULL
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_world_pixels_tile_claim_xy
+            ON world_pixels (x, y)
+            INCLUDE (owner_user_id, is_starter)
+            WHERE owner_user_id IS NOT NULL OR is_starter IS TRUE
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
             DO $$
             BEGIN
                 IF NOT EXISTS (

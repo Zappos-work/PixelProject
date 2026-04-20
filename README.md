@@ -433,6 +433,23 @@ Current gameplay chunk rules:
 
 Rendering can still use smaller internal tiles or cached images, such as the current Wplace-style `1,000 x 1,000` PNG tiles.
 
+Normal world overview reads must stay cheap. `GET /api/v1/world/overview` should report the already-known chunk state and should not run full pixel-to-chunk synchronization during page load. Growth synchronization belongs after successful Holder claims, during bootstrap, or in deliberate maintenance/import workflows.
+
+Large imports or cache resets can pre-render active chunk tiles from the backend container:
+
+```bash
+python -m app.cli.warm_world_tiles --clear-cache
+```
+
+The command can also warm only one layer:
+
+```bash
+python -m app.cli.warm_world_tiles --layer paint
+python -m app.cli.warm_world_tiles --layer claims
+```
+
+The frontend first paints with a local origin-world fallback and refreshes the live world overview in the browser so the page shell is visible quickly even when the database contains millions of pixels.
+
 The client only loads visible chunks.
 
 Benefits:
@@ -621,6 +638,9 @@ Current implementation highlights:
 - PostgreSQL and Redis integration
 - Single active starter chunk at the `0:0` origin
 - Staged world growth based on `70%` claimed Holder coverage
+- Fast first render through a local world fallback plus browser-side overview refresh
+- Cheap world overview reads that no longer synchronize millions of pixels during page load
+- Backend tile warmup command for active chunk PNG caches after large imports
 - First visible world preview in the frontend
 
 The next major implementation goals are still to define and build:

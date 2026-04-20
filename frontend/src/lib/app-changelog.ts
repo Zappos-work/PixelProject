@@ -6,6 +6,16 @@ export type ChangelogEntry = {
 
 export const APP_CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.1.5",
+    date: "2026-04-20",
+    changes: [
+      "Made the first page render immediately with a local world fallback, then refresh the live world overview in the browser.",
+      "Stopped the world overview endpoint from running full growth and pixel chunk synchronization on every page load.",
+      "Added database indexes and a tile warmup command for faster large-world loading after heavy local imports.",
+      "Changed the active world border to exact SVG rectangle geometry so chunk outlines no longer rely on overlapping CSS strips.",
+    ],
+  },
+  {
     version: "0.1.4",
     date: "2026-04-20",
     changes: [

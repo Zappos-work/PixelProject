@@ -252,6 +252,18 @@ select {
   background: rgba(0, 0, 0, 0.72);
 }
 
+.world-limit-outline {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  color: rgb(33, 37, 41);
+  pointer-events: none;
+}
+
+.world-shell.theme-light .world-limit-outline {
+  color: rgb(33, 37, 41);
+}
+
 .world-crosshair-line {
   position: absolute;
   display: none;

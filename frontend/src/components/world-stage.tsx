@@ -58,7 +58,7 @@ type CameraState = {
   zoom: number;
 };
 
-type WorldEdge = {
+type WorldBoundaryRect = {
   key: string;
   left: number;
   top: number;
@@ -895,6 +895,24 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
   }, [refreshAuthStatus]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    const refreshWorldOverview = async (): Promise<void> => {
+      const nextWorld = await fetchWorldOverview();
+
+      if (!cancelled) {
+        setWorld(nextWorld);
+      }
+    };
+
+    void refreshWorldOverview();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!authStatus.authenticated) {
       return;
     }
@@ -1306,9 +1324,14 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
     };
   }, [camera.x, camera.y, camera.zoom, gridVisible, viewportSize.height, viewportSize.width]);
 
-  const activeChunkEdges = useMemo(() => {
+  const activeChunkBoundaryRects = useMemo(() => {
     const chunkIndex = new Set(activeChunks.map((chunk) => `${chunk.chunk_x}:${chunk.chunk_y}`));
-    const edges: WorldEdge[] = [];
+    const rects: WorldBoundaryRect[] = [];
+    const pushRect = (rect: WorldBoundaryRect): void => {
+      if (rect.width > 0 && rect.height > 0) {
+        rects.push(rect);
+      }
+    };
 
     for (const chunk of activeChunks) {
       const left = snapScreen(camera.x + chunk.origin_x * camera.zoom);
@@ -1317,49 +1340,95 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
       const bottom = snapScreen(camera.y + (chunk.origin_y + chunk.height) * camera.zoom);
       const width = right - left;
       const height = bottom - top;
+      const hasTopEdge = !chunkIndex.has(`${chunk.chunk_x}:${chunk.chunk_y - 1}`);
+      const hasRightEdge = !chunkIndex.has(`${chunk.chunk_x + 1}:${chunk.chunk_y}`);
+      const hasBottomEdge = !chunkIndex.has(`${chunk.chunk_x}:${chunk.chunk_y + 1}`);
+      const hasLeftEdge = !chunkIndex.has(`${chunk.chunk_x - 1}:${chunk.chunk_y}`);
+      const horizontalWidth = Math.min(WORLD_BORDER_WIDTH, Math.max(1, height));
+      const verticalWidth = Math.min(WORLD_BORDER_WIDTH, Math.max(1, width));
 
-      if (!chunkIndex.has(`${chunk.chunk_x}:${chunk.chunk_y - 1}`)) {
-        edges.push({
+      if (hasTopEdge) {
+        pushRect({
           key: `${chunk.id}-top`,
-          left: left - WORLD_BORDER_WIDTH,
-          top: top - WORLD_BORDER_WIDTH,
-          width: width + WORLD_BORDER_WIDTH * 2,
-          height: WORLD_BORDER_WIDTH,
+          left,
+          top: top - horizontalWidth,
+          width,
+          height: horizontalWidth,
         });
       }
 
-      if (!chunkIndex.has(`${chunk.chunk_x + 1}:${chunk.chunk_y}`)) {
-        edges.push({
+      if (hasRightEdge) {
+        pushRect({
           key: `${chunk.id}-right`,
-          left: left + width,
-          top: top - WORLD_BORDER_WIDTH,
-          width: WORLD_BORDER_WIDTH,
-          height: height + WORLD_BORDER_WIDTH * 2,
+          left: right,
+          top,
+          width: verticalWidth,
+          height,
         });
       }
 
-      if (!chunkIndex.has(`${chunk.chunk_x}:${chunk.chunk_y + 1}`)) {
-        edges.push({
+      if (hasBottomEdge) {
+        pushRect({
           key: `${chunk.id}-bottom`,
-          left: left - WORLD_BORDER_WIDTH,
-          top: top + height,
-          width: width + WORLD_BORDER_WIDTH * 2,
-          height: WORLD_BORDER_WIDTH,
+          left,
+          top: bottom,
+          width,
+          height: horizontalWidth,
         });
       }
 
-      if (!chunkIndex.has(`${chunk.chunk_x - 1}:${chunk.chunk_y}`)) {
-        edges.push({
+      if (hasLeftEdge) {
+        pushRect({
           key: `${chunk.id}-left`,
-          left: left - WORLD_BORDER_WIDTH,
-          top: top - WORLD_BORDER_WIDTH,
-          width: WORLD_BORDER_WIDTH,
-          height: height + WORLD_BORDER_WIDTH * 2,
+          left: left - verticalWidth,
+          top,
+          width: verticalWidth,
+          height,
+        });
+      }
+
+      if (hasTopEdge && hasLeftEdge) {
+        pushRect({
+          key: `${chunk.id}-top-left`,
+          left: left - verticalWidth,
+          top: top - horizontalWidth,
+          width: verticalWidth,
+          height: horizontalWidth,
+        });
+      }
+
+      if (hasTopEdge && hasRightEdge) {
+        pushRect({
+          key: `${chunk.id}-top-right`,
+          left: right,
+          top: top - horizontalWidth,
+          width: verticalWidth,
+          height: horizontalWidth,
+        });
+      }
+
+      if (hasBottomEdge && hasRightEdge) {
+        pushRect({
+          key: `${chunk.id}-bottom-right`,
+          left: right,
+          top: bottom,
+          width: verticalWidth,
+          height: horizontalWidth,
+        });
+      }
+
+      if (hasBottomEdge && hasLeftEdge) {
+        pushRect({
+          key: `${chunk.id}-bottom-left`,
+          left: left - verticalWidth,
+          top: bottom,
+          width: verticalWidth,
+          height: horizontalWidth,
         });
       }
     }
 
-    return edges;
+    return rects;
   }, [activeChunks, camera.x, camera.y, camera.zoom]);
 
   const renderedWorldTiles = useMemo<WorldTile[]>(() => {
@@ -1398,6 +1467,17 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
         const key = getWorldTileKey(tileX, tileY);
         const tileOriginX = tileX * WORLD_TILE_SIZE;
         const tileOriginY = tileY * WORLD_TILE_SIZE;
+        const intersectsActiveChunk = activeChunks.some((chunk) => (
+          tileOriginX < chunk.origin_x + chunk.width &&
+          tileOriginX + WORLD_TILE_SIZE > chunk.origin_x &&
+          tileOriginY < chunk.origin_y + chunk.height &&
+          tileOriginY + WORLD_TILE_SIZE > chunk.origin_y
+        ));
+
+        if (!intersectsActiveChunk) {
+          continue;
+        }
+
         tiles.push({
           key,
           tileX,
@@ -1416,6 +1496,7 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
     activeWorldBounds.maxY,
     activeWorldBounds.minX,
     activeWorldBounds.minY,
+    activeChunks,
     camera.x,
     camera.y,
     camera.zoom,
@@ -2992,19 +3073,24 @@ export function WorldStage({ world: initialWorld }: WorldStageProps) {
             }}
           />
         ) : null}
-        {activeChunkEdges.map((edge) => (
-          <div
-            aria-hidden="true"
-            className="world-limit"
-            key={edge.key}
-            style={{
-              left: `${edge.left}px`,
-              top: `${edge.top}px`,
-              width: `${edge.width}px`,
-              height: `${edge.height}px`,
-            }}
-          />
-        ))}
+        <svg
+          aria-hidden="true"
+          className="world-limit-outline"
+          height={viewportSize.height}
+          shapeRendering="crispEdges"
+          width={viewportSize.width}
+        >
+          {activeChunkBoundaryRects.map((rect) => (
+            <rect
+              fill="currentColor"
+              height={rect.height}
+              key={rect.key}
+              width={rect.width}
+              x={rect.left}
+              y={rect.top}
+            />
+          ))}
+        </svg>
 
         <div
           aria-hidden="true"

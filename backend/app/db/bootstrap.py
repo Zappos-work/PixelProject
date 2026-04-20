@@ -15,4 +15,4 @@ async def initialize_database() -> None:
         await ensure_initial_chunks(session)
         await ensure_starter_claim_frontier(session)
         await ensure_legacy_claim_areas(session)
-        await sync_world_growth(session)
+        await sync_world_growth(session, sync_pixels=False)

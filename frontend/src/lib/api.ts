@@ -149,14 +149,14 @@ const fallbackHealth: HealthResponse = {
   },
 };
 
-const fallbackWorld: WorldOverview = {
+export const fallbackWorld: WorldOverview = {
   origin: {
     x: 0,
     y: 0,
   },
   chunk_size: 4000,
   expansion_buffer: 0,
-  chunk_count: 0,
+  chunk_count: 1,
   bounds: {
     min_chunk_x: 0,
     max_chunk_x: 0,
@@ -167,7 +167,21 @@ const fallbackWorld: WorldOverview = {
     min_world_y: 0,
     max_world_y: 4000,
   },
-  chunks: [],
+  chunks: [
+    {
+      id: "fallback-origin",
+      chunk_x: 0,
+      chunk_y: 0,
+      origin_x: 0,
+      origin_y: 0,
+      width: 4000,
+      height: 4000,
+      is_active: true,
+      created_at: "1970-01-01T00:00:00Z",
+      label: "Origin Anchor",
+      role: "origin",
+    },
+  ],
   landmarks: [],
 };
 

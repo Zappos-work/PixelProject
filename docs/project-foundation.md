@@ -21,8 +21,20 @@ This document captures the first confirmed implementation decisions after the pl
 - `docker-compose.yml`: local development stack with frontend, backend, PostgreSQL and Redis.
 - `GET /api/v1/health`: verifies API, database and Redis state.
 - `GET /api/v1/world/overview`: returns the world origin, active chunks, inactive migration chunks and current bounds.
+- `GET /api/v1/world/overview` is intentionally a cheap read path. It must not run full world growth or pixel chunk synchronization during normal page loads.
 - A single active origin chunk is seeded so the local world has a controlled starting field.
 - The frontend already includes a first draggable and zoomable world preview.
+- The frontend first render starts from a local origin-world fallback and refreshes the live world overview in the browser after the shell is visible.
+- Cached world tile PNGs can be pre-rendered for the active chunks with `python -m app.cli.warm_world_tiles`.
+
+## World Growth And Tile Maintenance
+
+- World growth synchronization is allowed after successful Holder claims, during bootstrap, during controlled imports, or as an explicit maintenance operation.
+- Pixel-to-chunk synchronization is expensive on large `world_pixels` tables and should only run when chunk sizing or imported legacy data requires it.
+- Normal overview reads should remain fast even with millions of local or production pixels.
+- The tile cache stores generated `1,000 x 1,000` PNG layers under `backend/.tile-cache`.
+- Use `python -m app.cli.warm_world_tiles --clear-cache` from the backend container to rebuild all active chunk tiles after a large import.
+- Use `--layer claims` or `--layer paint` to warm only one tile layer.
 
 ## Current Production Foundation
 

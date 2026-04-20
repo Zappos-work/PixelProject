@@ -4,7 +4,7 @@ Last updated: 2026-04-20
 
 ## Current Snapshot
 
-- Current frontend build marker: `0.1.4`.
+- Current frontend build marker: `0.1.5`.
 - Local development stack is running through Docker Compose.
 - Frontend is available on `http://localhost:3000`.
 - Backend API and docs are available on `http://localhost:8000`.
@@ -60,6 +60,12 @@ Last updated: 2026-04-20
 - The performance probe now keeps a quiet browser-side ring buffer log at `window.__pixelPerfLog`.
 - The main world renderer now uses Wplace-style 1000x1000 PNG tiles for saved claims and paint pixels.
 - Backend tile PNGs are cached under `backend/.tile-cache` and only the touched tile is invalidated after claim/paint writes.
+- The frontend first render now uses a local origin-world fallback and refreshes the live world overview in the browser, so the page shell does not block on API or database work.
+- `GET /api/v1/world/overview` now reads existing chunk state only; growth synchronization is no longer run as part of normal page loading.
+- Growth synchronization can still be triggered by claim saves, bootstrap, maintenance tasks or explicit import workflows.
+- Large local imports can warm cached tile PNGs with `python -m app.cli.warm_world_tiles`.
+- The active world outline is rendered as exact SVG rectangle geometry aligned outside the playable chunk edges, avoiding the older overlapping CSS-strip corner artifacts.
+- Tile requests are filtered against exact active chunks so inactive diagonal gaps in cross-shaped growth stages are not requested.
 - New Holder claims are now grouped into claim Areas with owner metadata, size stats, painted-pixel stats and contributor slots.
 - Clicking claimed territory now opens a right-side Area panel with owner, size, description and contributor information.
 - Area owners can edit the Area name and description and invite other players by public `#` number.
@@ -78,13 +84,14 @@ Last updated: 2026-04-20
 - Existing claimed pixels outside the origin chunk force the minimum growth stage needed to keep that territory active.
 - The active field expands when claimed Holder pixels reach `70%` of the currently active shape.
 - Expansion alternates between diamond/cross and square stages around the origin.
+- Normal overview reads must remain cheap. Full pixel-to-chunk synchronization should be reserved for migrations, imports or deliberate maintenance actions.
 
 ## Open Work Areas
 
 - Exact claim-shape editor tools beyond the first Space staging brush and rectangle tool, such as lasso or fill selection.
 - Pixel history, first-paint coin rewards, and moderation rollback tools.
 - Live chunk subscriptions and WebSocket update strategy.
-- Future far-zoom support should avoid loading every pixel at once by using tile-aware streaming or level-of-detail rendering.
+- Future far-zoom support should add level-of-detail or pre-scaled overview tiles so distant artwork does not require full-resolution tile rendering.
 - Holder/coin balancing, rate-limits, and broader gameplay systems beyond the first pixel-placement loop.
 - Production hardening: SSH lock-down, external backups, monitoring, and final GitHub Actions/Discord deploy notification verification.
 
