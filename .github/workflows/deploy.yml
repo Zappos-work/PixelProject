@@ -1,0 +1,34 @@
+name: Deploy PixelProject
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: pixelproject-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Prepare SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PIXEL_SSH_KEY }}" > ~/.ssh/pixel_key
+          chmod 600 ~/.ssh/pixel_key
+          ssh-keyscan -p "${{ secrets.PIXEL_SSH_PORT }}" "${{ secrets.PIXEL_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy on server
+        run: |
+          ssh -i ~/.ssh/pixel_key -p "${{ secrets.PIXEL_SSH_PORT }}" deploy@${{ secrets.PIXEL_HOST }} '
+            set -e
+            cd /opt/pixelproject
+            git fetch origin main
+            git reset --hard origin/main
+            docker compose -f compose.prod.yml up -d --build --remove-orphans
+            docker image prune -f
+            docker compose -f compose.prod.yml ps
+          '
