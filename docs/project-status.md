@@ -1,10 +1,10 @@
 # Project Status
 
-Last updated: 2026-04-19
+Last updated: 2026-04-20
 
 ## Current Snapshot
 
-- Current frontend build marker: `0.1.0`.
+- Current frontend build marker: `0.1.1`.
 - Local development stack is running through Docker Compose.
 - Frontend is available on `http://localhost:3000`.
 - Backend API and docs are available on `http://localhost:8000`.
@@ -56,6 +56,11 @@ Last updated: 2026-04-19
 - The performance probe now keeps a quiet browser-side ring buffer log at `window.__pixelPerfLog`.
 - The main world renderer now uses Wplace-style 1000x1000 PNG tiles for saved claims and paint pixels.
 - Backend tile PNGs are cached under `backend/.tile-cache` and only the touched tile is invalidated after claim/paint writes.
+- New Holder claims are now grouped into claim Areas with owner metadata, size stats, painted-pixel stats and contributor slots.
+- Clicking claimed territory now opens a right-side Area panel with owner, size, description and contributor information.
+- Area owners can edit the Area name and description and invite other players by public `#` number.
+- Holder claim submission now supports backend batch validation for multi-pixel tools.
+- The first rectangle claim tool is available by choosing two opposite corners while still rejecting existing claimed cells and requiring a valid connection route.
 
 ## Confirmed World Decisions
 
@@ -67,7 +72,7 @@ Last updated: 2026-04-19
 
 ## Open Work Areas
 
-- Exact claim-shape editor tools beyond the first Space staging brush, such as rectangle or lasso selection.
+- Exact claim-shape editor tools beyond the first Space staging brush and rectangle tool, such as lasso or fill selection.
 - Pixel history, first-paint coin rewards, and moderation rollback tools.
 - Live chunk subscriptions and WebSocket update strategy.
 - Future far-zoom support should avoid loading every pixel at once by using chunk-aware streaming or level-of-detail rendering.
@@ -75,4 +80,4 @@ Last updated: 2026-04-19
 
 ## Recommended Next Implementation Step
 
-- Expand the claim-first gameplay layer with multi-pixel claim tools, contributor permissions, or realtime multiplayer updates.
+- Add pixel history, first-paint Coins, and stronger contributor management such as removing contributors and activity logs.

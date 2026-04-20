@@ -114,6 +114,7 @@ export type WorldPixel = {
   owner_user_id: string | null;
   owner_public_id: number | null;
   owner_display_name: string | null;
+  area_id: string | null;
   is_starter: boolean;
   created_at: string;
   updated_at: string;
@@ -218,6 +219,50 @@ export type PixelPaintResult = {
   ok: boolean;
   pixel: WorldPixel | null;
   user: AuthUser | null;
+  status: number | null;
+  error: string | null;
+};
+
+export type AreaOwnerSummary = {
+  id: string;
+  public_id: number;
+  display_name: string;
+};
+
+export type AreaContributorSummary = {
+  id: string;
+  public_id: number;
+  display_name: string;
+};
+
+export type ClaimAreaSummary = {
+  id: string;
+  name: string;
+  description: string;
+  owner: AreaOwnerSummary;
+  claimed_pixels_count: number;
+  painted_pixels_count: number;
+  contributor_count: number;
+  contributors: AreaContributorSummary[];
+  viewer_can_edit: boolean;
+  viewer_can_paint: boolean;
+  created_at: string;
+  updated_at: string;
+  last_activity_at: string;
+};
+
+export type PixelBatchClaimResult = {
+  ok: boolean;
+  pixels: WorldPixel[];
+  user: AuthUser | null;
+  area: ClaimAreaSummary | null;
+  status: number | null;
+  error: string | null;
+};
+
+export type ClaimAreaResult = {
+  ok: boolean;
+  area: ClaimAreaSummary | null;
   status: number | null;
   error: string | null;
 };
@@ -474,6 +519,53 @@ export async function claimWorldPixel(x: number, y: number): Promise<PixelClaimR
   }
 }
 
+export async function claimWorldPixels(pixels: Array<{ x: number; y: number }>): Promise<PixelBatchClaimResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/world/claims/batch`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      credentials: "include",
+      body: JSON.stringify({ pixels }),
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        pixels: [],
+        user: null,
+        area: null,
+        status: response.status,
+        error: await readApiError(response, "Batch claim failed."),
+      };
+    }
+
+    const payload = (await response.json()) as {
+      pixels: WorldPixel[];
+      user: AuthUser;
+      area: ClaimAreaSummary;
+    };
+    return {
+      ok: true,
+      pixels: payload.pixels,
+      user: payload.user,
+      area: payload.area,
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      pixels: [],
+      user: null,
+      area: null,
+      status: null,
+      error: "Batch claim failed.",
+    };
+  }
+}
+
 export async function paintWorldPixel(
   x: number,
   y: number,
@@ -518,6 +610,117 @@ export async function paintWorldPixel(
       user: null,
       status: null,
       error: "Pixel painting failed.",
+    };
+  }
+}
+
+export async function fetchClaimArea(areaId: string): Promise<ClaimAreaResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/world/areas/${areaId}`, {
+      cache: "no-store",
+      credentials: "include",
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        area: null,
+        status: response.status,
+        error: await readApiError(response, "Area request failed."),
+      };
+    }
+
+    return {
+      ok: true,
+      area: (await response.json()) as ClaimAreaSummary,
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      area: null,
+      status: null,
+      error: "Area request failed.",
+    };
+  }
+}
+
+export async function updateClaimArea(
+  areaId: string,
+  name: string,
+  description: string,
+): Promise<ClaimAreaResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/world/areas/${areaId}`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      credentials: "include",
+      body: JSON.stringify({ name, description }),
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        area: null,
+        status: response.status,
+        error: await readApiError(response, "Area update failed."),
+      };
+    }
+
+    return {
+      ok: true,
+      area: (await response.json()) as ClaimAreaSummary,
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      area: null,
+      status: null,
+      error: "Area update failed.",
+    };
+  }
+}
+
+export async function inviteAreaContributor(
+  areaId: string,
+  publicId: number,
+): Promise<ClaimAreaResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/world/areas/${areaId}/contributors`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      credentials: "include",
+      body: JSON.stringify({ public_id: publicId }),
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        area: null,
+        status: response.status,
+        error: await readApiError(response, "Contributor invite failed."),
+      };
+    }
+
+    return {
+      ok: true,
+      area: (await response.json()) as ClaimAreaSummary,
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      area: null,
+      status: null,
+      error: "Contributor invite failed.",
     };
   }
 }

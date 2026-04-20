@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 - 2026-04-20
+
+- Added claim Areas so new Holder territory can carry owner, size, painted-pixel and contributor information.
+- Added a selected-area panel with owner stats, editable area name and info text, and owner-only contributor invites by public player number.
+- Added a rectangle Holder tool that stages a whole area from two clicked corners while respecting claim connectivity and already-claimed territory rules.
+- Changed Holder claim submission to use a backend batch endpoint so multi-pixel tools save as one validated operation.
+
 ## 0.1.0 - 2026-04-19
 
 - Bundled today's work into the first playable PixelProject milestone: authenticated accounts, Holders, claiming, painting and profile basics.

@@ -81,7 +81,40 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     )
 
     await connection.execute(text("ALTER TABLE world_pixels ADD COLUMN IF NOT EXISTS is_starter BOOLEAN DEFAULT FALSE"))
+    await connection.execute(text("ALTER TABLE world_pixels ADD COLUMN IF NOT EXISTS area_id UUID"))
     await connection.execute(text("ALTER TABLE world_pixels ALTER COLUMN owner_user_id DROP NOT NULL"))
     await connection.execute(text("ALTER TABLE world_pixels ALTER COLUMN color_id DROP NOT NULL"))
     await connection.execute(text("UPDATE world_pixels SET is_starter = FALSE WHERE is_starter IS NULL"))
     await connection.execute(text("ALTER TABLE world_pixels ALTER COLUMN is_starter SET NOT NULL"))
+    await connection.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_world_pixels_area_id ON world_pixels (area_id)")
+    )
+    await connection.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conrelid = 'world_pixels'::regclass
+                      AND confrelid = 'claim_areas'::regclass
+                      AND contype = 'f'
+                      AND conkey = ARRAY[
+                          (
+                              SELECT attnum
+                              FROM pg_attribute
+                              WHERE attrelid = 'world_pixels'::regclass
+                                AND attname = 'area_id'
+                          )
+                      ]::smallint[]
+                ) THEN
+                    ALTER TABLE world_pixels
+                    ADD CONSTRAINT fk_world_pixels_area_id_claim_areas
+                    FOREIGN KEY (area_id) REFERENCES claim_areas(id) ON DELETE SET NULL;
+                END IF;
+            END
+            $$;
+            """
+        )
+    )

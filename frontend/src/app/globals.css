@@ -545,6 +545,129 @@ select {
   text-align: center;
 }
 
+.world-area-panel {
+  position: absolute;
+  z-index: 12;
+  top: 5rem;
+  right: 1rem;
+  width: min(360px, calc(100vw - 2rem));
+  max-height: calc(100vh - 10rem);
+  display: grid;
+  gap: 0.8rem;
+  overflow-y: auto;
+  padding: 0.95rem;
+  border: 1px solid var(--hud-border);
+  border-radius: 18px;
+  background: var(--hud-background);
+  color: var(--hud-text);
+  backdrop-filter: blur(16px);
+}
+
+.area-panel-header {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.area-panel-header strong {
+  font-size: 1.05rem;
+}
+
+.area-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
+.area-stat-grid article {
+  min-width: 0;
+  display: grid;
+  gap: 0.15rem;
+  padding: 0.62rem;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.area-stat-grid span,
+.area-stat-grid small,
+.area-description,
+.area-contributor-list small {
+  color: var(--modal-copy);
+}
+
+.area-stat-grid span {
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.area-stat-grid strong {
+  overflow-wrap: anywhere;
+}
+
+.area-owner-tools,
+.area-contributor-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.area-description {
+  margin: 0;
+  line-height: 1.55;
+}
+
+.area-input {
+  min-height: 42px;
+  border-radius: 12px;
+}
+
+.area-textarea {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.area-action-button {
+  min-height: 42px;
+  margin-top: 0;
+}
+
+.area-invite-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 104px;
+  gap: 0.55rem;
+}
+
+.claim-tool-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 0.8rem;
+}
+
+.claim-tool-row span {
+  grid-column: 1 / -1;
+  color: var(--modal-copy);
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-align: center;
+}
+
+.claim-tool-button {
+  min-height: 40px;
+  border: 1px solid var(--hud-border);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--hud-text);
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.claim-tool-button.is-active {
+  border-color: rgba(125, 211, 165, 0.42);
+  background: rgba(125, 211, 165, 0.14);
+}
+
 .pixel-placement-panel {
   width: min(420px, calc(100vw - 2rem));
   padding: 0.9rem 1rem;
@@ -1423,6 +1546,16 @@ select {
   .world-hud-bottom {
     right: 0.8rem;
     bottom: 0.8rem;
+  }
+
+  .world-area-panel {
+    top: 4.6rem;
+    right: 0.8rem;
+    max-height: calc(100vh - 15rem);
+  }
+
+  .area-stat-grid {
+    grid-template-columns: 1fr;
   }
 
   .world-hud-bottom-center {

@@ -1,11 +1,15 @@
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, tuple_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from PIL import Image
 
 from app.core.config import Settings, get_settings
+from app.models.area_contributor import AreaContributor
+from app.models.claim_area import ClaimArea
 from app.models.user import User
 from app.models.world_chunk import WorldChunk
 from app.models.world_pixel import WorldPixel
@@ -17,7 +21,11 @@ from app.modules.auth.service import (
 )
 from app.schemas.world import (
     PixelClaimResponse,
+    PixelBatchClaimResponse,
     PixelPaintResponse,
+    AreaContributorSummary,
+    AreaOwnerSummary,
+    ClaimAreaSummary,
     WorldPixelSummary,
     WorldPixelWindow,
 )
@@ -61,6 +69,9 @@ MAX_VISIBLE_PIXELS = 5000
 WORLD_TILE_SIZE = 1000
 WORLD_TILE_CACHE_DIR = Path(".tile-cache")
 WORLD_TILE_LAYERS = {"claims", "paint"}
+MAX_BATCH_CLAIM_PIXELS = 4096
+AREA_NAME_MAX_LENGTH = 80
+AREA_DESCRIPTION_MAX_LENGTH = 1200
 STARTER_FRONTIER_COORDINATES = [
     (-1, 0),
     (0, -1),
@@ -139,9 +150,56 @@ def build_world_pixel_summary(pixel: WorldPixel, owner: User | None) -> WorldPix
         owner_user_id=pixel.owner_user_id,
         owner_public_id=owner.public_id if owner is not None else None,
         owner_display_name=owner.display_name if owner is not None else None,
+        area_id=pixel.area_id,
         is_starter=pixel.is_starter,
         created_at=pixel.created_at,
         updated_at=pixel.updated_at,
+    )
+
+
+async def build_claim_area_summary(
+    session: AsyncSession,
+    area: ClaimArea,
+    owner: User,
+    viewer: User | None = None,
+) -> ClaimAreaSummary:
+    contributor_rows = await session.execute(
+        select(User)
+        .join(AreaContributor, AreaContributor.user_id == User.id)
+        .where(AreaContributor.area_id == area.id)
+        .order_by(User.public_id)
+    )
+    contributors = contributor_rows.scalars().all()
+    viewer_can_edit = viewer is not None and viewer.id == area.owner_user_id
+    viewer_can_paint = viewer_can_edit or (
+        viewer is not None and any(contributor.id == viewer.id for contributor in contributors)
+    )
+
+    return ClaimAreaSummary(
+        id=area.id,
+        name=area.name,
+        description=area.description,
+        owner=AreaOwnerSummary(
+            id=owner.id,
+            public_id=owner.public_id,
+            display_name=owner.display_name,
+        ),
+        claimed_pixels_count=area.claimed_pixels_count,
+        painted_pixels_count=area.painted_pixels_count,
+        contributor_count=len(contributors),
+        contributors=[
+            AreaContributorSummary(
+                id=contributor.id,
+                public_id=contributor.public_id,
+                display_name=contributor.display_name,
+            )
+            for contributor in contributors
+        ],
+        viewer_can_edit=viewer_can_edit,
+        viewer_can_paint=viewer_can_paint,
+        created_at=area.created_at,
+        updated_at=area.updated_at,
+        last_activity_at=area.last_activity_at,
     )
 
 
@@ -181,6 +239,51 @@ async def ensure_starter_claim_frontier(
         )
 
     await session.commit()
+
+
+async def ensure_legacy_claim_areas(session: AsyncSession) -> None:
+    result = await session.scalars(
+        select(WorldPixel.owner_user_id)
+        .where(
+            WorldPixel.owner_user_id.is_not(None),
+            WorldPixel.area_id.is_(None),
+            WorldPixel.is_starter.is_(False),
+        )
+        .distinct()
+    )
+    owner_ids = [owner_id for owner_id in result.all() if owner_id is not None]
+
+    for owner_id in owner_ids:
+        pixels = (
+            await session.scalars(
+                select(WorldPixel).where(
+                    WorldPixel.owner_user_id == owner_id,
+                    WorldPixel.area_id.is_(None),
+                    WorldPixel.is_starter.is_(False),
+                )
+            )
+        ).all()
+
+        if not pixels:
+            continue
+
+        now = datetime.now(timezone.utc)
+        area = ClaimArea(
+            owner_user_id=owner_id,
+            name="Imported area",
+            description="",
+            claimed_pixels_count=len(pixels),
+            painted_pixels_count=sum(1 for pixel in pixels if pixel.color_id is not None),
+            last_activity_at=max((pixel.updated_at for pixel in pixels), default=now),
+        )
+        session.add(area)
+        await session.flush()
+
+        for pixel in pixels:
+            pixel.area_id = area.id
+
+    if owner_ids:
+        await session.commit()
 
 
 async def get_visible_world_pixels(
@@ -281,6 +384,140 @@ async def ensure_world_tile_png(
     return tile_path
 
 
+def _normalize_area_name(name: str | None) -> str:
+    compact = " ".join((name or "").split())
+    if not compact:
+        return "Untitled area"
+    return compact[:AREA_NAME_MAX_LENGTH]
+
+
+def _normalize_area_description(description: str | None) -> str:
+    compact = (description or "").strip()
+    return compact[:AREA_DESCRIPTION_MAX_LENGTH]
+
+
+def _normalize_batch_pixels(pixels: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    unique_pixels: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+
+    for pixel in pixels:
+        if pixel in seen:
+            continue
+
+        seen.add(pixel)
+        unique_pixels.append(pixel)
+
+    if not unique_pixels:
+        raise PixelPlacementError("No claim pixels were submitted.", 422)
+
+    if len(unique_pixels) > MAX_BATCH_CLAIM_PIXELS:
+        raise PixelPlacementError(
+            f"Claim batches are limited to {MAX_BATCH_CLAIM_PIXELS} pixels.",
+            413,
+        )
+
+    return unique_pixels
+
+
+def _validate_connected_pixels(pixels: list[tuple[int, int]]) -> None:
+    pixel_set = set(pixels)
+    visited: set[tuple[int, int]] = set()
+    stack = [pixels[0]]
+
+    while stack:
+        x, y = stack.pop()
+
+        if (x, y) in visited:
+            continue
+
+        visited.add((x, y))
+
+        for neighbor in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if neighbor in pixel_set and neighbor not in visited:
+                stack.append(neighbor)
+
+    if len(visited) != len(pixel_set):
+        raise PixelPlacementError("Claim batches must be one connected shape.", 422)
+
+
+def _get_neighbor_coordinates(pixels: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    pixel_set = set(pixels)
+    neighbors: set[tuple[int, int]] = set()
+
+    for x, y in pixels:
+        for neighbor in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if neighbor not in pixel_set:
+                neighbors.add(neighbor)
+
+    return list(neighbors)
+
+
+async def _get_existing_pixels_at(
+    session: AsyncSession,
+    coordinates: list[tuple[int, int]],
+) -> list[WorldPixel]:
+    if not coordinates:
+        return []
+
+    result = await session.scalars(
+        select(WorldPixel).where(tuple_(WorldPixel.x, WorldPixel.y).in_(coordinates))
+    )
+    return result.all()
+
+
+async def _get_adjacent_claim_pixels(
+    session: AsyncSession,
+    pixels: list[tuple[int, int]],
+) -> list[WorldPixel]:
+    return await _get_existing_pixels_at(session, _get_neighbor_coordinates(pixels))
+
+
+async def _resolve_target_area_for_claim(
+    session: AsyncSession,
+    user: User,
+    adjacent_pixels: list[WorldPixel],
+    now: datetime,
+) -> ClaimArea:
+    owned_area_ids = [
+        pixel.area_id
+        for pixel in adjacent_pixels
+        if pixel.owner_user_id == user.id and pixel.area_id is not None
+    ]
+
+    if owned_area_ids:
+        area = await session.get(ClaimArea, owned_area_ids[0])
+        if area is not None:
+            return area
+
+    area = ClaimArea(
+        owner_user_id=user.id,
+        name="Untitled area",
+        description="",
+        claimed_pixels_count=0,
+        painted_pixels_count=0,
+        last_activity_at=now,
+    )
+    session.add(area)
+    await session.flush()
+    return area
+
+
+async def _user_can_paint_area(session: AsyncSession, user: User, area: ClaimArea | None) -> bool:
+    if area is None:
+        return False
+
+    if area.owner_user_id == user.id:
+        return True
+
+    contributor = await session.scalar(
+        select(AreaContributor).where(
+            AreaContributor.area_id == area.id,
+            AreaContributor.user_id == user.id,
+        )
+    )
+    return contributor is not None
+
+
 async def _validate_inside_active_world(session: AsyncSession, x: int, y: int) -> None:
     active_chunk = await session.scalar(
         select(WorldChunk).where(
@@ -308,6 +545,105 @@ async def _has_adjacent_claim(session: AsyncSession, x: int, y: int) -> bool:
     return any(pixel.is_starter or pixel.owner_user_id is not None for pixel in result.all())
 
 
+async def get_claim_area_details(
+    session: AsyncSession,
+    area_id: UUID,
+    viewer: User | None = None,
+) -> ClaimAreaSummary:
+    row = await session.execute(
+        select(ClaimArea, User)
+        .join(User, User.id == ClaimArea.owner_user_id)
+        .where(ClaimArea.id == area_id)
+    )
+    result = row.first()
+
+    if result is None:
+        raise PixelPlacementError("Area not found.", 404)
+
+    area, owner = result
+    return await build_claim_area_summary(session, area, owner, viewer)
+
+
+async def update_claim_area_metadata(
+    session: AsyncSession,
+    area_id: UUID,
+    user: User,
+    name: str | None,
+    description: str | None,
+) -> ClaimAreaSummary:
+    row = await session.execute(
+        select(ClaimArea, User)
+        .join(User, User.id == ClaimArea.owner_user_id)
+        .where(ClaimArea.id == area_id)
+    )
+    result = row.first()
+
+    if result is None:
+        raise PixelPlacementError("Area not found.", 404)
+
+    area, owner = result
+    if area.owner_user_id != user.id:
+        raise PixelPlacementError("Only the area owner can edit this area.", 403)
+
+    if name is not None:
+        area.name = _normalize_area_name(name)
+
+    if description is not None:
+        area.description = _normalize_area_description(description)
+
+    await session.commit()
+    await session.refresh(area)
+    return await build_claim_area_summary(session, area, owner, user)
+
+
+async def invite_area_contributor(
+    session: AsyncSession,
+    area_id: UUID,
+    owner: User,
+    contributor_public_id: int,
+) -> ClaimAreaSummary:
+    row = await session.execute(
+        select(ClaimArea, User)
+        .join(User, User.id == ClaimArea.owner_user_id)
+        .where(ClaimArea.id == area_id)
+    )
+    result = row.first()
+
+    if result is None:
+        raise PixelPlacementError("Area not found.", 404)
+
+    area, area_owner = result
+    if area.owner_user_id != owner.id:
+        raise PixelPlacementError("Only the area owner can invite contributors.", 403)
+
+    contributor = await session.scalar(select(User).where(User.public_id == contributor_public_id))
+    if contributor is None:
+        raise PixelPlacementError("No player with this public number was found.", 404)
+
+    if contributor.id == owner.id:
+        raise PixelPlacementError("The owner already has full access to this area.", 409)
+
+    existing = await session.scalar(
+        select(AreaContributor).where(
+            AreaContributor.area_id == area.id,
+            AreaContributor.user_id == contributor.id,
+        )
+    )
+
+    if existing is None:
+        session.add(
+            AreaContributor(
+                area_id=area.id,
+                user_id=contributor.id,
+                invited_by_user_id=owner.id,
+            )
+        )
+        await session.commit()
+
+    await session.refresh(area)
+    return await build_claim_area_summary(session, area, area_owner, owner)
+
+
 async def claim_world_pixel(
     session: AsyncSession,
     user: User,
@@ -315,48 +651,87 @@ async def claim_world_pixel(
     y: int,
     settings: Settings | None = None,
 ) -> PixelClaimResponse:
+    batch = await claim_world_pixels(session, user, [(x, y)], settings)
+
+    return PixelClaimResponse(
+        pixel=batch.pixels[0],
+        user=batch.user,
+    )
+
+
+async def claim_world_pixels(
+    session: AsyncSession,
+    user: User,
+    pixels: list[tuple[int, int]],
+    settings: Settings | None = None,
+) -> PixelBatchClaimResponse:
     resolved_settings = settings or get_settings()
     now = datetime.now(timezone.utc)
+    normalized_pixels = _normalize_batch_pixels(pixels)
 
-    await _validate_inside_active_world(session, x, y)
+    _validate_connected_pixels(normalized_pixels)
 
-    existing = await session.scalar(select(WorldPixel).where(WorldPixel.x == x, WorldPixel.y == y))
-    if existing is not None:
-        raise PixelPlacementError("This pixel is already part of an existing claim.", 409)
+    for x, y in normalized_pixels:
+        await _validate_inside_active_world(session, x, y)
 
-    if not await _has_adjacent_claim(session, x, y):
+    existing_pixels = await _get_existing_pixels_at(session, normalized_pixels)
+    if existing_pixels:
+        raise PixelPlacementError("This claim includes territory that is already claimed.", 409)
+
+    adjacent_pixels = await _get_adjacent_claim_pixels(session, normalized_pixels)
+    touches_existing_claim = any(pixel.is_starter or pixel.owner_user_id is not None for pixel in adjacent_pixels)
+
+    if not touches_existing_claim:
         raise PixelPlacementError(
             "Claims must touch an existing claimed pixel or the starter frontier.",
             422,
         )
 
     try:
-        await spend_holders(session, user, 1, resolved_settings, now)
+        await spend_holders(session, user, len(normalized_pixels), resolved_settings, now)
     except UserStateError as error:
         raise PixelPlacementError(error.detail, error.status_code) from error
 
-    chunk_x, chunk_y = get_chunk_coordinates_for_pixel(x, y, resolved_settings)
-    pixel = WorldPixel(
-        x=x,
-        y=y,
-        chunk_x=chunk_x,
-        chunk_y=chunk_y,
-        color_id=None,
-        owner_user_id=user.id,
-        is_starter=False,
-    )
-    session.add(pixel)
-    user.holders_placed_total += 1
-    user.claimed_pixels_count += 1
+    area = await _resolve_target_area_for_claim(session, user, adjacent_pixels, now)
+    claimed_pixels: list[WorldPixel] = []
 
-    await session.commit()
-    invalidate_world_tile_for_pixel(x, y, {"claims"})
-    await session.refresh(pixel)
+    for x, y in normalized_pixels:
+        chunk_x, chunk_y = get_chunk_coordinates_for_pixel(x, y, resolved_settings)
+        pixel = WorldPixel(
+            x=x,
+            y=y,
+            chunk_x=chunk_x,
+            chunk_y=chunk_y,
+            color_id=None,
+            owner_user_id=user.id,
+            area_id=area.id,
+            is_starter=False,
+        )
+        session.add(pixel)
+        claimed_pixels.append(pixel)
+
+    area.claimed_pixels_count += len(claimed_pixels)
+    area.last_activity_at = now
+    user.holders_placed_total += len(claimed_pixels)
+    user.claimed_pixels_count += len(claimed_pixels)
+
+    try:
+        await session.commit()
+    except IntegrityError as error:
+        await session.rollback()
+        raise PixelPlacementError("This claim conflicts with a recent claim. Try again.", 409) from error
+
+    for pixel in claimed_pixels:
+        invalidate_world_tile_for_pixel(pixel.x, pixel.y, {"claims"})
+        await session.refresh(pixel)
+
+    await session.refresh(area)
     await session.refresh(user)
 
-    return PixelClaimResponse(
-        pixel=build_world_pixel_summary(pixel, user),
+    return PixelBatchClaimResponse(
+        pixels=[build_world_pixel_summary(pixel, user) for pixel in claimed_pixels],
         user=build_auth_user_summary(user, resolved_settings),
+        area=await build_claim_area_summary(session, area, user, user),
     )
 
 
@@ -379,11 +754,20 @@ async def paint_world_pixel(
     if pixel is None or pixel.owner_user_id is None or pixel.is_starter:
         raise PixelPlacementError("This pixel is not claimed yet.", 422)
 
-    if pixel.owner_user_id != user.id:
-        raise PixelPlacementError("You can only paint inside your own claimed area.", 403)
+    area = await session.get(ClaimArea, pixel.area_id) if pixel.area_id is not None else None
+    owner = user if pixel.owner_user_id == user.id else await session.get(User, pixel.owner_user_id)
+
+    if pixel.owner_user_id != user.id and not await _user_can_paint_area(session, user, area):
+        raise PixelPlacementError("You can only paint inside owned or contributed areas.", 403)
 
     await apply_holder_regeneration(session, user, resolved_settings)
+    was_unpainted = pixel.color_id is None
     pixel.color_id = color_id
+
+    if area is not None:
+        if was_unpainted:
+            area.painted_pixels_count += 1
+        area.last_activity_at = datetime.now(timezone.utc)
 
     await session.commit()
     invalidate_world_tile_for_pixel(x, y, {"paint"})
@@ -391,6 +775,6 @@ async def paint_world_pixel(
     await session.refresh(user)
 
     return PixelPaintResponse(
-        pixel=build_world_pixel_summary(pixel, user),
+        pixel=build_world_pixel_summary(pixel, owner),
         user=build_auth_user_summary(user, resolved_settings),
     )

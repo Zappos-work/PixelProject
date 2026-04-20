@@ -74,6 +74,7 @@ class WorldPixelSummary(BaseModel):
     owner_user_id: UUID | None
     owner_public_id: int | None
     owner_display_name: str | None
+    area_id: UUID | None
     is_starter: bool
     created_at: datetime
     updated_at: datetime
@@ -93,6 +94,10 @@ class PixelClaimRequest(BaseModel):
     y: int
 
 
+class PixelBatchClaimRequest(BaseModel):
+    pixels: list[Point]
+
+
 class PixelClaimResponse(BaseModel):
     pixel: WorldPixelSummary
     user: AuthUserSummary
@@ -107,3 +112,46 @@ class PixelPaintRequest(BaseModel):
 class PixelPaintResponse(BaseModel):
     pixel: WorldPixelSummary
     user: AuthUserSummary
+
+
+class AreaOwnerSummary(BaseModel):
+    id: UUID
+    public_id: int
+    display_name: str
+
+
+class AreaContributorSummary(BaseModel):
+    id: UUID
+    public_id: int
+    display_name: str
+
+
+class ClaimAreaSummary(BaseModel):
+    id: UUID
+    name: str
+    description: str
+    owner: AreaOwnerSummary
+    claimed_pixels_count: int
+    painted_pixels_count: int
+    contributor_count: int
+    contributors: list[AreaContributorSummary]
+    viewer_can_edit: bool
+    viewer_can_paint: bool
+    created_at: datetime
+    updated_at: datetime
+    last_activity_at: datetime
+
+
+class PixelBatchClaimResponse(BaseModel):
+    pixels: list[WorldPixelSummary]
+    user: AuthUserSummary
+    area: ClaimAreaSummary
+
+
+class ClaimAreaUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+
+
+class AreaContributorInviteRequest(BaseModel):
+    public_id: int

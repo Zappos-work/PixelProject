@@ -1,11 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from uuid import UUID
 
 from app.core.config import get_settings
 from app.db.session import get_db
 from app.modules.auth.service import resolve_authenticated_user
 from app.schemas.world import (
+    AreaContributorInviteRequest,
+    ClaimAreaSummary,
+    ClaimAreaUpdateRequest,
+    PixelBatchClaimRequest,
+    PixelBatchClaimResponse,
     PixelClaimRequest,
     PixelClaimResponse,
     PixelColor,
@@ -19,9 +25,13 @@ from app.services.pixels import (
     PixelPlacementError,
     WorldTileError,
     claim_world_pixel,
+    claim_world_pixels,
     ensure_world_tile_png,
+    get_claim_area_details,
     get_visible_world_pixels,
+    invite_area_contributor,
     paint_world_pixel,
+    update_claim_area_metadata,
 )
 from app.services.world import get_world_overview
 
@@ -89,6 +99,29 @@ async def claim_pixel(
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 
 
+@router.post("/claims/batch", response_model=PixelBatchClaimResponse)
+async def claim_pixels(
+    payload: PixelBatchClaimRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> PixelBatchClaimResponse:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, session, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    try:
+        return await claim_world_pixels(
+            session,
+            user,
+            [(pixel.x, pixel.y) for pixel in payload.pixels],
+            settings,
+        )
+    except PixelPlacementError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+
 @router.post("/pixels", response_model=PixelPaintResponse)
 async def paint_pixel(
     payload: PixelPaintRequest,
@@ -103,5 +136,58 @@ async def paint_pixel(
 
     try:
         return await paint_world_pixel(session, user, payload.x, payload.y, payload.color_id, settings)
+    except PixelPlacementError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+
+@router.get("/areas/{area_id}", response_model=ClaimAreaSummary)
+async def get_area(
+    area_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> ClaimAreaSummary:
+    settings = get_settings()
+    viewer = await resolve_authenticated_user(request, session, settings)
+
+    try:
+        return await get_claim_area_details(session, area_id, viewer)
+    except PixelPlacementError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+
+@router.patch("/areas/{area_id}", response_model=ClaimAreaSummary)
+async def patch_area(
+    area_id: UUID,
+    payload: ClaimAreaUpdateRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> ClaimAreaSummary:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, session, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    try:
+        return await update_claim_area_metadata(session, area_id, user, payload.name, payload.description)
+    except PixelPlacementError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+
+@router.post("/areas/{area_id}/contributors", response_model=ClaimAreaSummary)
+async def post_area_contributor(
+    area_id: UUID,
+    payload: AreaContributorInviteRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> ClaimAreaSummary:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, session, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    try:
+        return await invite_area_contributor(session, area_id, user, payload.public_id)
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error

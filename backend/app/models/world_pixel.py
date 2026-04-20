@@ -24,6 +24,12 @@ class WorldPixel(Base):
         index=True,
         nullable=True,
     )
+    area_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("claim_areas.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
     is_starter: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

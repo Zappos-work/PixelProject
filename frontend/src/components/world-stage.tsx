@@ -4,17 +4,21 @@ import Image from "next/image";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
-  claimWorldPixel,
+  claimWorldPixels,
+  fetchClaimArea,
   fetchAuthSession,
   fetchVisibleWorldPixels,
   getClientApiBaseUrl,
   getWorldTileUrl,
+  inviteAreaContributor,
   logoutAuthSession,
   paintWorldPixel,
+  updateClaimArea,
   updateDisplayName,
   uploadAvatar,
   type AuthUser,
   type AuthSessionStatus,
+  type ClaimAreaSummary,
   type WorldOverview,
   type WorldPixel,
 } from "@/lib/api";
@@ -38,6 +42,8 @@ type PanDragState = {
 type DragState = PanDragState;
 
 type BuildMode = "claim" | "paint";
+
+type ClaimTool = "brush" | "rectangle";
 
 type PointerPosition = {
   x: number;
@@ -378,6 +384,22 @@ function getPixelLine(start: PixelCoordinate, end: PixelCoordinate): PixelCoordi
   }
 
   return points;
+}
+
+function getRectanglePixels(start: PixelCoordinate, end: PixelCoordinate): PixelCoordinate[] {
+  const minX = Math.min(start.x, end.x);
+  const maxX = Math.max(start.x, end.x);
+  const minY = Math.min(start.y, end.y);
+  const maxY = Math.max(start.y, end.y);
+  const pixels: PixelCoordinate[] = [];
+
+  for (let y = minY; y <= maxY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      pixels.push({ x, y });
+    }
+  }
+
+  return pixels;
 }
 
 function formatDateTime(value: string): string {
@@ -788,6 +810,9 @@ export function WorldStage({ world }: WorldStageProps) {
   const pendingPaintsRef = useRef<PendingPaint[]>([]);
   const pendingPaintMapRef = useRef<Map<string, PendingPaint>>(new Map());
   const activeBuildModeRef = useRef<BuildMode>("claim");
+  const claimToolRef = useRef<ClaimTool>("brush");
+  const rectangleAnchorRef = useRef<PixelCoordinate | null>(null);
+  const knownPaintableAreaIdsRef = useRef<Set<string>>(new Set());
   const selectedColorIdRef = useRef(DEFAULT_COLOR_ID);
   const zoomRef = useRef(DEFAULT_ZOOM);
   const cameraRef = useRef<CameraState>({
@@ -817,6 +842,8 @@ export function WorldStage({ world }: WorldStageProps) {
   const [selectedPixel, setSelectedPixel] = useState<PixelCoordinate | null>(null);
   const [selectedColorId, setSelectedColorId] = useState(DEFAULT_COLOR_ID);
   const [activeBuildMode, setActiveBuildMode] = useState<BuildMode>("claim");
+  const [claimTool, setClaimTool] = useState<ClaimTool>("brush");
+  const [rectangleAnchor, setRectangleAnchor] = useState<PixelCoordinate | null>(null);
   const [buildPanelOpen, setBuildPanelOpen] = useState(false);
   const [buildPanelPosition, setBuildPanelPosition] = useState<BuildPanelPosition | null>(null);
   const [pendingClaims, setPendingClaims] = useState<PixelCoordinate[]>([]);
@@ -828,6 +855,12 @@ export function WorldStage({ world }: WorldStageProps) {
   const [viewportSize, setViewportSize] = useState<ViewportSize>({ width: 0, height: 0 });
   const [isCentered, setIsCentered] = useState(false);
   const [spaceToolActive, setSpaceToolActive] = useState(false);
+  const [selectedArea, setSelectedArea] = useState<ClaimAreaSummary | null>(null);
+  const [areaPanelBusy, setAreaPanelBusy] = useState(false);
+  const [areaDraftName, setAreaDraftName] = useState("");
+  const [areaDraftDescription, setAreaDraftDescription] = useState("");
+  const [areaInvitePublicId, setAreaInvitePublicId] = useState("");
+  const [areaMessage, setAreaMessage] = useState<ProfileMessage | null>(null);
   worldRenderCountRef.current += 1;
 
   const refreshAuthStatus = useCallback(async (showLoading = true): Promise<void> => {
@@ -1126,6 +1159,8 @@ export function WorldStage({ world }: WorldStageProps) {
   currentUserRef.current = currentUser;
   activeWorldBoundsRef.current = activeWorldBounds;
   activeBuildModeRef.current = activeBuildMode;
+  claimToolRef.current = claimTool;
+  rectangleAnchorRef.current = rectangleAnchor;
   selectedColorIdRef.current = selectedColorId;
   zoomRef.current = camera.zoom;
   cameraRef.current = camera;
@@ -1531,7 +1566,10 @@ export function WorldStage({ world }: WorldStageProps) {
     const canPaint =
       pixelRecord !== null &&
       !pixelRecord.is_starter &&
-      pixelRecord.owner_user_id === nextUser.id &&
+      (
+        pixelRecord.owner_user_id === nextUser.id ||
+        (pixelRecord.area_id !== null && knownPaintableAreaIdsRef.current.has(pixelRecord.area_id))
+      ) &&
       !isPendingClaim;
     let canClaim = false;
 
@@ -1573,6 +1611,51 @@ export function WorldStage({ world }: WorldStageProps) {
       setSelectedColorId(selectedPixelRecord.color_id);
     }
   }, [selectedPendingPaint, selectedPixelRecord]);
+
+  useEffect(() => {
+    const areaId = selectedPixelRecord?.area_id ?? null;
+
+    if (areaId === null) {
+      setSelectedArea(null);
+      setAreaPanelBusy(false);
+      setAreaMessage(null);
+      return;
+    }
+
+    let cancelled = false;
+    setAreaPanelBusy(true);
+    setAreaMessage(null);
+
+    void fetchClaimArea(areaId).then((result) => {
+      if (cancelled) {
+        return;
+      }
+
+      setAreaPanelBusy(false);
+
+      if (!result.ok || result.area === null) {
+        setSelectedArea(null);
+        setAreaMessage({
+          tone: "error",
+          text: result.error ?? "Area details could not be loaded.",
+        });
+        return;
+      }
+
+      setSelectedArea(result.area);
+      setAreaDraftName(result.area.name);
+      setAreaDraftDescription(result.area.description);
+      setAreaInvitePublicId("");
+
+      if (result.area.viewer_can_paint) {
+        knownPaintableAreaIdsRef.current.add(result.area.id);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedPixelRecord?.area_id]);
 
   const renderedPendingClaims = useMemo(() => {
     return pendingClaims.map((pixel) => ({
@@ -1647,8 +1730,12 @@ export function WorldStage({ world }: WorldStageProps) {
       return selectedPendingPaint ? "Pending paint change" : "Your claimed territory";
     }
 
+    if (selectedArea?.viewer_can_paint) {
+      return "Contributor access";
+    }
+
     return `Claimed by #${selectedPixelRecord.owner_public_id}`;
-  }, [currentUser, selectedPendingPaint, selectedPixel, selectedPixelRecord, selectedPlacementState.isPendingClaim]);
+  }, [currentUser, selectedArea?.viewer_can_paint, selectedPendingPaint, selectedPixel, selectedPixelRecord, selectedPlacementState.isPendingClaim]);
 
   const placementHelpText = useMemo(() => {
     if (currentUser === null) {
@@ -1666,6 +1753,12 @@ export function WorldStage({ world }: WorldStageProps) {
     }
 
     if (activeBuildMode === "claim") {
+      if (claimTool === "rectangle") {
+        return rectangleAnchor
+          ? "Click the opposite corner. The rectangle cannot cover existing claims and must touch the claim route."
+          : "Click the first rectangle corner, then click the opposite corner to stage a Holder area.";
+      }
+
       if (selectedPlacementState.isPendingClaim) {
         return "This Holder claim is staged locally. Submit the pending claims when your shape is ready.";
       }
@@ -1682,7 +1775,7 @@ export function WorldStage({ world }: WorldStageProps) {
     }
 
     if (canPaintSelectedPixel) {
-      return "Normal mode only paints your claimed territory. Choose a palette color, press Space over cells, then submit.";
+      return "Normal mode paints owned or contributed territory. Choose a palette color, press Space over cells, then submit.";
     }
 
     if (selectedPixelRecord === null || selectedPlacementState.isPendingClaim) {
@@ -1693,13 +1786,15 @@ export function WorldStage({ world }: WorldStageProps) {
       return "Starter frontier cells are reserved and cannot be painted.";
     }
 
-    return "You can only paint inside territory that belongs to you.";
+    return "You can only paint inside territory you own or were invited into.";
   }, [
     activeBuildMode,
     camera.zoom,
     canClaimSelectedPixel,
     canPaintSelectedPixel,
+    claimTool,
     currentUser,
+    rectangleAnchor,
     selectedPendingPaint,
     selectedPixel,
     selectedPixelRecord,
@@ -1813,7 +1908,7 @@ export function WorldStage({ world }: WorldStageProps) {
       if (!options?.quiet) {
         setPlacementMessage({
           tone: "error",
-          text: "Normal mode only paints your own claimed territory.",
+          text: "Normal mode only paints territory you own or were invited into.",
         });
       }
       return false;
@@ -1833,6 +1928,74 @@ export function WorldStage({ world }: WorldStageProps) {
     });
     return true;
   }, [getPlacementState, syncPendingClaims, syncPendingPaints]);
+
+  const stageClaimRectangle = useCallback((start: PixelCoordinate, end: PixelCoordinate): boolean => {
+    setSelectedPixel(end);
+    setBuildPanelOpen(true);
+
+    const nextUser = currentUserRef.current;
+    if (nextUser === null) {
+      setPlacementMessage({ tone: "error", text: "Login required to use the rectangle claim tool." });
+      return false;
+    }
+
+    const rectanglePixels = getRectanglePixels(start, end);
+    const pendingMap = pendingClaimMapRef.current;
+    const newPixels = rectanglePixels.filter((pixel) => !pendingMap.has(getPixelKey(pixel)));
+
+    if (newPixels.length === 0) {
+      setPlacementMessage({ tone: "info", text: "This rectangle is already staged." });
+      return false;
+    }
+
+    const displayedHolders = getCurrentDisplayedHolders(nextUser);
+    if (pendingClaimsRef.current.length + newPixels.length > displayedHolders) {
+      setPlacementMessage({
+        tone: "error",
+        text: "Not enough Holders for this rectangle.",
+      });
+      return false;
+    }
+
+    let touchesClaimRoute = false;
+
+    for (const pixel of newPixels) {
+      const state = getPlacementState(pixel);
+
+      if (!state.isInsideWorld) {
+        setPlacementMessage({ tone: "error", text: "The rectangle leaves the active world." });
+        return false;
+      }
+
+      if (state.pixelRecord !== null) {
+        setPlacementMessage({
+          tone: "error",
+          text: "The rectangle includes already claimed territory.",
+        });
+        return false;
+      }
+
+      if (state.canClaim) {
+        touchesClaimRoute = true;
+      }
+    }
+
+    if (!touchesClaimRoute) {
+      setPlacementMessage({
+        tone: "error",
+        text: "The rectangle must touch the starter frontier, an existing claim or another pending claim.",
+      });
+      return false;
+    }
+
+    const updatedClaims = [...pendingClaimsRef.current, ...newPixels];
+    syncPendingClaims(updatedClaims);
+    setPlacementMessage({
+      tone: "info",
+      text: `${newPixels.length} rectangle claim${newPixels.length === 1 ? "" : "s"} staged locally.`,
+    });
+    return true;
+  }, [getPlacementState, syncPendingClaims]);
 
   const stageSpaceStroke = useCallback((targetPixel: PixelCoordinate): void => {
     let stroke = spaceStrokeRef.current;
@@ -2001,9 +2164,26 @@ export function WorldStage({ world }: WorldStageProps) {
     }
 
     if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) <= CLICK_DISTANCE) {
-      setSelectedPixel(getEventPixel(event));
+      const clickedPixel = getEventPixel(event);
+      setSelectedPixel(clickedPixel);
       setBuildPanelOpen(true);
       setPlacementMessage(null);
+
+      if (activeBuildModeRef.current === "claim" && claimToolRef.current === "rectangle") {
+        const anchor = rectangleAnchorRef.current;
+
+        if (anchor === null) {
+          setRectangleAnchor(clickedPixel);
+          setPlacementMessage({
+            tone: "info",
+            text: "Rectangle start set. Click the opposite corner to stage the claim.",
+          });
+          return;
+        }
+
+        stageClaimRectangle(anchor, clickedPixel);
+        setRectangleAnchor(null);
+      }
     }
   }
 
@@ -2101,6 +2281,9 @@ export function WorldStage({ world }: WorldStageProps) {
   }
 
   const applySavedPixel = useCallback((nextPixel: WorldPixel, nextUser: AuthUser): void => {
+    const previousPixel = visiblePixelsRef.current.find(
+      (pixel) => pixel.id === nextPixel.id || (pixel.x === nextPixel.x && pixel.y === nextPixel.y),
+    );
     const nextPixels = visiblePixelsRef.current.filter(
       (pixel) => pixel.id !== nextPixel.id && !(pixel.x === nextPixel.x && pixel.y === nextPixel.y),
     );
@@ -2115,6 +2298,21 @@ export function WorldStage({ world }: WorldStageProps) {
     }));
     markWorldTileDirty(nextPixel);
     setSelectedPixel({ x: nextPixel.x, y: nextPixel.y });
+    setSelectedArea((currentArea) => {
+      if (
+        currentArea === null ||
+        nextPixel.area_id !== currentArea.id ||
+        nextPixel.color_id === null ||
+        previousPixel?.color_id !== null
+      ) {
+        return currentArea;
+      }
+
+      return {
+        ...currentArea,
+        painted_pixels_count: currentArea.painted_pixels_count + 1,
+      };
+    });
   }, [markWorldTileDirty]);
 
   async function handlePlacementAction(): Promise<void> {
@@ -2160,21 +2358,24 @@ export function WorldStage({ world }: WorldStageProps) {
   }
 
   async function submitPendingClaims(claimsToSubmit: PixelCoordinate[]): Promise<number> {
-    for (let index = 0; index < claimsToSubmit.length; index += 1) {
-      const claim = claimsToSubmit[index];
-      const result = await claimWorldPixel(claim.x, claim.y);
+    const result = await claimWorldPixels(claimsToSubmit);
 
-      if (!result.ok || result.pixel === null || result.user === null) {
-        setPlacementMessage({
-          tone: "error",
-          text: result.error ?? "Claim submission failed. Remaining claims stayed pending.",
-        });
-        return index;
-      }
-
-      applySavedPixel(result.pixel, result.user);
+    if (!result.ok || result.user === null || result.area === null || result.pixels.length === 0) {
+      setPlacementMessage({
+        tone: "error",
+        text: result.error ?? "Claim submission failed. Pending claims stayed local.",
+      });
+      return 0;
     }
 
+    for (const pixel of result.pixels) {
+      applySavedPixel(pixel, result.user);
+    }
+
+    setSelectedArea(result.area);
+    setAreaDraftName(result.area.name);
+    setAreaDraftDescription(result.area.description);
+    knownPaintableAreaIdsRef.current.add(result.area.id);
     return -1;
   }
 
@@ -2197,11 +2398,92 @@ export function WorldStage({ world }: WorldStageProps) {
     return -1;
   }
 
+  async function handleAreaSave(): Promise<void> {
+    if (selectedArea === null || areaPanelBusy) {
+      return;
+    }
+
+    setAreaPanelBusy(true);
+    setAreaMessage(null);
+
+    const result = await updateClaimArea(selectedArea.id, areaDraftName, areaDraftDescription);
+
+    if (!result.ok || result.area === null) {
+      setAreaMessage({
+        tone: "error",
+        text: result.error ?? "Area update failed.",
+      });
+      setAreaPanelBusy(false);
+      return;
+    }
+
+    setSelectedArea(result.area);
+    setAreaDraftName(result.area.name);
+    setAreaDraftDescription(result.area.description);
+    setAreaMessage({
+      tone: "success",
+      text: "Area info saved.",
+    });
+    setAreaPanelBusy(false);
+  }
+
+  async function handleAreaInvite(): Promise<void> {
+    if (selectedArea === null || areaPanelBusy) {
+      return;
+    }
+
+    const publicId = Number.parseInt(areaInvitePublicId.trim().replace(/^#/, ""), 10);
+
+    if (!Number.isFinite(publicId)) {
+      setAreaMessage({
+        tone: "error",
+        text: "Enter a valid public player number.",
+      });
+      return;
+    }
+
+    setAreaPanelBusy(true);
+    setAreaMessage(null);
+
+    const result = await inviteAreaContributor(selectedArea.id, publicId);
+
+    if (!result.ok || result.area === null) {
+      setAreaMessage({
+        tone: "error",
+        text: result.error ?? "Contributor invite failed.",
+      });
+      setAreaPanelBusy(false);
+      return;
+    }
+
+    setSelectedArea(result.area);
+    setAreaInvitePublicId("");
+    setAreaMessage({
+      tone: "success",
+      text: `Player #${publicId} can now pixel in this area.`,
+    });
+    setAreaPanelBusy(false);
+  }
+
   function handleBuildModeChange(nextMode: BuildMode): void {
     setActiveBuildMode(nextMode);
     setBuildPanelOpen(true);
     setPlacementMessage(null);
     spaceStrokeRef.current = null;
+
+    if (nextMode !== "claim") {
+      setRectangleAnchor(null);
+    }
+  }
+
+  function handleClaimToolChange(nextTool: ClaimTool): void {
+    setClaimTool(nextTool);
+    setBuildPanelOpen(true);
+    setPlacementMessage(null);
+
+    if (nextTool !== "rectangle") {
+      setRectangleAnchor(null);
+    }
   }
 
   function handleCloseBuildPanel(): void {
@@ -2213,6 +2495,7 @@ export function WorldStage({ world }: WorldStageProps) {
   function handleClearActivePending(): void {
     if (activeBuildMode === "claim") {
       syncPendingClaims([]);
+      setRectangleAnchor(null);
     } else {
       syncPendingPaints([]);
     }
@@ -2343,6 +2626,101 @@ export function WorldStage({ world }: WorldStageProps) {
         </button>
       </div>
 
+      {selectedPixelRecord && !selectedPixelRecord.is_starter ? (
+        <aside className="world-area-panel" aria-label="Selected area information">
+          <div className="area-panel-header">
+            <span className="coordinate-label">Selected area</span>
+            <strong>{areaPanelBusy && selectedArea === null ? "Loading..." : selectedArea?.name ?? "Unassigned claim"}</strong>
+          </div>
+          {selectedArea ? (
+            <>
+              <div className="area-stat-grid">
+                <article>
+                  <span>Owner</span>
+                  <strong>#{selectedArea.owner.public_id}</strong>
+                  <small>{selectedArea.owner.display_name}</small>
+                </article>
+                <article>
+                  <span>Size</span>
+                  <strong>{selectedArea.claimed_pixels_count}</strong>
+                  <small>{selectedArea.painted_pixels_count} painted</small>
+                </article>
+                <article>
+                  <span>Contributors</span>
+                  <strong>{selectedArea.contributor_count}</strong>
+                  <small>{selectedArea.viewer_can_paint ? "You can pixel here" : "View only"}</small>
+                </article>
+              </div>
+              {selectedArea.viewer_can_edit ? (
+                <div className="area-owner-tools">
+                  <label className="account-label" htmlFor="area-name-input">Name</label>
+                  <input
+                    className="account-input area-input"
+                    id="area-name-input"
+                    maxLength={80}
+                    onChange={(event) => setAreaDraftName(event.target.value)}
+                    value={areaDraftName}
+                  />
+                  <label className="account-label" htmlFor="area-description-input">Info</label>
+                  <textarea
+                    className="account-input area-textarea"
+                    id="area-description-input"
+                    maxLength={1200}
+                    onChange={(event) => setAreaDraftDescription(event.target.value)}
+                    placeholder="What is shown here?"
+                    value={areaDraftDescription}
+                  />
+                  <button
+                    className="google-button area-action-button"
+                    disabled={areaPanelBusy}
+                    onClick={() => void handleAreaSave()}
+                    type="button"
+                  >
+                    {areaPanelBusy ? "Saving..." : "Save area info"}
+                  </button>
+                  <label className="account-label" htmlFor="area-invite-input">Invite by #</label>
+                  <div className="area-invite-row">
+                    <input
+                      className="account-input area-input"
+                      id="area-invite-input"
+                      inputMode="numeric"
+                      onChange={(event) => setAreaInvitePublicId(event.target.value)}
+                      placeholder="#123"
+                      value={areaInvitePublicId}
+                    />
+                    <button
+                      className="google-button area-action-button"
+                      disabled={areaPanelBusy}
+                      onClick={() => void handleAreaInvite()}
+                      type="button"
+                    >
+                      Invite
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p className="area-description">
+                  {selectedArea.description || "No area info yet."}
+                </p>
+              )}
+              {selectedArea.contributors.length > 0 ? (
+                <div className="area-contributor-list">
+                  <span className="account-label">Can pixel here</span>
+                  {selectedArea.contributors.map((contributor) => (
+                    <small key={contributor.id}>#{contributor.public_id} {contributor.display_name}</small>
+                  ))}
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <p className="area-description">This older claim is not assigned to an area yet.</p>
+          )}
+          {areaMessage ? (
+            <p className={`account-feedback is-${areaMessage.tone}`}>{areaMessage.text}</p>
+          ) : null}
+        </aside>
+      ) : null}
+
       <div className="world-hud world-hud-bottom-left">
         <div className="coordinate-panel">
           <div className="coordinate-row">
@@ -2435,6 +2813,27 @@ export function WorldStage({ world }: WorldStageProps) {
               </div>
             </div>
             <HolderPanelSummary pendingClaims={pendingClaims.length} user={currentUser} />
+            {activeBuildMode === "claim" ? (
+              <div className="claim-tool-row" aria-label="Holder claim tools">
+                <button
+                  className={`claim-tool-button ${claimTool === "brush" ? "is-active" : ""}`}
+                  onClick={() => handleClaimToolChange("brush")}
+                  type="button"
+                >
+                  Brush
+                </button>
+                <button
+                  className={`claim-tool-button ${claimTool === "rectangle" ? "is-active" : ""}`}
+                  onClick={() => handleClaimToolChange("rectangle")}
+                  type="button"
+                >
+                  Rectangle
+                </button>
+                {rectangleAnchor ? (
+                  <span>{rectangleAnchor.x} : {rectangleAnchor.y}</span>
+                ) : null}
+              </div>
+            ) : null}
             {activeBuildMode === "paint" ? (
               <div className="pixel-palette-grid">
                 {PIXEL_PALETTE.map((color) => (
