@@ -3316,11 +3316,18 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                         <strong>{entry.version}</strong>
                         <span>{entry.date}</span>
                       </div>
-                      <ul>
-                        {entry.changes.map((change) => (
-                          <li key={change}>{change}</li>
+                      <div className="changelog-sections">
+                        {entry.sections.map((section) => (
+                          <section className="changelog-section" key={`${entry.version}-${section.title}`}>
+                            <h3 className="changelog-section-title">{section.title}</h3>
+                            <ul>
+                              {section.items.map((item) => (
+                                <li key={item}>{item}</li>
+                              ))}
+                            </ul>
+                          </section>
                         ))}
-                      </ul>
+                      </div>
                     </div>
                   ))}
                 </div>
