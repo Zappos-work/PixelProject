@@ -6,6 +6,15 @@ export type ChangelogEntry = {
 
 export const APP_CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.1.2",
+    date: "2026-04-20",
+    changes: [
+      "Documented the first production deployment on pixel.zappos-dev.work.",
+      "Added the production deployment runbook with DNS, Caddy, environment, Google OAuth, backup and GitHub Actions notes.",
+      "Updated project foundation and status docs to reflect the live production server.",
+    ],
+  },
+  {
     version: "0.1.1",
     date: "2026-04-20",
     changes: [
