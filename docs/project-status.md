@@ -4,12 +4,12 @@ Last updated: 2026-04-19
 
 ## Current Snapshot
 
-- Current frontend build marker: `0.0.8`.
+- Current frontend build marker: `0.1.0`.
 - Local development stack is running through Docker Compose.
 - Frontend is available on `http://localhost:3000`.
 - Backend API and docs are available on `http://localhost:8000`.
 - PostgreSQL and Redis are connected and included in local startup.
-- A dedicated changelog is now tracked in `docs/changelog.md` and mirrored in the in-app information modal.
+- A dedicated changelog is tracked in `docs/changelog.md` and is now opened in-app from the clickable version badge.
 
 ## Implemented So Far
 
@@ -42,6 +42,20 @@ Last updated: 2026-04-19
 - The account modal now includes custom avatar upload with automatic crop/resize handling, compact previous-upload history, and a pencil shortcut under the profile image.
 - Authenticated players now get `/me` as raw JSON output, exposing all currently known account fields from the backend instead of a separate HTML settings page.
 - Newly created accounts are redirected back into the main app and prompted there to choose a display name before settling in.
+- The version badge now opens a dedicated changelog modal, separate from the info modal.
+- Long modal content is now constrained to the viewport with internal scrolling instead of overflowing past the screen edge.
+- The bottom taskbar now separates Holder claiming from normal palette painting.
+- Space alone now stages cells under the cursor, without requiring a simultaneous left mouse drag.
+- Claim and paint changes are staged locally as pending overlays and are only saved after the player submits them.
+- The build panel can now be closed, moved by dragging its header on desktop, and shows remaining Holders after pending claims.
+- Holder countdown updates are isolated in small HUD subcomponents instead of rerendering the full world stage.
+- Wheel zoom is handled with a native non-passive listener to avoid browser passive-listener warning spam.
+- Pointer hover movement now updates crosshair and hover coordinates outside React renders, reducing canvas work during mouse movement.
+- `?perf=1` enables an in-app performance probe that records frame gaps, long tasks, layout shifts and nearby app events.
+- Visible claimed territory and saved paint pixels now render through canvas layers instead of thousands of absolute DOM nodes.
+- The performance probe now keeps a quiet browser-side ring buffer log at `window.__pixelPerfLog`.
+- The main world renderer now uses Wplace-style 1000x1000 PNG tiles for saved claims and paint pixels.
+- Backend tile PNGs are cached under `backend/.tile-cache` and only the touched tile is invalidated after claim/paint writes.
 
 ## Confirmed World Decisions
 
@@ -53,7 +67,7 @@ Last updated: 2026-04-19
 
 ## Open Work Areas
 
-- Exact claim-shape editor tools and multi-pixel area claiming.
+- Exact claim-shape editor tools beyond the first Space staging brush, such as rectangle or lasso selection.
 - Pixel history, first-paint coin rewards, and moderation rollback tools.
 - Live chunk subscriptions and WebSocket update strategy.
 - Future far-zoom support should avoid loading every pixel at once by using chunk-aware streaming or level-of-detail rendering.

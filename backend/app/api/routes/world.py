@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -16,7 +17,9 @@ from app.schemas.world import (
 from app.services.pixels import (
     PIXEL_PALETTE,
     PixelPlacementError,
+    WorldTileError,
     claim_world_pixel,
+    ensure_world_tile_png,
     get_visible_world_pixels,
     paint_world_pixel,
 )
@@ -44,6 +47,28 @@ async def world_pixels(
     session: AsyncSession = Depends(get_db),
 ) -> WorldPixelWindow:
     return await get_visible_world_pixels(session, min_x, max_x, min_y, max_y)
+
+
+@router.get("/tiles/{layer}/{tile_x}/{tile_y}.png")
+async def world_tile(
+    layer: str,
+    tile_x: int,
+    tile_y: int,
+    session: AsyncSession = Depends(get_db),
+) -> FileResponse:
+    try:
+        tile_path = await ensure_world_tile_png(session, layer, tile_x, tile_y)
+    except WorldTileError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+    return FileResponse(
+        tile_path,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "public, max-age=5, must-revalidate",
+            "X-PixelProject-Tile": f"{layer}/{tile_x}/{tile_y}",
+        },
+    )
 
 
 @router.post("/claims", response_model=PixelClaimResponse)

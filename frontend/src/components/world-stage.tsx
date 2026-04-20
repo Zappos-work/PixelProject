@@ -8,6 +8,7 @@ import {
   fetchAuthSession,
   fetchVisibleWorldPixels,
   getClientApiBaseUrl,
+  getWorldTileUrl,
   logoutAuthSession,
   paintWorldPixel,
   updateDisplayName,
@@ -25,13 +26,18 @@ type WorldStageProps = {
   world: WorldOverview;
 };
 
-type DragState = {
+type PanDragState = {
   pointerId: number;
   startX: number;
   startY: number;
   originX: number;
   originY: number;
+  mode: "pan";
 };
+
+type DragState = PanDragState;
+
+type BuildMode = "claim" | "paint";
 
 type PointerPosition = {
   x: number;
@@ -53,6 +59,16 @@ type WorldEdge = {
   height: number;
 };
 
+type WorldTile = {
+  key: string;
+  tileX: number;
+  tileY: number;
+  left: number;
+  top: number;
+  size: number;
+  revision: number;
+};
+
 type GridLine = {
   key: string;
   position: number;
@@ -62,6 +78,10 @@ type GridLine = {
 type PixelCoordinate = {
   x: number;
   y: number;
+};
+
+type PendingPaint = PixelCoordinate & {
+  colorId: number;
 };
 
 type ProfileMessage = {
@@ -85,6 +105,63 @@ type ActiveWorldBounds = {
   centerY: number;
 };
 
+type PlacementState = {
+  pixelRecord: WorldPixel | null;
+  isInsideWorld: boolean;
+  canClaim: boolean;
+  canPaint: boolean;
+  isPendingClaim: boolean;
+  pendingPaint: PendingPaint | null;
+};
+
+type SpaceStrokeState = {
+  visitedKeys: Set<string>;
+  lastPixel: PixelCoordinate | null;
+};
+
+type BuildPanelPosition = {
+  x: number;
+  y: number;
+};
+
+type BuildPanelDragState = {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  originX: number;
+  originY: number;
+  width: number;
+  height: number;
+};
+
+type PerfMarkDetail = {
+  label: string;
+  detail?: string;
+  at: number;
+};
+
+type PerfEventKind = "gap" | "layout" | "longtask" | "mark";
+
+type PerfEventRecord = {
+  id: number;
+  kind: PerfEventKind;
+  label: string;
+  detail: string;
+  at: number;
+  duration?: number;
+};
+
+type LayoutShiftEntry = PerformanceEntry & {
+  value?: number;
+  hadRecentInput?: boolean;
+};
+
+type PerfDebugWindow = Window & {
+  __pixelPerfLog?: PerfEventRecord[];
+  __pixelPerfDump?: () => string;
+  __pixelPerfClear?: () => void;
+};
+
 const DEFAULT_ZOOM = 3;
 const DEFAULT_MIN_ZOOM = 0.05;
 const ABSOLUTE_MIN_ZOOM = 0.001;
@@ -98,15 +175,30 @@ const PAN_PADDING_FACTOR = 0.18;
 const PAN_PADDING_MIN = 140;
 const CLICK_DISTANCE = 6;
 const AUTH_REFRESH_INTERVAL_MS = 60000;
-const HOLDER_TICK_MS = 250;
+const HOLDER_TICK_MS = 1000;
 const PIXEL_FETCH_DEBOUNCE_MS = 120;
 const PIXEL_FETCH_MARGIN = 2;
+const PERF_EVENT_NAME = "pixelproject:perf-event";
+const PERF_FRAME_GAP_THRESHOLD_MS = 42;
+const PERF_LOG_LIMIT = 500;
+const WORLD_TILE_SIZE = 1000;
+const WORLD_TILE_MARGIN = 1;
+const BUILD_MODE_LABEL: Record<BuildMode, string> = {
+  claim: "Holders",
+  paint: "Normal",
+};
+const BUILD_MODE_HELP: Record<BuildMode, string> = {
+  claim: "Claim only. Uses Holders and has no color palette.",
+  paint: "Paint only. Uses the palette and only works inside your claimed area.",
+};
 
 const FALLBACK_AUTH_STATUS: AuthSessionStatus = {
   authenticated: false,
   google_oauth_configured: false,
   user: null,
 };
+
+let perfDebugEnabledCache: boolean | null = null;
 
 function clampZoom(value: number, minZoom: number): number {
   return Math.min(MAX_ZOOM, Math.max(minZoom, Number(value.toFixed(4))));
@@ -118,6 +210,174 @@ function snapScreen(value: number): number {
 
 function modalButtonClass(isActive: boolean): string {
   return isActive ? "hud-toggle is-active" : "hud-toggle";
+}
+
+function isPerfDebugEnabled(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  if (perfDebugEnabledCache !== null) {
+    return perfDebugEnabledCache;
+  }
+
+  try {
+    const params = new URLSearchParams(window.location.search);
+    perfDebugEnabledCache = params.has("perf") || window.localStorage.getItem("pixelproject:perf") === "1";
+    return perfDebugEnabledCache;
+  } catch {
+    perfDebugEnabledCache = false;
+    return false;
+  }
+}
+
+function markPerfEvent(label: string, detail?: string): void {
+  if (typeof window === "undefined" || !isPerfDebugEnabled()) {
+    return;
+  }
+
+  window.dispatchEvent(
+    new CustomEvent<PerfMarkDetail>(PERF_EVENT_NAME, {
+      detail: {
+        label,
+        detail,
+        at: performance.now(),
+      },
+    }),
+  );
+}
+
+function isPerfMarkDetail(value: unknown): value is PerfMarkDetail {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<PerfMarkDetail>;
+  return typeof candidate.label === "string" && typeof candidate.at === "number";
+}
+
+function formatPerfTime(value: number): string {
+  return `${Math.round(value)}ms`;
+}
+
+function getPerfDebugWindow(): PerfDebugWindow | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  return window as PerfDebugWindow;
+}
+
+function appendPerfLog(event: PerfEventRecord): void {
+  const perfWindow = getPerfDebugWindow();
+
+  if (perfWindow === null) {
+    return;
+  }
+
+  const log = perfWindow.__pixelPerfLog ?? [];
+  log.push(event);
+
+  if (log.length > PERF_LOG_LIMIT) {
+    log.splice(0, log.length - PERF_LOG_LIMIT);
+  }
+
+  perfWindow.__pixelPerfLog = log;
+}
+
+function getPixelKey(pixel: PixelCoordinate): string {
+  return `${pixel.x}:${pixel.y}`;
+}
+
+function getWorldTileKey(tileX: number, tileY: number): string {
+  return `${tileX}:${tileY}`;
+}
+
+function getPixelTileKey(pixel: PixelCoordinate): string {
+  return getWorldTileKey(
+    Math.floor(pixel.x / WORLD_TILE_SIZE),
+    Math.floor(pixel.y / WORLD_TILE_SIZE),
+  );
+}
+
+function screenPointToWorldPixel(screenX: number, screenY: number, camera: CameraState): PixelCoordinate {
+  return {
+    x: Math.floor((screenX - camera.x) / camera.zoom),
+    y: Math.floor((screenY - camera.y) / camera.zoom),
+  };
+}
+
+function buildPendingClaimMap(claims: PixelCoordinate[]): Set<string> {
+  return new Set(claims.map(getPixelKey));
+}
+
+function buildPendingPaintMap(paints: PendingPaint[]): Map<string, PendingPaint> {
+  return new Map(paints.map((paint) => [getPixelKey(paint), paint]));
+}
+
+function clampPanelPosition(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): BuildPanelPosition {
+  if (typeof window === "undefined") {
+    return { x, y };
+  }
+
+  const padding = 12;
+  const maxX = Math.max(padding, window.innerWidth - width - padding);
+  const maxY = Math.max(padding, window.innerHeight - height - padding);
+
+  return {
+    x: Math.min(maxX, Math.max(padding, x)),
+    y: Math.min(maxY, Math.max(padding, y)),
+  };
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement
+  ) {
+    return true;
+  }
+
+  return target instanceof HTMLElement && target.isContentEditable;
+}
+
+function getPixelLine(start: PixelCoordinate, end: PixelCoordinate): PixelCoordinate[] {
+  const points: PixelCoordinate[] = [];
+  let currentX = start.x;
+  let currentY = start.y;
+  const deltaX = Math.abs(end.x - start.x);
+  const deltaY = Math.abs(end.y - start.y);
+  const stepX = start.x < end.x ? 1 : -1;
+  const stepY = start.y < end.y ? 1 : -1;
+  let error = deltaX - deltaY;
+
+  while (true) {
+    points.push({ x: currentX, y: currentY });
+
+    if (currentX === end.x && currentY === end.y) {
+      break;
+    }
+
+    const doubledError = error * 2;
+
+    if (doubledError > -deltaY) {
+      error -= deltaY;
+      currentX += stepX;
+    }
+
+    if (doubledError < deltaX) {
+      error += deltaX;
+      currentY += stepY;
+    }
+  }
+
+  return points;
 }
 
 function formatDateTime(value: string): string {
@@ -167,6 +427,312 @@ function getProjectedHolderState(
   };
 }
 
+function getCurrentDisplayedHolders(user: AuthUser | null): number {
+  return getProjectedHolderState(user, Date.now()).displayedHolders;
+}
+
+function useProjectedHolderState(user: AuthUser | null): { displayedHolders: number; statusText: string } {
+  const [projection, setProjection] = useState(() => getProjectedHolderState(user, Date.now()));
+
+  useEffect(() => {
+    const syncProjection = (): void => {
+      markPerfEvent("holder tick", user ? `#${user.public_id}` : "anonymous");
+      const nextProjection = getProjectedHolderState(user, Date.now());
+      setProjection((current) => (
+        current.displayedHolders === nextProjection.displayedHolders &&
+        current.statusText === nextProjection.statusText
+          ? current
+          : nextProjection
+      ));
+    };
+
+    syncProjection();
+
+    if (user === null) {
+      return;
+    }
+
+    const ticker = window.setInterval(syncProjection, HOLDER_TICK_MS);
+
+    return () => {
+      window.clearInterval(ticker);
+    };
+  }, [user]);
+
+  return projection;
+}
+
+function HolderTaskbarStatus({
+  pendingClaims,
+  user,
+}: {
+  pendingClaims: number;
+  user: AuthUser | null;
+}) {
+  const projection = useProjectedHolderState(user);
+
+  if (user === null) {
+    return <span className="build-taskbar-status">Login to build</span>;
+  }
+
+  const remainingHolders = Math.max(0, projection.displayedHolders - pendingClaims);
+
+  return (
+    <span className="build-taskbar-status">
+      {remainingHolders} / {user.holder_limit} Holders left
+    </span>
+  );
+}
+
+function HolderPanelSummary({
+  pendingClaims,
+  user,
+}: {
+  pendingClaims: number;
+  user: AuthUser | null;
+}) {
+  const projection = useProjectedHolderState(user);
+
+  if (user === null) {
+    return (
+      <div className="pixel-holder-summary">
+        <span>Holder left</span>
+        <strong>--</strong>
+        <small>Login required for Holder balance</small>
+      </div>
+    );
+  }
+
+  const remainingHolders = Math.max(0, projection.displayedHolders - pendingClaims);
+
+  return (
+    <div className="pixel-holder-summary">
+      <span>Holder left</span>
+      <strong>{remainingHolders}</strong>
+      <small>
+        {pendingClaims} pending claim{pendingClaims === 1 ? "" : "s"} from{" "}
+        {projection.displayedHolders} ready Holders
+      </small>
+    </div>
+  );
+}
+
+function HolderAccountCount({ user }: { user: AuthUser }) {
+  const projection = useProjectedHolderState(user);
+
+  return (
+    <>
+      Holders: {projection.displayedHolders} / {user.holder_limit}
+    </>
+  );
+}
+
+function HolderAccountStatus({ user }: { user: AuthUser }) {
+  const projection = useProjectedHolderState(user);
+
+  return <strong>{projection.statusText}</strong>;
+}
+
+function PerfDebugOverlay() {
+  const [enabled, setEnabled] = useState(false);
+  const [events, setEvents] = useState<PerfEventRecord[]>([]);
+  const eventIdRef = useRef(0);
+  const recentMarksRef = useRef<PerfEventRecord[]>([]);
+  const maxGapRef = useRef(0);
+  const gapCountRef = useRef(0);
+  const longTaskCountRef = useRef(0);
+  const layoutShiftCountRef = useRef(0);
+
+  const pushEvent = useCallback((event: Omit<PerfEventRecord, "id">): void => {
+    const nextEvent: PerfEventRecord = {
+      ...event,
+      id: eventIdRef.current + 1,
+    };
+    eventIdRef.current = nextEvent.id;
+    appendPerfLog(nextEvent);
+
+    if (nextEvent.kind === "mark") {
+      recentMarksRef.current = [nextEvent, ...recentMarksRef.current]
+        .filter((mark) => nextEvent.at - mark.at <= 1600)
+        .slice(0, 10);
+      return;
+    }
+
+    setEvents((current) => [nextEvent, ...current].slice(0, 10));
+  }, []);
+
+  useEffect(() => {
+    setEnabled(isPerfDebugEnabled());
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
+    const perfWindow = getPerfDebugWindow();
+
+    if (perfWindow === null) {
+      return;
+    }
+
+    perfWindow.__pixelPerfLog = perfWindow.__pixelPerfLog ?? [];
+    perfWindow.__pixelPerfDump = () => JSON.stringify(perfWindow.__pixelPerfLog ?? [], null, 2);
+    perfWindow.__pixelPerfClear = () => {
+      perfWindow.__pixelPerfLog = [];
+    };
+  }, [enabled]);
+
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
+    let lastFrame = performance.now();
+    let animationFrame = 0;
+
+    const watchFrame = (now: number): void => {
+      const delta = now - lastFrame;
+      lastFrame = now;
+
+      if (delta >= PERF_FRAME_GAP_THRESHOLD_MS) {
+        gapCountRef.current += 1;
+        maxGapRef.current = Math.max(maxGapRef.current, delta);
+        const recentMarks = recentMarksRef.current
+          .slice(0, 5)
+          .map((mark) => `${mark.label}${mark.detail ? ` (${mark.detail})` : ""}`)
+          .join(" -> ");
+
+        pushEvent({
+          kind: "gap",
+          label: `Frame gap ${delta.toFixed(1)}ms`,
+          detail: recentMarks || "No app mark in the last 1.6s",
+          at: now,
+          duration: delta,
+        });
+      }
+
+      animationFrame = window.requestAnimationFrame(watchFrame);
+    };
+
+    animationFrame = window.requestAnimationFrame(watchFrame);
+
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+    };
+  }, [enabled, pushEvent]);
+
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
+    const handlePerfMark = (event: Event): void => {
+      if (!(event instanceof CustomEvent) || !isPerfMarkDetail(event.detail)) {
+        return;
+      }
+
+      pushEvent({
+        kind: "mark",
+        label: event.detail.label,
+        detail: event.detail.detail ?? "",
+        at: event.detail.at,
+      });
+    };
+
+    window.addEventListener(PERF_EVENT_NAME, handlePerfMark);
+
+    return () => {
+      window.removeEventListener(PERF_EVENT_NAME, handlePerfMark);
+    };
+  }, [enabled, pushEvent]);
+
+  useEffect(() => {
+    if (!enabled || typeof PerformanceObserver === "undefined") {
+      return;
+    }
+
+    const observers: PerformanceObserver[] = [];
+
+    if (PerformanceObserver.supportedEntryTypes.includes("longtask")) {
+      const longTaskObserver = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          longTaskCountRef.current += 1;
+          pushEvent({
+            kind: "longtask",
+            label: `Long task ${entry.duration.toFixed(1)}ms`,
+            detail: entry.name || "Main thread task",
+            at: entry.startTime,
+            duration: entry.duration,
+          });
+        }
+      });
+      longTaskObserver.observe({ type: "longtask", buffered: true });
+      observers.push(longTaskObserver);
+    }
+
+    if (PerformanceObserver.supportedEntryTypes.includes("layout-shift")) {
+      const layoutObserver = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          const layoutEntry = entry as LayoutShiftEntry;
+
+          if (layoutEntry.hadRecentInput || !layoutEntry.value || layoutEntry.value < 0.001) {
+            continue;
+          }
+
+          layoutShiftCountRef.current += 1;
+          pushEvent({
+            kind: "layout",
+            label: `Layout shift ${layoutEntry.value.toFixed(4)}`,
+            detail: layoutEntry.name || "No recent input",
+            at: layoutEntry.startTime,
+          });
+        }
+      });
+      layoutObserver.observe({ type: "layout-shift", buffered: true });
+      observers.push(layoutObserver);
+    }
+
+    return () => {
+      for (const observer of observers) {
+        observer.disconnect();
+      }
+    };
+  }, [enabled, pushEvent]);
+
+  if (!enabled) {
+    return null;
+  }
+
+  return (
+    <aside className="perf-debug-panel">
+      <div className="perf-debug-header">
+        <strong>Perf probe</strong>
+        <span>?perf=1</span>
+      </div>
+      <div className="perf-debug-stats">
+        <span>Gaps: {gapCountRef.current}</span>
+        <span>Max: {formatPerfTime(maxGapRef.current)}</span>
+        <span>Long: {longTaskCountRef.current}</span>
+        <span>CLS: {layoutShiftCountRef.current}</span>
+      </div>
+      <p className="perf-debug-command">Console: copy(window.__pixelPerfDump())</p>
+      <div className="perf-debug-events">
+        {events.length === 0 ? (
+          <p>No gaps yet. Move around until the lag happens. App marks are logged without repainting this panel.</p>
+        ) : (
+          events.map((event) => (
+            <article className={`perf-debug-event is-${event.kind}`} key={event.id}>
+              <strong>{event.label}</strong>
+              <span>{event.detail || "No detail"}</span>
+            </article>
+          ))
+        )}
+      </div>
+    </aside>
+  );
+}
+
 function DefaultAvatarIcon() {
   return (
     <svg aria-hidden="true" className="account-avatar-icon" viewBox="0 0 24 24">
@@ -201,9 +767,36 @@ function PencilIcon() {
 }
 
 export function WorldStage({ world }: WorldStageProps) {
+  const worldRenderCountRef = useRef(0);
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const buildPanelRef = useRef<HTMLDivElement | null>(null);
+  const hoverCoordinateValueRef = useRef<HTMLSpanElement | null>(null);
+  const crosshairHorizontalRef = useRef<HTMLDivElement | null>(null);
+  const crosshairVerticalRef = useRef<HTMLDivElement | null>(null);
   const avatarFileInputRef = useRef<HTMLInputElement | null>(null);
   const dragState = useRef<DragState | null>(null);
+  const buildPanelDragState = useRef<BuildPanelDragState | null>(null);
+  const pointerVisualFrameRef = useRef<number | null>(null);
+  const spaceStrokeRef = useRef<SpaceStrokeState | null>(null);
+  const spaceToolActiveRef = useRef(false);
+  const currentUserRef = useRef<AuthUser | null>(null);
+  const visiblePixelsRef = useRef<WorldPixel[]>([]);
+  const pixelIndexRef = useRef<Map<string, WorldPixel>>(new Map());
+  const activeWorldBoundsRef = useRef<ActiveWorldBounds | null>(null);
+  const pendingClaimsRef = useRef<PixelCoordinate[]>([]);
+  const pendingClaimMapRef = useRef<Set<string>>(new Set());
+  const pendingPaintsRef = useRef<PendingPaint[]>([]);
+  const pendingPaintMapRef = useRef<Map<string, PendingPaint>>(new Map());
+  const activeBuildModeRef = useRef<BuildMode>("claim");
+  const selectedColorIdRef = useRef(DEFAULT_COLOR_ID);
+  const zoomRef = useRef(DEFAULT_ZOOM);
+  const cameraRef = useRef<CameraState>({
+    x: 0,
+    y: 0,
+    zoom: DEFAULT_ZOOM,
+  });
+  const pointerRef = useRef<PointerPosition>({ x: 0, y: 0, inside: false });
+  const activeModalRef = useRef<"info" | "changelog" | "login" | "shop" | "avatar" | null>(null);
   const namePromptShownRef = useRef(false);
   const [camera, setCamera] = useState<CameraState>({
     x: 0,
@@ -212,7 +805,7 @@ export function WorldStage({ world }: WorldStageProps) {
   });
   const [showGrid, setShowGrid] = useState(true);
   const [darkMode, setDarkMode] = useState(true);
-  const [activeModal, setActiveModal] = useState<"info" | "login" | "shop" | "avatar" | null>(null);
+  const [activeModal, setActiveModal] = useState<"info" | "changelog" | "login" | "shop" | "avatar" | null>(null);
   const [authStatus, setAuthStatus] = useState<AuthSessionStatus>(FALLBACK_AUTH_STATUS);
   const [authLoading, setAuthLoading] = useState(true);
   const [authBusy, setAuthBusy] = useState(false);
@@ -221,17 +814,24 @@ export function WorldStage({ world }: WorldStageProps) {
   const [profileMessage, setProfileMessage] = useState<ProfileMessage | null>(null);
   const [avatarBusy, setAvatarBusy] = useState(false);
   const [avatarMessage, setAvatarMessage] = useState<ProfileMessage | null>(null);
-  const [pointer, setPointer] = useState<PointerPosition>({ x: 0, y: 0, inside: false });
   const [selectedPixel, setSelectedPixel] = useState<PixelCoordinate | null>(null);
   const [selectedColorId, setSelectedColorId] = useState(DEFAULT_COLOR_ID);
+  const [activeBuildMode, setActiveBuildMode] = useState<BuildMode>("claim");
+  const [buildPanelOpen, setBuildPanelOpen] = useState(false);
+  const [buildPanelPosition, setBuildPanelPosition] = useState<BuildPanelPosition | null>(null);
+  const [pendingClaims, setPendingClaims] = useState<PixelCoordinate[]>([]);
+  const [pendingPaints, setPendingPaints] = useState<PendingPaint[]>([]);
   const [placementBusy, setPlacementBusy] = useState(false);
   const [placementMessage, setPlacementMessage] = useState<ProfileMessage | null>(null);
   const [visiblePixels, setVisiblePixels] = useState<WorldPixel[]>([]);
+  const [tileRevisions, setTileRevisions] = useState<Record<string, number>>({});
   const [viewportSize, setViewportSize] = useState<ViewportSize>({ width: 0, height: 0 });
   const [isCentered, setIsCentered] = useState(false);
-  const [nowMs, setNowMs] = useState(Date.now());
+  const [spaceToolActive, setSpaceToolActive] = useState(false);
+  worldRenderCountRef.current += 1;
 
   const refreshAuthStatus = useCallback(async (showLoading = true): Promise<void> => {
+    markPerfEvent("auth refresh start", showLoading ? "with loading" : "background");
     if (showLoading) {
       setAuthLoading(true);
     }
@@ -239,7 +839,12 @@ export function WorldStage({ world }: WorldStageProps) {
     const nextStatus = await fetchAuthSession();
     setAuthStatus(nextStatus);
     setAuthLoading(false);
+    markPerfEvent("auth refresh done", nextStatus.authenticated ? "authenticated" : "guest");
   }, []);
+
+  useEffect(() => {
+    markPerfEvent("world render", `#${worldRenderCountRef.current}`);
+  });
 
   useEffect(() => {
     document.body.dataset.theme = darkMode ? "dark" : "light";
@@ -294,16 +899,6 @@ export function WorldStage({ world }: WorldStageProps) {
   }, [authStatus.user?.needs_display_name_setup]);
 
   useEffect(() => {
-    const ticker = window.setInterval(() => {
-      setNowMs(Date.now());
-    }, HOLDER_TICK_MS);
-
-    return () => {
-      window.clearInterval(ticker);
-    };
-  }, []);
-
-  useEffect(() => {
     const viewport = viewportRef.current;
 
     if (viewport === null) {
@@ -313,6 +908,7 @@ export function WorldStage({ world }: WorldStageProps) {
     const syncSize = (): void => {
       const rect = viewport.getBoundingClientRect();
       setViewportSize({ width: rect.width, height: rect.height });
+      markPerfEvent("viewport resize", `${Math.round(rect.width)}x${Math.round(rect.height)}`);
     };
 
     syncSize();
@@ -327,6 +923,25 @@ export function WorldStage({ world }: WorldStageProps) {
       observer.disconnect();
     };
   }, []);
+
+  useEffect(() => {
+    if (buildPanelPosition === null) {
+      return;
+    }
+
+    const panel = buildPanelRef.current;
+
+    if (panel === null) {
+      return;
+    }
+
+    const rect = panel.getBoundingClientRect();
+    const nextPosition = clampPanelPosition(buildPanelPosition.x, buildPanelPosition.y, rect.width, rect.height);
+
+    if (nextPosition.x !== buildPanelPosition.x || nextPosition.y !== buildPanelPosition.y) {
+      setBuildPanelPosition(nextPosition);
+    }
+  }, [buildPanelPosition, viewportSize.height, viewportSize.width]);
 
   const activeWorldBounds = useMemo<ActiveWorldBounds>(() => {
     const activeChunks = world.chunks.filter((chunk) => chunk.is_active);
@@ -456,21 +1071,66 @@ export function WorldStage({ world }: WorldStageProps) {
     world.chunk_size,
   ]);
 
-  const hoverPixel = useMemo(() => {
-    if (!pointer.inside) {
-      return null;
+  const handleNativeWheel = useCallback((event: WheelEvent): void => {
+    event.preventDefault();
+    markPerfEvent("wheel zoom");
+
+    const viewport = viewportRef.current;
+
+    if (viewport === null) {
+      return;
     }
 
-    return screenToWorldPixel(pointer.x, pointer.y);
-  }, [pointer.inside, pointer.x, pointer.y, screenToWorldPixel]);
+    const rect = viewport.getBoundingClientRect();
+    const anchorX = event.clientX - rect.left;
+    const anchorY = event.clientY - rect.top;
+
+    setCamera((current) => {
+      const zoomDirection = event.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
+      const nextZoom = clampZoom(current.zoom * zoomDirection, minZoom);
+
+      if (nextZoom === current.zoom) {
+        return current;
+      }
+
+      const worldX = (anchorX - current.x) / current.zoom;
+      const worldY = (anchorY - current.y) / current.zoom;
+
+      return clampCamera({
+        zoom: nextZoom,
+        x: anchorX - worldX * nextZoom,
+        y: anchorY - worldY * nextZoom,
+      });
+    });
+  }, [clampCamera, minZoom]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+
+    if (viewport === null) {
+      return;
+    }
+
+    viewport.addEventListener("wheel", handleNativeWheel, { passive: false });
+
+    return () => {
+      viewport.removeEventListener("wheel", handleNativeWheel);
+    };
+  }, [handleNativeWheel]);
 
   const normalizedProfileName = useMemo(() => {
     return profileName.trim().replace(/\s+/g, " ");
   }, [profileName]);
 
   const currentUser = authStatus.user;
-  const projectedHolderState = useMemo(() => getProjectedHolderState(currentUser, nowMs), [currentUser, nowMs]);
-  const displayedHolders = currentUser ? projectedHolderState.displayedHolders : 0;
+  currentUserRef.current = currentUser;
+  activeWorldBoundsRef.current = activeWorldBounds;
+  activeBuildModeRef.current = activeBuildMode;
+  selectedColorIdRef.current = selectedColorId;
+  zoomRef.current = camera.zoom;
+  cameraRef.current = camera;
+  activeModalRef.current = activeModal;
+  spaceToolActiveRef.current = spaceToolActive;
 
   const hasDisplayNameChange = useMemo(() => {
     if (!currentUser) {
@@ -502,8 +1162,6 @@ export function WorldStage({ world }: WorldStageProps) {
 
     return "Display name changes are temporarily unavailable.";
   }, [currentUser]);
-
-  const holderStatus = projectedHolderState.statusText;
 
   useEffect(() => {
     if (isCentered || viewportSize.width === 0 || viewportSize.height === 0) {
@@ -658,8 +1316,70 @@ export function WorldStage({ world }: WorldStageProps) {
     return edges;
   }, [camera.x, camera.y, camera.zoom, world.chunks]);
 
-  const pixelFetchBounds = useMemo(() => {
+  const renderedWorldTiles = useMemo<WorldTile[]>(() => {
     if (viewportSize.width === 0 || viewportSize.height === 0) {
+      return [];
+    }
+
+    const visibleMinX = Math.floor(-camera.x / camera.zoom);
+    const visibleMaxX = Math.ceil((viewportSize.width - camera.x) / camera.zoom);
+    const visibleMinY = Math.floor(-camera.y / camera.zoom);
+    const visibleMaxY = Math.ceil((viewportSize.height - camera.y) / camera.zoom);
+    const worldMinTileX = Math.floor(activeWorldBounds.minX / WORLD_TILE_SIZE);
+    const worldMaxTileX = Math.floor((activeWorldBounds.maxX - 1) / WORLD_TILE_SIZE);
+    const worldMinTileY = Math.floor(activeWorldBounds.minY / WORLD_TILE_SIZE);
+    const worldMaxTileY = Math.floor((activeWorldBounds.maxY - 1) / WORLD_TILE_SIZE);
+    const minTileX = Math.max(
+      worldMinTileX,
+      Math.floor(visibleMinX / WORLD_TILE_SIZE) - WORLD_TILE_MARGIN,
+    );
+    const maxTileX = Math.min(
+      worldMaxTileX,
+      Math.floor(visibleMaxX / WORLD_TILE_SIZE) + WORLD_TILE_MARGIN,
+    );
+    const minTileY = Math.max(
+      worldMinTileY,
+      Math.floor(visibleMinY / WORLD_TILE_SIZE) - WORLD_TILE_MARGIN,
+    );
+    const maxTileY = Math.min(
+      worldMaxTileY,
+      Math.floor(visibleMaxY / WORLD_TILE_SIZE) + WORLD_TILE_MARGIN,
+    );
+    const tiles: WorldTile[] = [];
+
+    for (let tileY = minTileY; tileY <= maxTileY; tileY += 1) {
+      for (let tileX = minTileX; tileX <= maxTileX; tileX += 1) {
+        const key = getWorldTileKey(tileX, tileY);
+        const tileOriginX = tileX * WORLD_TILE_SIZE;
+        const tileOriginY = tileY * WORLD_TILE_SIZE;
+        tiles.push({
+          key,
+          tileX,
+          tileY,
+          left: snapScreen(camera.x + tileOriginX * camera.zoom),
+          top: snapScreen(camera.y + tileOriginY * camera.zoom),
+          size: Math.ceil(WORLD_TILE_SIZE * camera.zoom),
+          revision: tileRevisions[key] ?? 0,
+        });
+      }
+    }
+
+    return tiles;
+  }, [
+    activeWorldBounds.maxX,
+    activeWorldBounds.maxY,
+    activeWorldBounds.minX,
+    activeWorldBounds.minY,
+    camera.x,
+    camera.y,
+    camera.zoom,
+    tileRevisions,
+    viewportSize.height,
+    viewportSize.width,
+  ]);
+
+  const pixelFetchBounds = useMemo(() => {
+    if (!gridVisible || viewportSize.width === 0 || viewportSize.height === 0) {
       return null;
     }
 
@@ -683,6 +1403,7 @@ export function WorldStage({ world }: WorldStageProps) {
     camera.x,
     camera.y,
     camera.zoom,
+    gridVisible,
     viewportSize.height,
     viewportSize.width,
   ]);
@@ -693,7 +1414,12 @@ export function WorldStage({ world }: WorldStageProps) {
     }
 
     let cancelled = false;
+    markPerfEvent(
+      "pixel fetch scheduled",
+      `${pixelFetchBounds.minX}:${pixelFetchBounds.minY} -> ${pixelFetchBounds.maxX}:${pixelFetchBounds.maxY}`,
+    );
     const fetchTimeout = window.setTimeout(async () => {
+      markPerfEvent("pixel fetch start");
       const result = await fetchVisibleWorldPixels(
         pixelFetchBounds.minX,
         pixelFetchBounds.maxX,
@@ -702,7 +1428,10 @@ export function WorldStage({ world }: WorldStageProps) {
       );
 
       if (!cancelled) {
+        visiblePixelsRef.current = result.pixels;
+        pixelIndexRef.current = new Map(result.pixels.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
         setVisiblePixels(result.pixels);
+        markPerfEvent("pixel fetch done", `${result.pixels.length} pixels`);
       }
     }, PIXEL_FETCH_DEBOUNCE_MS);
 
@@ -715,50 +1444,158 @@ export function WorldStage({ world }: WorldStageProps) {
   const pixelIndex = useMemo(() => {
     return new Map(visiblePixels.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
   }, [visiblePixels]);
+  const pendingClaimMap = useMemo(() => buildPendingClaimMap(pendingClaims), [pendingClaims]);
+  const pendingPaintMap = useMemo(() => buildPendingPaintMap(pendingPaints), [pendingPaints]);
+  visiblePixelsRef.current = visiblePixels;
+  pixelIndexRef.current = pixelIndex;
+  pendingClaimsRef.current = pendingClaims;
+  pendingClaimMapRef.current = pendingClaimMap;
+  pendingPaintsRef.current = pendingPaints;
+  pendingPaintMapRef.current = pendingPaintMap;
 
-  const selectedPixelRecord = useMemo(() => {
-    if (selectedPixel === null) {
-      return null;
+  const syncPendingClaims = useCallback((nextClaims: PixelCoordinate[]): void => {
+    pendingClaimsRef.current = nextClaims;
+    pendingClaimMapRef.current = buildPendingClaimMap(nextClaims);
+    setPendingClaims(nextClaims);
+  }, []);
+
+  const syncPendingPaints = useCallback((nextPaints: PendingPaint[]): void => {
+    pendingPaintsRef.current = nextPaints;
+    pendingPaintMapRef.current = buildPendingPaintMap(nextPaints);
+    setPendingPaints(nextPaints);
+  }, []);
+
+  const markWorldTileDirty = useCallback((pixel: PixelCoordinate): void => {
+    const tileKey = getPixelTileKey(pixel);
+    setTileRevisions((current) => ({
+      ...current,
+      [tileKey]: (current[tileKey] ?? 0) + 1,
+    }));
+  }, []);
+
+  const getPlacementState = useCallback((pixel: PixelCoordinate | null): PlacementState => {
+    if (pixel === null) {
+      return {
+        pixelRecord: null,
+        isInsideWorld: false,
+        canClaim: false,
+        canPaint: false,
+        isPendingClaim: false,
+        pendingPaint: null,
+      };
     }
 
-    return pixelIndex.get(`${selectedPixel.x}:${selectedPixel.y}`) ?? null;
-  }, [pixelIndex, selectedPixel]);
+    const bounds = activeWorldBoundsRef.current;
+    const pixelMap = pixelIndexRef.current;
+    const pendingClaimsMap = pendingClaimMapRef.current;
+    const pendingPaintsMap = pendingPaintMapRef.current;
+    const zoom = zoomRef.current;
+    const nextUser = currentUserRef.current;
+    const pixelKey = getPixelKey(pixel);
+
+    if (bounds === null) {
+      return {
+        pixelRecord: null,
+        isInsideWorld: false,
+        canClaim: false,
+        canPaint: false,
+        isPendingClaim: false,
+        pendingPaint: null,
+      };
+    }
+
+    const isInsideWorld =
+      pixel.x >= bounds.minX &&
+      pixel.x < bounds.maxX &&
+      pixel.y >= bounds.minY &&
+      pixel.y < bounds.maxY;
+    const pixelRecord = pixelMap.get(pixelKey) ?? null;
+    const isPendingClaim = pendingClaimsMap.has(pixelKey);
+    const pendingPaint = pendingPaintsMap.get(pixelKey) ?? null;
+
+    if (
+      nextUser === null ||
+      zoom < GRID_THRESHOLD ||
+      !isInsideWorld
+    ) {
+      return {
+        pixelRecord,
+        isInsideWorld,
+        canClaim: false,
+        canPaint: false,
+        isPendingClaim,
+        pendingPaint,
+      };
+    }
+
+    const canPaint =
+      pixelRecord !== null &&
+      !pixelRecord.is_starter &&
+      pixelRecord.owner_user_id === nextUser.id &&
+      !isPendingClaim;
+    let canClaim = false;
+
+    if (pixelRecord === null && !isPendingClaim) {
+      const neighborKeys = [
+        `${pixel.x - 1}:${pixel.y}`,
+        `${pixel.x + 1}:${pixel.y}`,
+        `${pixel.x}:${pixel.y - 1}`,
+        `${pixel.x}:${pixel.y + 1}`,
+      ];
+      canClaim = neighborKeys.some((key) => {
+        const neighbor = pixelMap.get(key);
+        return pendingClaimsMap.has(key) || (neighbor ? neighbor.is_starter || neighbor.owner_user_id !== null : false);
+      });
+    }
+
+    return {
+      pixelRecord,
+      isInsideWorld,
+      canClaim,
+      canPaint,
+      isPendingClaim,
+      pendingPaint,
+    };
+  }, []);
+
+  const selectedPlacementState = getPlacementState(selectedPixel);
+
+  const selectedPixelRecord = selectedPlacementState.pixelRecord;
+  const selectedPendingPaint = selectedPlacementState.pendingPaint;
 
   useEffect(() => {
+    if (selectedPendingPaint) {
+      setSelectedColorId(selectedPendingPaint.colorId);
+      return;
+    }
+
     if (selectedPixelRecord?.color_id !== null && selectedPixelRecord?.color_id !== undefined) {
       setSelectedColorId(selectedPixelRecord.color_id);
     }
-  }, [selectedPixelRecord]);
+  }, [selectedPendingPaint, selectedPixelRecord]);
 
-  const renderedClaims = useMemo(() => {
-    return visiblePixels.map((pixel) => ({
-      key: `${pixel.id}-claim`,
+  const renderedPendingClaims = useMemo(() => {
+    return pendingClaims.map((pixel) => ({
+      key: `pending-claim-${getPixelKey(pixel)}`,
       left: camera.x + pixel.x * camera.zoom,
       top: camera.y + pixel.y * camera.zoom,
       width: camera.zoom,
       height: camera.zoom,
-      tone: pixel.is_starter
-        ? "is-starter"
-        : pixel.owner_user_id === currentUser?.id
-          ? "is-owned"
-          : "is-foreign",
       isSelected: selectedPixel?.x === pixel.x && selectedPixel?.y === pixel.y,
     }));
-  }, [camera.x, camera.y, camera.zoom, currentUser?.id, selectedPixel, visiblePixels]);
+  }, [camera.x, camera.y, camera.zoom, pendingClaims, selectedPixel]);
 
-  const renderedPixels = useMemo(() => {
-    return visiblePixels
-      .filter((pixel) => pixel.color_id !== null)
-      .map((pixel) => ({
-        key: pixel.id,
-        left: camera.x + pixel.x * camera.zoom,
-        top: camera.y + pixel.y * camera.zoom,
-        width: camera.zoom,
-        height: camera.zoom,
-        color: PIXEL_PALETTE[pixel.color_id ?? DEFAULT_COLOR_ID]?.hex ?? "#ffffff",
-        isSelected: selectedPixel?.x === pixel.x && selectedPixel?.y === pixel.y,
-      }));
-  }, [camera.x, camera.y, camera.zoom, selectedPixel, visiblePixels]);
+  const renderedPendingPaints = useMemo(() => {
+    return pendingPaints.map((pixel) => ({
+      key: `pending-paint-${getPixelKey(pixel)}`,
+      left: camera.x + pixel.x * camera.zoom,
+      top: camera.y + pixel.y * camera.zoom,
+      width: camera.zoom,
+      height: camera.zoom,
+      color: PIXEL_PALETTE[pixel.colorId]?.hex ?? "#ffffff",
+      isSelected: selectedPixel?.x === pixel.x && selectedPixel?.y === pixel.y,
+    }));
+  }, [camera.x, camera.y, camera.zoom, pendingPaints, selectedPixel]);
 
   const selectedPixelOverlay = useMemo(() => {
     if (selectedPixel === null) {
@@ -772,106 +1609,330 @@ export function WorldStage({ world }: WorldStageProps) {
     };
   }, [camera.x, camera.y, camera.zoom, selectedPixel]);
 
-  const isSelectedInsideWorld = useMemo(() => {
-    if (selectedPixel === null) {
-      return false;
-    }
-
-    return (
-      selectedPixel.x >= activeWorldBounds.minX &&
-      selectedPixel.x < activeWorldBounds.maxX &&
-      selectedPixel.y >= activeWorldBounds.minY &&
-      selectedPixel.y < activeWorldBounds.maxY
-    );
-  }, [activeWorldBounds.maxX, activeWorldBounds.maxY, activeWorldBounds.minX, activeWorldBounds.minY, selectedPixel]);
-
-  const canClaimSelectedPixel = useMemo(() => {
-    if (
-      selectedPixel === null ||
-      currentUser === null ||
-      camera.zoom < GRID_THRESHOLD ||
-      !isSelectedInsideWorld ||
-      selectedPixelRecord !== null
-    ) {
-      return false;
-    }
-
-    const neighborKeys = [
-      `${selectedPixel.x - 1}:${selectedPixel.y}`,
-      `${selectedPixel.x + 1}:${selectedPixel.y}`,
-      `${selectedPixel.x}:${selectedPixel.y - 1}`,
-      `${selectedPixel.x}:${selectedPixel.y + 1}`,
-    ];
-
-    return neighborKeys.some((key) => {
-      const neighbor = pixelIndex.get(key);
-      return neighbor ? neighbor.is_starter || neighbor.owner_user_id !== null : false;
-    });
-  }, [camera.zoom, currentUser, isSelectedInsideWorld, pixelIndex, selectedPixel, selectedPixelRecord]);
-
-  const canPaintSelectedPixel = useMemo(() => {
-    if (selectedPixel === null || currentUser === null || camera.zoom < GRID_THRESHOLD || !isSelectedInsideWorld) {
-      return false;
-    }
-
-    return (
-      selectedPixelRecord !== null &&
-      !selectedPixelRecord.is_starter &&
-      selectedPixelRecord.owner_user_id === currentUser.id
-    );
-  }, [camera.zoom, currentUser, isSelectedInsideWorld, selectedPixel, selectedPixelRecord]);
+  const canClaimSelectedPixel = selectedPlacementState.canClaim;
+  const canPaintSelectedPixel = selectedPlacementState.canPaint;
+  const activePendingCount = activeBuildMode === "claim" ? pendingClaims.length : pendingPaints.length;
+  const activePendingLabel = activeBuildMode === "claim"
+    ? `${pendingClaims.length} pending claim${pendingClaims.length === 1 ? "" : "s"}`
+    : `${pendingPaints.length} pending pixel${pendingPaints.length === 1 ? "" : "s"}`;
 
   const placementLabel = useMemo(() => {
-    if (currentUser === null) {
-      return "Login required";
+    if (placementBusy) {
+      return "Saving...";
+    }
+
+    if (activePendingCount === 0) {
+      return "Nothing pending";
+    }
+
+    return activeBuildMode === "claim"
+      ? `Submit ${activePendingCount} claim${activePendingCount === 1 ? "" : "s"}`
+      : `Submit ${activePendingCount} pixel${activePendingCount === 1 ? "" : "s"}`;
+  }, [activeBuildMode, activePendingCount, placementBusy]);
+
+  const selectedCellLabel = useMemo(() => {
+    if (selectedPixel === null) {
+      return "No cell selected";
     }
 
     if (selectedPixelRecord === null) {
-      return canClaimSelectedPixel ? "Claim pixel" : "Claim unavailable";
+      return selectedPlacementState.isPendingClaim ? "Pending Holder claim" : "Unclaimed cell";
     }
 
     if (selectedPixelRecord.is_starter) {
       return "Starter frontier";
     }
 
-    if (selectedPixelRecord.owner_user_id === currentUser.id) {
-      return selectedPixelRecord.color_id === null ? "Paint my claim" : "Recolor my claim";
+    if (currentUser && selectedPixelRecord.owner_user_id === currentUser.id) {
+      return selectedPendingPaint ? "Pending paint change" : "Your claimed territory";
     }
 
-    return "Claimed by another player";
-  }, [canClaimSelectedPixel, currentUser, selectedPixelRecord]);
+    return `Claimed by #${selectedPixelRecord.owner_public_id}`;
+  }, [currentUser, selectedPendingPaint, selectedPixel, selectedPixelRecord, selectedPlacementState.isPendingClaim]);
 
   const placementHelpText = useMemo(() => {
     if (currentUser === null) {
-      return "Login required to claim territory and paint inside it.";
+      return "Login required to use the build tools.";
     }
 
-    if (selectedPixelRecord === null) {
-      return canClaimSelectedPixel
-        ? "Claiming costs 1 Holder. New claims must touch the starter frontier or another claimed pixel."
-        : "This cell is not claimable yet. Claims must touch the starter frontier or an existing claimed pixel.";
+    if (camera.zoom < GRID_THRESHOLD) {
+      return "Zoom in until the pixel grid is visible before staging changes.";
+    }
+
+    if (selectedPixel === null) {
+      return activeBuildMode === "claim"
+        ? "Select a connected empty cell or press Space over the canvas to stage Holder claims."
+        : "Select one of your claimed cells or press Space over your territory to stage paint changes.";
+    }
+
+    if (activeBuildMode === "claim") {
+      if (selectedPlacementState.isPendingClaim) {
+        return "This Holder claim is staged locally. Submit the pending claims when your shape is ready.";
+      }
+
+      if (canClaimSelectedPixel) {
+        return "Press Space over cells to stage Holder claims. New claims must touch the starter frontier, an existing claim or another staged claim.";
+      }
+
+      return "Holder mode only claims empty cells. Pick an empty cell connected to claimed territory.";
+    }
+
+    if (selectedPendingPaint) {
+      return "This color is staged locally. Keep painting with Space, then submit all pending pixels together.";
+    }
+
+    if (canPaintSelectedPixel) {
+      return "Normal mode only paints your claimed territory. Choose a palette color, press Space over cells, then submit.";
+    }
+
+    if (selectedPixelRecord === null || selectedPlacementState.isPendingClaim) {
+      return "Normal mode cannot claim new cells. Switch to Holders first, submit the claim, then paint it.";
     }
 
     if (selectedPixelRecord.is_starter) {
-      return "Starter frontier cells are reserved. Claim directly next to them to begin your own area.";
+      return "Starter frontier cells are reserved and cannot be painted.";
     }
 
-    if (selectedPixelRecord.owner_user_id === currentUser.id) {
-      return selectedPixelRecord.color_id === null
-        ? "This claimed cell belongs to you. Pick a palette color and paint it."
-        : "Only your own claimed territory can be repainted here.";
+    return "You can only paint inside territory that belongs to you.";
+  }, [
+    activeBuildMode,
+    camera.zoom,
+    canClaimSelectedPixel,
+    canPaintSelectedPixel,
+    currentUser,
+    selectedPendingPaint,
+    selectedPixel,
+    selectedPixelRecord,
+    selectedPlacementState.isPendingClaim,
+  ]);
+
+  const renderPointerVisual = useCallback((): void => {
+    const nextPointer = pointerRef.current;
+    const horizontalLine = crosshairHorizontalRef.current;
+    const verticalLine = crosshairVerticalRef.current;
+    const hoverValue = hoverCoordinateValueRef.current;
+
+    if (horizontalLine === null || verticalLine === null || hoverValue === null) {
+      return;
     }
 
-    return `This territory already belongs to #${selectedPixelRecord.owner_public_id}.`;
-  }, [canClaimSelectedPixel, currentUser, selectedPixelRecord]);
+    if (!nextPointer.inside) {
+      horizontalLine.style.display = "none";
+      verticalLine.style.display = "none";
+      hoverValue.textContent = "-- : --";
+      return;
+    }
+
+    const hoverPixel = screenPointToWorldPixel(nextPointer.x, nextPointer.y, cameraRef.current);
+    horizontalLine.style.display = "block";
+    verticalLine.style.display = "block";
+    horizontalLine.style.transform = `translateY(${Math.round(nextPointer.y)}px)`;
+    verticalLine.style.transform = `translateX(${Math.round(nextPointer.x)}px)`;
+    hoverValue.textContent = `${hoverPixel.x} : ${hoverPixel.y}`;
+  }, []);
+
+  const schedulePointerVisual = useCallback((): void => {
+    if (pointerVisualFrameRef.current !== null) {
+      return;
+    }
+
+    pointerVisualFrameRef.current = window.requestAnimationFrame(() => {
+      pointerVisualFrameRef.current = null;
+      renderPointerVisual();
+    });
+  }, [renderPointerVisual]);
+
+  useEffect(() => {
+    schedulePointerVisual();
+  }, [camera.x, camera.y, camera.zoom, schedulePointerVisual]);
+
+  useEffect(() => {
+    return () => {
+      if (pointerVisualFrameRef.current !== null) {
+        window.cancelAnimationFrame(pointerVisualFrameRef.current);
+      }
+    };
+  }, []);
+
+  const stageActiveToolPixel = useCallback((
+    targetPixel: PixelCoordinate,
+    options?: { quiet?: boolean },
+  ): boolean => {
+    setSelectedPixel(targetPixel);
+    setBuildPanelOpen(true);
+
+    const nextUser = currentUserRef.current;
+    if (nextUser === null) {
+      if (!options?.quiet) {
+        setPlacementMessage({ tone: "error", text: "Login required to use the build tools." });
+      }
+      return false;
+    }
+
+    const targetState = getPlacementState(targetPixel);
+    const activeMode = activeBuildModeRef.current;
+
+    if (activeMode === "claim") {
+      if (!targetState.canClaim) {
+        if (!options?.quiet) {
+          setPlacementMessage({
+            tone: "error",
+            text: "This cell cannot be claimed in Holder mode.",
+          });
+        }
+        return false;
+      }
+
+      const nextClaims = pendingClaimsRef.current;
+      const claimKey = getPixelKey(targetPixel);
+
+      if (pendingClaimMapRef.current.has(claimKey)) {
+        return false;
+      }
+
+      if (nextClaims.length >= getCurrentDisplayedHolders(nextUser)) {
+        if (!options?.quiet) {
+          setPlacementMessage({
+            tone: "error",
+            text: "Not enough Holders for more pending claims.",
+          });
+        }
+        return false;
+      }
+
+      const updatedClaims = [...nextClaims, targetPixel];
+      syncPendingClaims(updatedClaims);
+      setPlacementMessage({
+        tone: "info",
+        text: `${updatedClaims.length} Holder claim${updatedClaims.length === 1 ? "" : "s"} staged locally.`,
+      });
+      return true;
+    }
+
+    if (!targetState.canPaint) {
+      if (!options?.quiet) {
+        setPlacementMessage({
+          tone: "error",
+          text: "Normal mode only paints your own claimed territory.",
+        });
+      }
+      return false;
+    }
+
+    const paintKey = getPixelKey(targetPixel);
+    const nextPaint: PendingPaint = {
+      ...targetPixel,
+      colorId: selectedColorIdRef.current,
+    };
+    const remainingPaints = pendingPaintsRef.current.filter((paint) => getPixelKey(paint) !== paintKey);
+    const updatedPaints = [...remainingPaints, nextPaint];
+    syncPendingPaints(updatedPaints);
+    setPlacementMessage({
+      tone: "info",
+      text: `${updatedPaints.length} pixel${updatedPaints.length === 1 ? "" : "s"} staged locally.`,
+    });
+    return true;
+  }, [getPlacementState, syncPendingClaims, syncPendingPaints]);
+
+  const stageSpaceStroke = useCallback((targetPixel: PixelCoordinate): void => {
+    let stroke = spaceStrokeRef.current;
+
+    if (stroke === null) {
+      stroke = {
+        visitedKeys: new Set(),
+        lastPixel: null,
+      };
+      spaceStrokeRef.current = stroke;
+    }
+
+    const linePixels = stroke.lastPixel ? getPixelLine(stroke.lastPixel, targetPixel) : [targetPixel];
+
+    for (const pixel of linePixels) {
+      const pixelKey = getPixelKey(pixel);
+
+      if (stroke.visitedKeys.has(pixelKey)) {
+        continue;
+      }
+
+      if (stageActiveToolPixel(pixel, { quiet: true })) {
+        stroke.visitedKeys.add(pixelKey);
+      }
+    }
+
+    stroke.lastPixel = targetPixel;
+  }, [stageActiveToolPixel]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (
+        event.code !== "Space" ||
+        isEditableTarget(event.target) ||
+        activeModalRef.current !== null
+      ) {
+        return;
+      }
+
+      event.preventDefault();
+
+      if (event.repeat) {
+        return;
+      }
+
+      spaceToolActiveRef.current = true;
+      setSpaceToolActive(true);
+      spaceStrokeRef.current = {
+        visitedKeys: new Set(),
+        lastPixel: null,
+      };
+
+      const currentPointer = pointerRef.current;
+
+      if (currentPointer.inside) {
+        stageSpaceStroke(screenPointToWorldPixel(currentPointer.x, currentPointer.y, cameraRef.current));
+      }
+    };
+
+    const handleKeyUp = (event: KeyboardEvent): void => {
+      if (event.code !== "Space") {
+        return;
+      }
+
+      spaceToolActiveRef.current = false;
+      setSpaceToolActive(false);
+      spaceStrokeRef.current = null;
+    };
+
+    const handleWindowBlur = (): void => {
+      spaceToolActiveRef.current = false;
+      setSpaceToolActive(false);
+      spaceStrokeRef.current = null;
+      dragState.current = null;
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleWindowBlur);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, [stageSpaceStroke]);
 
   function updatePointer(event: React.PointerEvent<HTMLDivElement>): void {
     const rect = event.currentTarget.getBoundingClientRect();
-    setPointer({
+    pointerRef.current = {
       x: event.clientX - rect.left,
       y: event.clientY - rect.top,
       inside: true,
-    });
+    };
+    schedulePointerVisual();
+  }
+
+  function getEventPixel(event: React.PointerEvent<HTMLDivElement>): PixelCoordinate {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return screenToWorldPixel(event.clientX - rect.left, event.clientY - rect.top);
   }
 
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>): void {
@@ -880,12 +1941,20 @@ export function WorldStage({ world }: WorldStageProps) {
     }
 
     updatePointer(event);
+    const targetPixel = getEventPixel(event);
+
+    if (spaceToolActiveRef.current) {
+      stageSpaceStroke(targetPixel);
+      return;
+    }
+
     dragState.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
       originX: camera.x,
       originY: camera.y,
+      mode: "pan",
     };
 
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -893,6 +1962,12 @@ export function WorldStage({ world }: WorldStageProps) {
 
   function handlePointerMove(event: React.PointerEvent<HTMLDivElement>): void {
     updatePointer(event);
+    const targetPixel = getEventPixel(event);
+
+    if (spaceToolActiveRef.current) {
+      stageSpaceStroke(targetPixel);
+      return;
+    }
 
     const drag = dragState.current;
 
@@ -900,13 +1975,16 @@ export function WorldStage({ world }: WorldStageProps) {
       return;
     }
 
-    setCamera((current) =>
-      clampCamera({
-        ...current,
-        x: drag.originX + event.clientX - drag.startX,
-        y: drag.originY + event.clientY - drag.startY,
-      }),
-    );
+    if (drag.mode === "pan") {
+      setCamera((current) =>
+        clampCamera({
+          ...current,
+          x: drag.originX + event.clientX - drag.startX,
+          y: drag.originY + event.clientY - drag.startY,
+        }),
+      );
+      return;
+    }
   }
 
   function handlePointerUp(event: React.PointerEvent<HTMLDivElement>): void {
@@ -923,40 +2001,18 @@ export function WorldStage({ world }: WorldStageProps) {
     }
 
     if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) <= CLICK_DISTANCE) {
-      const rect = event.currentTarget.getBoundingClientRect();
-      setSelectedPixel(screenToWorldPixel(event.clientX - rect.left, event.clientY - rect.top));
+      setSelectedPixel(getEventPixel(event));
+      setBuildPanelOpen(true);
       setPlacementMessage(null);
     }
   }
 
   function handlePointerLeave(): void {
-    setPointer((current) => ({ ...current, inside: false }));
-  }
-
-  function handleWheel(event: React.WheelEvent<HTMLDivElement>): void {
-    event.preventDefault();
-
-    const rect = event.currentTarget.getBoundingClientRect();
-    const anchorX = event.clientX - rect.left;
-    const anchorY = event.clientY - rect.top;
-
-    setCamera((current) => {
-      const zoomDirection = event.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
-      const nextZoom = clampZoom(current.zoom * zoomDirection, minZoom);
-
-      if (nextZoom === current.zoom) {
-        return current;
-      }
-
-      const worldX = (anchorX - current.x) / current.zoom;
-      const worldY = (anchorY - current.y) / current.zoom;
-
-      return clampCamera({
-        zoom: nextZoom,
-        x: anchorX - worldX * nextZoom,
-        y: anchorY - worldY * nextZoom,
-      });
-    });
+    pointerRef.current = {
+      ...pointerRef.current,
+      inside: false,
+    };
+    schedulePointerVisual();
   }
 
   function handleGoogleLogin(): void {
@@ -1044,44 +2100,192 @@ export function WorldStage({ world }: WorldStageProps) {
     event.target.value = "";
   }
 
+  const applySavedPixel = useCallback((nextPixel: WorldPixel, nextUser: AuthUser): void => {
+    const nextPixels = visiblePixelsRef.current.filter(
+      (pixel) => pixel.id !== nextPixel.id && !(pixel.x === nextPixel.x && pixel.y === nextPixel.y),
+    );
+    nextPixels.push(nextPixel);
+    visiblePixelsRef.current = nextPixels;
+    pixelIndexRef.current = new Map(nextPixels.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
+    setVisiblePixels(nextPixels);
+    currentUserRef.current = nextUser;
+    setAuthStatus((current) => ({
+      ...current,
+      user: nextUser,
+    }));
+    markWorldTileDirty(nextPixel);
+    setSelectedPixel({ x: nextPixel.x, y: nextPixel.y });
+  }, [markWorldTileDirty]);
+
   async function handlePlacementAction(): Promise<void> {
-    if (selectedPixel === null || currentUser === null) {
+    if (currentUser === null || placementBusy || activePendingCount === 0) {
       return;
     }
 
     setPlacementBusy(true);
     setPlacementMessage(null);
 
-    const result = canClaimSelectedPixel
-      ? await claimWorldPixel(selectedPixel.x, selectedPixel.y)
-      : await paintWorldPixel(selectedPixel.x, selectedPixel.y, selectedColorId);
+    if (activeBuildMode === "claim") {
+      const claimsToSubmit = [...pendingClaimsRef.current];
+      const failedIndex = await submitPendingClaims(claimsToSubmit);
 
-    if (!result.ok || result.pixel === null || result.user === null) {
-      setPlacementMessage({
-        tone: "error",
-        text: result.error ?? (canClaimSelectedPixel ? "Pixel claim failed." : "Pixel painting failed."),
-      });
+      if (failedIndex === -1) {
+        syncPendingClaims([]);
+        setPlacementMessage({
+          tone: "success",
+          text: `${claimsToSubmit.length} Holder claim${claimsToSubmit.length === 1 ? "" : "s"} saved.`,
+        });
+      } else {
+        syncPendingClaims(claimsToSubmit.slice(failedIndex));
+      }
+
       setPlacementBusy(false);
       return;
     }
 
-    const nextPixel = result.pixel;
-    setVisiblePixels((current) => {
-      const nextPixels = current.filter(
-        (pixel) => pixel.id !== nextPixel.id && !(pixel.x === nextPixel.x && pixel.y === nextPixel.y),
-      );
-      nextPixels.push(nextPixel);
-      return nextPixels;
-    });
-    setAuthStatus((current) => ({
-      ...current,
-      user: result.user,
-    }));
-    setPlacementMessage({
-      tone: "success",
-      text: canClaimSelectedPixel ? "Claim created successfully." : "Pixel painted successfully.",
-    });
+    const paintsToSubmit = [...pendingPaintsRef.current];
+    const failedIndex = await submitPendingPaints(paintsToSubmit);
+
+    if (failedIndex === -1) {
+      syncPendingPaints([]);
+      setPlacementMessage({
+        tone: "success",
+        text: `${paintsToSubmit.length} pixel${paintsToSubmit.length === 1 ? "" : "s"} saved.`,
+      });
+    } else {
+      syncPendingPaints(paintsToSubmit.slice(failedIndex));
+    }
+
     setPlacementBusy(false);
+  }
+
+  async function submitPendingClaims(claimsToSubmit: PixelCoordinate[]): Promise<number> {
+    for (let index = 0; index < claimsToSubmit.length; index += 1) {
+      const claim = claimsToSubmit[index];
+      const result = await claimWorldPixel(claim.x, claim.y);
+
+      if (!result.ok || result.pixel === null || result.user === null) {
+        setPlacementMessage({
+          tone: "error",
+          text: result.error ?? "Claim submission failed. Remaining claims stayed pending.",
+        });
+        return index;
+      }
+
+      applySavedPixel(result.pixel, result.user);
+    }
+
+    return -1;
+  }
+
+  async function submitPendingPaints(paintsToSubmit: PendingPaint[]): Promise<number> {
+    for (let index = 0; index < paintsToSubmit.length; index += 1) {
+      const paint = paintsToSubmit[index];
+      const result = await paintWorldPixel(paint.x, paint.y, paint.colorId);
+
+      if (!result.ok || result.pixel === null || result.user === null) {
+        setPlacementMessage({
+          tone: "error",
+          text: result.error ?? "Pixel submission failed. Remaining pixels stayed pending.",
+        });
+        return index;
+      }
+
+      applySavedPixel(result.pixel, result.user);
+    }
+
+    return -1;
+  }
+
+  function handleBuildModeChange(nextMode: BuildMode): void {
+    setActiveBuildMode(nextMode);
+    setBuildPanelOpen(true);
+    setPlacementMessage(null);
+    spaceStrokeRef.current = null;
+  }
+
+  function handleCloseBuildPanel(): void {
+    setBuildPanelOpen(false);
+    setPlacementMessage(null);
+    buildPanelDragState.current = null;
+  }
+
+  function handleClearActivePending(): void {
+    if (activeBuildMode === "claim") {
+      syncPendingClaims([]);
+    } else {
+      syncPendingPaints([]);
+    }
+
+    setPlacementMessage({
+      tone: "info",
+      text: `${BUILD_MODE_LABEL[activeBuildMode]} pending changes cleared.`,
+    });
+  }
+
+  function handleBuildPanelDragStart(event: React.PointerEvent<HTMLDivElement>): void {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const target = event.target;
+
+    if (target instanceof HTMLElement && target.closest("button")) {
+      return;
+    }
+
+    const panel = buildPanelRef.current;
+
+    if (panel === null) {
+      return;
+    }
+
+    const rect = panel.getBoundingClientRect();
+    const origin = clampPanelPosition(rect.left, rect.top, rect.width, rect.height);
+
+    buildPanelDragState.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: origin.x,
+      originY: origin.y,
+      width: rect.width,
+      height: rect.height,
+    };
+    setBuildPanelPosition(origin);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }
+
+  function handleBuildPanelDragMove(event: React.PointerEvent<HTMLDivElement>): void {
+    const drag = buildPanelDragState.current;
+
+    if (drag?.pointerId !== event.pointerId) {
+      return;
+    }
+
+    setBuildPanelPosition(
+      clampPanelPosition(
+        drag.originX + event.clientX - drag.startX,
+        drag.originY + event.clientY - drag.startY,
+        drag.width,
+        drag.height,
+      ),
+    );
+  }
+
+  function handleBuildPanelDragEnd(event: React.PointerEvent<HTMLDivElement>): void {
+    const drag = buildPanelDragState.current;
+
+    if (drag?.pointerId !== event.pointerId) {
+      return;
+    }
+
+    buildPanelDragState.current = null;
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
   }
 
   function openMePage(): void {
@@ -1091,9 +2295,18 @@ export function WorldStage({ world }: WorldStageProps) {
   const accountButtonLabel = currentUser
     ? `${currentUser.display_name} #${currentUser.public_id}`
     : "Login";
+  const buildPanelStyle = buildPanelPosition
+    ? {
+        left: `${buildPanelPosition.x}px`,
+        top: `${buildPanelPosition.y}px`,
+        bottom: "auto",
+        transform: "none",
+      }
+    : undefined;
 
   return (
     <main className={`world-shell ${darkMode ? "theme-dark" : "theme-light"}`}>
+      <PerfDebugOverlay />
       <div className="world-hud world-hud-left">
         <div className="hud-stack">
           <button
@@ -1104,7 +2317,13 @@ export function WorldStage({ world }: WorldStageProps) {
           >
             I
           </button>
-          <p className="hud-version">Version {APP_VERSION}</p>
+          <button
+            className="hud-version-button"
+            onClick={() => setActiveModal("changelog")}
+            type="button"
+          >
+            Version {APP_VERSION}
+          </button>
         </div>
       </div>
 
@@ -1128,9 +2347,7 @@ export function WorldStage({ world }: WorldStageProps) {
         <div className="coordinate-panel">
           <div className="coordinate-row">
             <span className="coordinate-label">Hover</span>
-            <span className="coordinate-value">
-              {hoverPixel === null ? "-- : --" : `${hoverPixel.x} : ${hoverPixel.y}`}
-            </span>
+            <span className="coordinate-value" ref={hoverCoordinateValueRef}>-- : --</span>
           </div>
           <div className="coordinate-row">
             <span className="coordinate-label">Selected</span>
@@ -1160,41 +2377,65 @@ export function WorldStage({ world }: WorldStageProps) {
         </button>
       </div>
 
-      {currentUser ? (
-        <div className="world-hud world-hud-bottom-center">
-          <div className="holder-panel">
-            <span className="holder-label">Holders</span>
-            <span className="holder-value">
-              {displayedHolders} / {currentUser.holder_limit}
-            </span>
-            <span className="holder-subtext">{holderStatus}</span>
-          </div>
+      <div className="world-hud world-hud-bottom-center">
+        <div className="build-taskbar" aria-label="Build tools">
+          <button
+            className={`build-tool-button ${activeBuildMode === "claim" ? "is-active" : ""}`}
+            onClick={() => handleBuildModeChange("claim")}
+            type="button"
+          >
+            <span>{BUILD_MODE_LABEL.claim}</span>
+            <small>Claim only</small>
+            {pendingClaims.length > 0 ? <strong>{pendingClaims.length}</strong> : null}
+          </button>
+          <button
+            className={`build-tool-button ${activeBuildMode === "paint" ? "is-active" : ""}`}
+            onClick={() => handleBuildModeChange("paint")}
+            type="button"
+          >
+            <span>{BUILD_MODE_LABEL.paint}</span>
+            <small>Palette</small>
+            {pendingPaints.length > 0 ? <strong>{pendingPaints.length}</strong> : null}
+          </button>
+          <HolderTaskbarStatus pendingClaims={pendingClaims.length} user={currentUser} />
         </div>
-      ) : null}
+      </div>
 
-      {selectedPixel ? (
-        <div className="world-hud world-hud-placement">
-          <div className="pixel-placement-panel">
-            <div className="pixel-placement-header">
+      {buildPanelOpen ? (
+        <div
+          className={`world-hud world-hud-placement ${buildPanelPosition ? "is-floating" : ""}`}
+          style={buildPanelStyle}
+        >
+          <div className="pixel-placement-panel" ref={buildPanelRef}>
+            <div
+              className="pixel-placement-header"
+              onPointerCancel={handleBuildPanelDragEnd}
+              onPointerDown={handleBuildPanelDragStart}
+              onPointerMove={handleBuildPanelDragMove}
+              onPointerUp={handleBuildPanelDragEnd}
+            >
               <div>
-                <span className="coordinate-label">Claim / Paint</span>
+                <span className="coordinate-label">{BUILD_MODE_LABEL[activeBuildMode]} mode</span>
                 <strong className="pixel-placement-title">
-                  {selectedPixel.x} : {selectedPixel.y}
+                  {selectedPixel === null ? "No pixel selected" : `${selectedPixel.x} : ${selectedPixel.y}`}
                 </strong>
+                <span className="pixel-placement-mode-help">{BUILD_MODE_HELP[activeBuildMode]}</span>
               </div>
-              {selectedPixelRecord === null ? (
-                <span className="pixel-placement-owner">Unclaimed cell</span>
-              ) : selectedPixelRecord.is_starter ? (
-                <span className="pixel-placement-owner">Starter frontier</span>
-              ) : selectedPixelRecord.owner_user_id === currentUser?.id ? (
-                <span className="pixel-placement-owner">Your claimed territory</span>
-              ) : (
-                <span className="pixel-placement-owner">
-                  Claimed by #{selectedPixelRecord.owner_public_id}
-                </span>
-              )}
+              <div className="pixel-placement-header-actions">
+                <span className="pixel-placement-owner">{selectedCellLabel}</span>
+                <button
+                  aria-label="Close build panel"
+                  className="pixel-panel-close"
+                  onClick={handleCloseBuildPanel}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  type="button"
+                >
+                  X
+                </button>
+              </div>
             </div>
-            {canPaintSelectedPixel ? (
+            <HolderPanelSummary pendingClaims={pendingClaims.length} user={currentUser} />
+            {activeBuildMode === "paint" ? (
               <div className="pixel-palette-grid">
                 {PIXEL_PALETTE.map((color) => (
                   <button
@@ -1209,17 +2450,28 @@ export function WorldStage({ world }: WorldStageProps) {
               </div>
             ) : null}
             <div className="pixel-placement-footer">
+              <div className="pixel-pending-row">
+                <span>{activePendingLabel}</span>
+                <button
+                  className="pixel-clear-button"
+                  disabled={placementBusy || activePendingCount === 0}
+                  onClick={handleClearActivePending}
+                  type="button"
+                >
+                  Clear
+                </button>
+              </div>
               <p className="pixel-placement-help">{placementHelpText}</p>
               {placementMessage ? (
                 <p className={`account-feedback is-${placementMessage.tone}`}>{placementMessage.text}</p>
               ) : null}
               <button
                 className="google-button pixel-place-button"
-                disabled={placementBusy || !(canClaimSelectedPixel || canPaintSelectedPixel)}
+                disabled={placementBusy || activePendingCount === 0}
                 onClick={() => void handlePlacementAction()}
                 type="button"
               >
-                {placementBusy ? "Saving..." : placementLabel}
+                {placementLabel}
               </button>
             </div>
           </div>
@@ -1233,7 +2485,6 @@ export function WorldStage({ world }: WorldStageProps) {
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
         onPointerLeave={handlePointerLeave}
-        onWheel={handleWheel}
         ref={viewportRef}
       >
         <div className="world-backdrop-glow" aria-hidden="true" />
@@ -1257,9 +2508,22 @@ export function WorldStage({ world }: WorldStageProps) {
           ))}
         </div>
         <div className="world-claim-layer" aria-hidden="true">
-          {renderedClaims.map((pixel) => (
+          {renderedWorldTiles.map((tile) => (
             <span
-              className={`world-claimed-pixel ${pixel.tone} ${pixel.isSelected ? "is-selected" : ""}`}
+              className="world-tile"
+              key={`claim-${tile.key}`}
+              style={{
+                left: `${tile.left}px`,
+                top: `${tile.top}px`,
+                width: `${tile.size}px`,
+                height: `${tile.size}px`,
+                backgroundImage: `url("${getWorldTileUrl("claims", tile.tileX, tile.tileY, tile.revision)}")`,
+              }}
+            />
+          ))}
+          {renderedPendingClaims.map((pixel) => (
+            <span
+              className={`world-pending-claim ${pixel.isSelected ? "is-selected" : ""}`}
               key={pixel.key}
               style={{
                 left: `${pixel.left}px`,
@@ -1271,9 +2535,22 @@ export function WorldStage({ world }: WorldStageProps) {
           ))}
         </div>
         <div className="world-pixel-layer" aria-hidden="true">
-          {renderedPixels.map((pixel) => (
+          {renderedWorldTiles.map((tile) => (
             <span
-              className={`world-painted-pixel ${pixel.isSelected ? "is-selected" : ""}`}
+              className="world-tile"
+              key={`paint-${tile.key}`}
+              style={{
+                left: `${tile.left}px`,
+                top: `${tile.top}px`,
+                width: `${tile.size}px`,
+                height: `${tile.size}px`,
+                backgroundImage: `url("${getWorldTileUrl("paint", tile.tileX, tile.tileY, tile.revision)}")`,
+              }}
+            />
+          ))}
+          {renderedPendingPaints.map((pixel) => (
+            <span
+              className={`world-pending-paint ${pixel.isSelected ? "is-selected" : ""}`}
               key={pixel.key}
               style={{
                 left: `${pixel.left}px`,
@@ -1311,12 +2588,16 @@ export function WorldStage({ world }: WorldStageProps) {
           />
         ))}
 
-        {pointer.inside ? (
-          <>
-            <div className="world-crosshair-line world-crosshair-horizontal" style={{ top: `${pointer.y}px` }} />
-            <div className="world-crosshair-line world-crosshair-vertical" style={{ left: `${pointer.x}px` }} />
-          </>
-        ) : null}
+        <div
+          aria-hidden="true"
+          className="world-crosshair-line world-crosshair-horizontal"
+          ref={crosshairHorizontalRef}
+        />
+        <div
+          aria-hidden="true"
+          className="world-crosshair-line world-crosshair-vertical"
+          ref={crosshairVerticalRef}
+        />
       </div>
 
       {activeModal === "info" ? (
@@ -1336,38 +2617,71 @@ export function WorldStage({ world }: WorldStageProps) {
               </button>
             </div>
 
-            <div className="modal-sections">
-              <article className="modal-card">
-                <h3>Announcements</h3>
-                <p>
-                  The landing view is now intentionally minimal: only the world viewport is visible,
-                  while project information and the running changelog stay inside modal windows.
-                </p>
-              </article>
-              <article className="modal-card">
-                <h3>Rules</h3>
-                <p>
-                  Claims must touch the starter frontier or another claimed pixel, and painting is
-                  only allowed inside territory that belongs to you.
-                </p>
-              </article>
-              <article className="modal-card">
-                <h3>Terms of Service</h3>
-                <p>
-                  Legal notes, privacy details and account policies are kept out of the canvas view
-                  and will be maintained in this information area.
-                </p>
-              </article>
-              <article className="modal-card">
-                <h3>World internals</h3>
-                <p>
-                  The backend still uses hidden chunks of {world.chunk_size} x {world.chunk_size}
-                  pixels, but chunk borders are not rendered in the frontend so the canvas stays
-                  visually clean.
-                </p>
-              </article>
+            <div className="modal-scroll-area">
+              <div className="modal-sections">
+                <article className="modal-card">
+                  <h3>Announcements</h3>
+                  <p>
+                    The landing view stays intentionally minimal: only the world viewport is visible,
+                    while project information now lives in dedicated modal windows.
+                  </p>
+                </article>
+                <article className="modal-card">
+                  <h3>Rules</h3>
+                  <p>
+                    Claims must touch the starter frontier or another claimed pixel, and painting is
+                    only allowed inside territory that belongs to you.
+                  </p>
+                </article>
+                <article className="modal-card">
+                  <h3>Terms of Service</h3>
+                  <p>
+                    Legal notes, privacy details and account policies are kept out of the canvas view
+                    and will be maintained in this information area.
+                  </p>
+                </article>
+                <article className="modal-card">
+                  <h3>World internals</h3>
+                  <p>
+                    The backend still uses hidden chunks of {world.chunk_size} x {world.chunk_size}
+                    pixels, but chunk borders are not rendered in the frontend so the canvas stays
+                    visually clean.
+                  </p>
+                </article>
+                <article className="modal-card">
+                  <h3>Canvas tools</h3>
+                  <p>
+                    Use the bottom taskbar to switch between Holder claims and normal painting.
+                    Press Space over cells to stage changes locally, then submit them together.
+                  </p>
+                </article>
+              </div>
+            </div>
+            <button className="modal-version-button" onClick={() => setActiveModal("changelog")} type="button">
+              Version {APP_VERSION}
+            </button>
+          </section>
+        </div>
+      ) : null}
+
+      {activeModal === "changelog" ? (
+        <div className="modal-backdrop" onClick={() => setActiveModal(null)} role="presentation">
+          <section
+            aria-labelledby="changelog-title"
+            className="modal-window"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div>
+                <p className="modal-eyebrow">Version history</p>
+                <h2 id="changelog-title">Project changelog</h2>
+              </div>
+              <button className="modal-close" onClick={() => setActiveModal(null)} type="button">
+                Close
+              </button>
+            </div>
+            <div className="modal-scroll-area">
               <article className="modal-card changelog-card">
-                <h3>Changelog</h3>
                 <div className="changelog-list">
                   {APP_CHANGELOG.map((entry) => (
                     <div className="changelog-entry" key={entry.version}>
@@ -1408,144 +2722,145 @@ export function WorldStage({ world }: WorldStageProps) {
                 Close
               </button>
             </div>
-
-            {currentUser ? (
-              <div className="modal-card account-card">
-                <div className="account-header">
-                  <div className="account-avatar-stack">
-                    {currentUser.avatar_url ? (
-                      <Image
-                        alt={currentUser.display_name}
-                        className="account-avatar"
-                        height={72}
-                        referrerPolicy="no-referrer"
-                        src={currentUser.avatar_url}
-                        width={72}
-                      />
-                    ) : (
-                      <div className="account-avatar account-avatar-fallback" aria-hidden="true">
-                        <DefaultAvatarIcon />
-                      </div>
-                    )}
+            <div className="modal-scroll-area">
+              {currentUser ? (
+                <div className="modal-card account-card">
+                  <div className="account-header">
+                    <div className="account-avatar-stack">
+                      {currentUser.avatar_url ? (
+                        <Image
+                          alt={currentUser.display_name}
+                          className="account-avatar"
+                          height={72}
+                          referrerPolicy="no-referrer"
+                          src={currentUser.avatar_url}
+                          width={72}
+                        />
+                      ) : (
+                        <div className="account-avatar account-avatar-fallback" aria-hidden="true">
+                          <DefaultAvatarIcon />
+                        </div>
+                      )}
+                      <button
+                        aria-label="Edit avatar"
+                        className="account-avatar-edit-button"
+                        onClick={() => setActiveModal("avatar")}
+                        type="button"
+                      >
+                        <PencilIcon />
+                      </button>
+                    </div>
+                    <div className="account-details">
+                      <h3>{currentUser.display_name}</h3>
+                      <p className="account-tag">#{currentUser.public_id}</p>
+                      <p>
+                        <HolderAccountCount user={currentUser} />
+                      </p>
+                      <p>Use the pencil button under your profile image to open avatar editing.</p>
+                    </div>
+                  </div>
+                  {currentUser.needs_display_name_setup ? (
+                    <div className="account-onboarding">
+                      <strong>Welcome aboard.</strong>
+                      <span>New registrations must choose a real display name before settling in.</span>
+                    </div>
+                  ) : null}
+                  <div className="account-stat-grid">
+                    <article className="account-stat-card">
+                      <span className="account-stat-label">Level</span>
+                      <strong>{currentUser.level}</strong>
+                      <small>
+                        {currentUser.level_progress_current} / {currentUser.level_progress_target}
+                      </small>
+                    </article>
+                    <article className="account-stat-card">
+                      <span className="account-stat-label">Placed Holders</span>
+                      <strong>{currentUser.holders_placed_total}</strong>
+                      <small>{currentUser.claimed_pixels_count} active claimed pixels</small>
+                    </article>
+                    <article className="account-stat-card">
+                      <span className="account-stat-label">Regeneration</span>
+                      <HolderAccountStatus user={currentUser} />
+                      <small>Projected locally from backend timestamps</small>
+                    </article>
+                    <article className="account-stat-card">
+                      <span className="account-stat-label">Last Login</span>
+                      <strong>{formatDateTime(currentUser.last_login_at)}</strong>
+                      <small>Created {formatDateTime(currentUser.created_at)}</small>
+                    </article>
+                  </div>
+                  <div className="account-name-editor">
+                    <label className="account-label" htmlFor="display-name-input">
+                      Display name
+                    </label>
+                    <input
+                      className="account-input"
+                      id="display-name-input"
+                      maxLength={24}
+                      onChange={(event) => setProfileName(event.target.value)}
+                      placeholder="Enter a display name"
+                      type="text"
+                      value={profileName}
+                    />
+                    <p className="account-helper">{nameChangeHint}</p>
+                    {profileMessage ? (
+                      <p className={`account-feedback is-${profileMessage.tone}`}>{profileMessage.text}</p>
+                    ) : null}
+                  </div>
+                  <div className="account-actions">
                     <button
-                      aria-label="Edit avatar"
-                      className="account-avatar-edit-button"
-                      onClick={() => setActiveModal("avatar")}
+                      className="google-button google-button-secondary"
+                      disabled={authBusy || profileBusy}
+                      onClick={openMePage}
                       type="button"
                     >
-                      <PencilIcon />
+                      Open /me JSON
+                    </button>
+                    <button
+                      className="google-button"
+                      disabled={
+                        authBusy ||
+                        profileBusy ||
+                        !currentUser.can_change_display_name ||
+                        !hasDisplayNameChange
+                      }
+                      onClick={() => void handleDisplayNameSave()}
+                      type="button"
+                    >
+                      {profileBusy ? "Saving..." : currentUser.needs_display_name_setup ? "Save my name" : "Save display name"}
+                    </button>
+                    <button
+                      className="google-button google-button-secondary"
+                      disabled={authBusy || profileBusy}
+                      onClick={() => void handleLogout()}
+                      type="button"
+                    >
+                      {authBusy ? "Signing out..." : "Logout"}
                     </button>
                   </div>
-                  <div className="account-details">
-                    <h3>{currentUser.display_name}</h3>
-                    <p className="account-tag">#{currentUser.public_id}</p>
-                    <p>
-                      Holders: {displayedHolders} / {currentUser.holder_limit}
-                    </p>
-                    <p>Use the pencil button under your profile image to open avatar editing.</p>
-                  </div>
                 </div>
-                {currentUser.needs_display_name_setup ? (
-                  <div className="account-onboarding">
-                    <strong>Welcome aboard.</strong>
-                    <span>New registrations must choose a real display name before settling in.</span>
-                  </div>
-                ) : null}
-                <div className="account-stat-grid">
-                  <article className="account-stat-card">
-                    <span className="account-stat-label">Level</span>
-                    <strong>{currentUser.level}</strong>
-                    <small>
-                      {currentUser.level_progress_current} / {currentUser.level_progress_target}
-                    </small>
-                  </article>
-                  <article className="account-stat-card">
-                    <span className="account-stat-label">Placed Holders</span>
-                    <strong>{currentUser.holders_placed_total}</strong>
-                    <small>{currentUser.claimed_pixels_count} active claimed pixels</small>
-                  </article>
-                  <article className="account-stat-card">
-                    <span className="account-stat-label">Regeneration</span>
-                    <strong>{holderStatus}</strong>
-                    <small>Projected locally from backend timestamps</small>
-                  </article>
-                  <article className="account-stat-card">
-                    <span className="account-stat-label">Last Login</span>
-                    <strong>{formatDateTime(currentUser.last_login_at)}</strong>
-                    <small>Created {formatDateTime(currentUser.created_at)}</small>
-                  </article>
-                </div>
-                <div className="account-name-editor">
-                  <label className="account-label" htmlFor="display-name-input">
-                    Display name
-                  </label>
-                  <input
-                    className="account-input"
-                    id="display-name-input"
-                    maxLength={24}
-                    onChange={(event) => setProfileName(event.target.value)}
-                    placeholder="Enter a display name"
-                    type="text"
-                    value={profileName}
-                  />
-                  <p className="account-helper">{nameChangeHint}</p>
-                  {profileMessage ? (
-                    <p className={`account-feedback is-${profileMessage.tone}`}>{profileMessage.text}</p>
-                  ) : null}
-                </div>
-                <div className="account-actions">
-                  <button
-                    className="google-button google-button-secondary"
-                    disabled={authBusy || profileBusy}
-                    onClick={openMePage}
-                    type="button"
-                  >
-                    Open /me JSON
-                  </button>
+              ) : (
+                <div className="modal-card">
+                  <p>
+                    Google OAuth is the account entry point for PixelProject. The first successful
+                    login now creates the player account and redirects brand-new users into the
+                    required display-name setup flow.
+                  </p>
                   <button
                     className="google-button"
-                    disabled={
-                      authBusy ||
-                      profileBusy ||
-                      !currentUser.can_change_display_name ||
-                      !hasDisplayNameChange
-                    }
-                    onClick={() => void handleDisplayNameSave()}
+                    disabled={authLoading || authBusy || !authStatus.google_oauth_configured}
+                    onClick={handleGoogleLogin}
                     type="button"
                   >
-                    {profileBusy ? "Saving..." : currentUser.needs_display_name_setup ? "Save my name" : "Save display name"}
-                  </button>
-                  <button
-                    className="google-button google-button-secondary"
-                    disabled={authBusy || profileBusy}
-                    onClick={() => void handleLogout()}
-                    type="button"
-                  >
-                    {authBusy ? "Signing out..." : "Logout"}
+                    {authLoading
+                      ? "Checking auth..."
+                      : authStatus.google_oauth_configured
+                        ? "Continue with Google"
+                        : "Google OAuth not configured"}
                   </button>
                 </div>
-              </div>
-            ) : (
-              <div className="modal-card">
-                <p>
-                  Google OAuth is the account entry point for PixelProject. The first successful
-                  login now creates the player account and redirects brand-new users into the
-                  required display-name setup flow.
-                </p>
-                <button
-                  className="google-button"
-                  disabled={authLoading || authBusy || !authStatus.google_oauth_configured}
-                  onClick={handleGoogleLogin}
-                  type="button"
-                >
-                  {authLoading
-                    ? "Checking auth..."
-                    : authStatus.google_oauth_configured
-                      ? "Continue with Google"
-                      : "Google OAuth not configured"}
-                </button>
-              </div>
-            )}
+              )}
+            </div>
           </section>
         </div>
       ) : null}
@@ -1566,62 +2881,64 @@ export function WorldStage({ world }: WorldStageProps) {
                 Back
               </button>
             </div>
-            <div className="modal-card avatar-editor-card">
-              <input
-                accept="image/*"
-                className="avatar-file-input"
-                onChange={(event) => void handleAvatarFileChange(event)}
-                ref={avatarFileInputRef}
-                type="file"
-              />
-              <div className="avatar-editor-current">
-                {currentUser.avatar_url ? (
-                  <Image
-                    alt={currentUser.display_name}
-                    className="account-avatar avatar-editor-preview"
-                    height={88}
-                    referrerPolicy="no-referrer"
-                    src={currentUser.avatar_url}
-                    width={88}
-                  />
-                ) : (
-                  <div className="account-avatar account-avatar-fallback avatar-editor-preview" aria-hidden="true">
-                    <DefaultAvatarIcon />
+            <div className="modal-scroll-area">
+              <div className="modal-card avatar-editor-card">
+                <input
+                  accept="image/*"
+                  className="avatar-file-input"
+                  onChange={(event) => void handleAvatarFileChange(event)}
+                  ref={avatarFileInputRef}
+                  type="file"
+                />
+                <div className="avatar-editor-current">
+                  {currentUser.avatar_url ? (
+                    <Image
+                      alt={currentUser.display_name}
+                      className="account-avatar avatar-editor-preview"
+                      height={88}
+                      referrerPolicy="no-referrer"
+                      src={currentUser.avatar_url}
+                      width={88}
+                    />
+                  ) : (
+                    <div className="account-avatar account-avatar-fallback avatar-editor-preview" aria-hidden="true">
+                      <DefaultAvatarIcon />
+                    </div>
+                  )}
+                  <div>
+                    <h3>Current avatar</h3>
+                    <p className="account-helper">
+                      Upload your own image. We crop it to a square and resize it automatically for the profile UI.
+                    </p>
+                    <div className="avatar-upload-actions">
+                      <button
+                        className="google-button"
+                        disabled={avatarBusy}
+                        onClick={handleAvatarUploadClick}
+                        type="button"
+                      >
+                        {avatarBusy ? "Uploading..." : "Upload custom avatar"}
+                      </button>
+                    </div>
+                    {avatarMessage ? (
+                      <p className={`account-feedback is-${avatarMessage.tone}`}>{avatarMessage.text}</p>
+                    ) : null}
                   </div>
-                )}
-                <div>
-                  <h3>Current avatar</h3>
-                  <p className="account-helper">
-                    Upload your own image. We crop it to a square and resize it automatically for the profile UI.
-                  </p>
-                  <div className="avatar-upload-actions">
-                    <button
-                      className="google-button"
-                      disabled={avatarBusy}
-                      onClick={handleAvatarUploadClick}
-                      type="button"
-                    >
-                      {avatarBusy ? "Uploading..." : "Upload custom avatar"}
-                    </button>
-                  </div>
-                  {avatarMessage ? (
-                    <p className={`account-feedback is-${avatarMessage.tone}`}>{avatarMessage.text}</p>
-                  ) : null}
                 </div>
+                {currentUser.avatar_history.length > 0 ? (
+                  <div className="avatar-history-block compact">
+                    <span className="account-label">Previous uploads</span>
+                    <div className="avatar-history-grid">
+                      {currentUser.avatar_history.map((avatar) => (
+                        <div className="avatar-history-tile" key={`${avatar.image_url}-${avatar.selected_at}`}>
+                          <Image alt={avatar.label} className="avatar-history-image" height={56} src={avatar.image_url} width={56} />
+                          <span>{avatar.label}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
               </div>
-              {currentUser.avatar_history.length > 0 ? (
-                <div className="avatar-history-block compact">
-                  <span className="account-label">Previous uploads</span>
-                  <div className="avatar-history-grid">
-                    {currentUser.avatar_history.map((avatar) => (
-                      <div className="avatar-history-tile" key={`${avatar.image_url}-${avatar.selected_at}`}>
-                        <Image alt={avatar.label} className="avatar-history-image" height={56} src={avatar.image_url} width={56} />
-                        <span>{avatar.label}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
             </div>
           </section>
         </div>
@@ -1643,11 +2960,13 @@ export function WorldStage({ world }: WorldStageProps) {
                 Close
               </button>
             </div>
-            <div className="modal-card">
-              <p>
-                The shop entry point now exists for signed-in players. We can fill it with holder
-                upgrades, perks, cosmetics or supporter packs in the next steps.
-              </p>
+            <div className="modal-scroll-area">
+              <div className="modal-card">
+                <p>
+                  The shop entry point now exists for signed-in players. We can fill it with holder
+                  upgrades, perks, cosmetics or supporter packs in the next steps.
+                </p>
+              </div>
             </div>
           </section>
         </div>

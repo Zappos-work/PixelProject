@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from PIL import Image
 
 from app.core.config import Settings, get_settings
 from app.models.user import User
@@ -56,6 +58,9 @@ PIXEL_PALETTE = [
 ]
 VALID_COLOR_IDS = {color["id"] for color in PIXEL_PALETTE}
 MAX_VISIBLE_PIXELS = 5000
+WORLD_TILE_SIZE = 1000
+WORLD_TILE_CACHE_DIR = Path(".tile-cache")
+WORLD_TILE_LAYERS = {"claims", "paint"}
 STARTER_FRONTIER_COORDINATES = [
     (-1, 0),
     (0, -1),
@@ -70,6 +75,57 @@ class PixelPlacementError(Exception):
         super().__init__(detail)
         self.detail = detail
         self.status_code = status_code
+
+
+class WorldTileError(Exception):
+    def __init__(self, detail: str, status_code: int) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.status_code = status_code
+
+
+def _hex_to_rgba(hex_color: str, alpha: int = 255) -> tuple[int, int, int, int]:
+    normalized = hex_color.lstrip("#")
+    return (
+        int(normalized[0:2], 16),
+        int(normalized[2:4], 16),
+        int(normalized[4:6], 16),
+        alpha,
+    )
+
+
+PALETTE_RGBA = {
+    color["id"]: _hex_to_rgba(color["hex"])
+    for color in PIXEL_PALETTE
+}
+
+
+def get_world_tile_key(x: int, y: int) -> tuple[int, int]:
+    return x // WORLD_TILE_SIZE, y // WORLD_TILE_SIZE
+
+
+def get_world_tile_cache_path(layer: str, tile_x: int, tile_y: int) -> Path:
+    return WORLD_TILE_CACHE_DIR / layer / f"{tile_x}_{tile_y}.png"
+
+
+def get_world_tile_bounds(tile_x: int, tile_y: int) -> tuple[int, int, int, int]:
+    min_x = tile_x * WORLD_TILE_SIZE
+    min_y = tile_y * WORLD_TILE_SIZE
+    return min_x, min_x + WORLD_TILE_SIZE - 1, min_y, min_y + WORLD_TILE_SIZE - 1
+
+
+def invalidate_world_tile_for_pixel(x: int, y: int, layers: set[str] | None = None) -> None:
+    tile_x, tile_y = get_world_tile_key(x, y)
+    invalidated_layers = layers or WORLD_TILE_LAYERS
+
+    for layer in invalidated_layers:
+        path = get_world_tile_cache_path(layer, tile_x, tile_y)
+
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            # A stale tile is acceptable; the next successful invalidation/request will refresh it.
+            pass
 
 
 def build_world_pixel_summary(pixel: WorldPixel, owner: User | None) -> WorldPixelSummary:
@@ -163,6 +219,68 @@ async def get_visible_world_pixels(
     )
 
 
+async def ensure_world_tile_png(
+    session: AsyncSession,
+    layer: str,
+    tile_x: int,
+    tile_y: int,
+) -> Path:
+    if layer not in WORLD_TILE_LAYERS:
+        raise WorldTileError("Unknown world tile layer.", 404)
+
+    tile_path = get_world_tile_cache_path(layer, tile_x, tile_y)
+    if tile_path.exists():
+        return tile_path
+
+    tile_path.parent.mkdir(parents=True, exist_ok=True)
+    min_x, max_x, min_y, max_y = get_world_tile_bounds(tile_x, tile_y)
+
+    if layer == "paint":
+        result = await session.execute(
+            select(WorldPixel.x, WorldPixel.y, WorldPixel.color_id)
+            .where(
+                WorldPixel.x >= min_x,
+                WorldPixel.x <= max_x,
+                WorldPixel.y >= min_y,
+                WorldPixel.y <= max_y,
+                WorldPixel.color_id.is_not(None),
+            )
+        )
+        image = Image.new("RGBA", (WORLD_TILE_SIZE, WORLD_TILE_SIZE), (0, 0, 0, 0))
+        pixels = image.load()
+
+        for x, y, color_id in result.all():
+            if color_id is None:
+                continue
+
+            pixels[x - min_x, y - min_y] = PALETTE_RGBA.get(color_id, (255, 255, 255, 255))
+    else:
+        result = await session.execute(
+            select(WorldPixel.x, WorldPixel.y, WorldPixel.owner_user_id, WorldPixel.is_starter)
+            .where(
+                WorldPixel.x >= min_x,
+                WorldPixel.x <= max_x,
+                WorldPixel.y >= min_y,
+                WorldPixel.y <= max_y,
+                or_(WorldPixel.owner_user_id.is_not(None), WorldPixel.is_starter.is_(True)),
+            )
+        )
+        image = Image.new("RGBA", (WORLD_TILE_SIZE, WORLD_TILE_SIZE), (0, 0, 0, 0))
+        pixels = image.load()
+
+        for x, y, owner_user_id, is_starter in result.all():
+            pixels[x - min_x, y - min_y] = (
+                (255, 210, 92, 74)
+                if is_starter
+                else (70, 208, 164, 48 if owner_user_id is not None else 0)
+            )
+
+    temp_path = tile_path.with_suffix(".tmp.png")
+    image.save(temp_path, format="PNG", compress_level=4)
+    temp_path.replace(tile_path)
+    return tile_path
+
+
 async def _validate_inside_active_world(session: AsyncSession, x: int, y: int) -> None:
     active_chunk = await session.scalar(
         select(WorldChunk).where(
@@ -232,6 +350,7 @@ async def claim_world_pixel(
     user.claimed_pixels_count += 1
 
     await session.commit()
+    invalidate_world_tile_for_pixel(x, y, {"claims"})
     await session.refresh(pixel)
     await session.refresh(user)
 
@@ -267,6 +386,7 @@ async def paint_world_pixel(
     pixel.color_id = color_id
 
     await session.commit()
+    invalidate_world_tile_for_pixel(x, y, {"paint"})
     await session.refresh(pixel)
     await session.refresh(user)
 

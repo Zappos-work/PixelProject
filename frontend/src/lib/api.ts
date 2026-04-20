@@ -128,6 +128,8 @@ export type WorldPixelWindow = {
   pixels: WorldPixel[];
 };
 
+export type WorldTileLayer = "claims" | "paint";
+
 const apiBaseUrl =
   process.env.API_SERVER_URL ??
   process.env.NEXT_PUBLIC_API_BASE_URL ??
@@ -259,6 +261,16 @@ export async function getDashboardData(): Promise<DashboardData> {
 
 export function getClientApiBaseUrl(): string {
   return clientApiBaseUrl;
+}
+
+export function getWorldTileUrl(
+  layer: WorldTileLayer,
+  tileX: number,
+  tileY: number,
+  revision = 0,
+): string {
+  const params = new URLSearchParams({ v: String(revision) });
+  return `${clientApiBaseUrl}/world/tiles/${layer}/${tileX}/${tileY}.png?${params.toString()}`;
 }
 
 export async function fetchAuthSession(): Promise<AuthSessionStatus> {
