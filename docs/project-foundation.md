@@ -8,7 +8,9 @@ This document captures the first confirmed implementation decisions after the pl
 - The first world anchor is seeded from the backend bootstrap so a valid starting chunk exists in the database.
 - Chunks are currently configured as `5,000 x 5,000`.
 - The current expansion rule reserves a `5,000` pixel buffer near the world border before a new chunk should be created.
-- The first implementation pass is local-only and Docker-based.
+- The first implementation pass started local-only and Docker-based.
+- The first production domain is `pixel.zappos-dev.work`.
+- Production uses Docker Compose with Caddy as the reverse proxy.
 
 ## Current Local Foundation
 
@@ -19,6 +21,18 @@ This document captures the first confirmed implementation decisions after the pl
 - `GET /api/v1/world/overview`: returns the seeded world origin and current chunks.
 - A visible starter chunk ring is seeded so the local world is not empty.
 - The frontend already includes a first draggable and zoomable world preview.
+
+## Current Production Foundation
+
+- Production URL: `https://pixel.zappos-dev.work`.
+- Server project directory: `/opt/pixelproject`.
+- Production Compose file: `/opt/pixelproject/compose.prod.yml`.
+- Reverse proxy: Caddy with automatic HTTPS through Let's Encrypt.
+- Public ports: `80` and `443`.
+- Internal services: `frontend:3000`, `backend:8000`, `db:5432`, `redis:6379`.
+- PostgreSQL and Redis are not directly exposed publicly.
+- Production health endpoint: `https://pixel.zappos-dev.work/api/v1/health`.
+- Detailed server notes are tracked in `docs/production-deployment.md`.
 
 ## Questions Still Open
 

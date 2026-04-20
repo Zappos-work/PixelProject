@@ -8,7 +8,11 @@ Last updated: 2026-04-20
 - Local development stack is running through Docker Compose.
 - Frontend is available on `http://localhost:3000`.
 - Backend API and docs are available on `http://localhost:8000`.
+- First production deployment is live at `https://pixel.zappos-dev.work`.
+- Production health is available at `https://pixel.zappos-dev.work/api/v1/health`.
 - PostgreSQL and Redis are connected and included in local startup.
+- Production uses Docker Compose with Caddy, PostgreSQL and Redis on the server.
+- Daily PostgreSQL backups are configured on the server with 14-day retention.
 - A dedicated changelog is tracked in `docs/changelog.md` and is now opened in-app from the clickable version badge.
 
 ## Implemented So Far
@@ -61,6 +65,7 @@ Last updated: 2026-04-20
 - Area owners can edit the Area name and description and invite other players by public `#` number.
 - Holder claim submission now supports backend batch validation for multi-pixel tools.
 - The first rectangle claim tool is available by choosing two opposite corners while still rejecting existing claimed cells and requiring a valid connection route.
+- Production deployment notes are documented in `docs/production-deployment.md`, including DNS, Caddy routing, production environment variables, Google OAuth URLs, backups and GitHub Actions deploy preparation.
 
 ## Confirmed World Decisions
 
@@ -77,6 +82,7 @@ Last updated: 2026-04-20
 - Live chunk subscriptions and WebSocket update strategy.
 - Future far-zoom support should avoid loading every pixel at once by using chunk-aware streaming or level-of-detail rendering.
 - Holder/coin balancing, rate-limits, and broader gameplay systems beyond the first pixel-placement loop.
+- Production hardening: SSH lock-down, external backups, monitoring, and final GitHub Actions/Discord deploy notification verification.
 
 ## Recommended Next Implementation Step
 

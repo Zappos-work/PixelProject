@@ -4,11 +4,11 @@ PixelProject is a professional browser-based multiplayer pixel canvas game.
 
 The main idea is to create a huge, expanding collaborative pixel artwork where many users build individual and shared artworks on one large world canvas. The project is inspired by large-scale pixel canvas concepts, but it will have its own gameplay systems, claiming rules, economy, moderation tools, and long-term progression.
 
-The first public development domain is planned as:
+The first public development domain is:
 
-`pixel.zappos-work.uk`
+`pixel.zappos-dev.work`
 
-The game is currently planned to run on a root server with 8 GB RAM and 4 CPU cores. This setup is intended for development, testing, and early low-traffic usage.
+The first production server is intended for development, testing, and early low-traffic usage.
 
 ---
 
@@ -412,7 +412,7 @@ Planned technical direction:
 - Deployment: Docker Compose
 - Reverse proxy: Nginx or Caddy
 - Server: Root server
-- Initial domain: pixel.zappos-work.uk
+- Initial production domain: pixel.zappos-dev.work
 
 The final stack may still be adjusted during development, but the project should be structured from the beginning like a serious long-term web game.
 
@@ -605,13 +605,14 @@ Possible future features:
 
 ## Current Project Status
 
-The project is currently in the early local implementation phase.
+The project is currently in early implementation with both local development and a first production server.
 
 The current goal is to turn the planning into a stable local foundation while keeping the long-term architecture clean.
 
 Current implementation highlights:
 
 - Local Docker development stack
+- First production Docker Compose deployment on `https://pixel.zappos-dev.work`
 - Frontend and backend foundation
 - PostgreSQL and Redis integration
 - Seeded starter world around the `0:0` origin
@@ -671,4 +672,5 @@ The ongoing implementation status is tracked in:
 - `README.md` for the main product and architecture vision
 - `docs/project-foundation.md` for confirmed technical decisions
 - `docs/project-status.md` for the current local implementation snapshot
+- `docs/production-deployment.md` for the first production server, DNS, Caddy, backups and deploy notes
 - `docs/changelog.md` for release-by-release change tracking

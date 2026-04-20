@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 - 2026-04-20
+
+- Documented the first production deployment on `https://pixel.zappos-dev.work`.
+- Added the production deployment runbook with DNS, Caddy, environment, Google OAuth, backup and GitHub Actions notes.
+- Updated project foundation and status docs to reflect the live production server.
+
 ## 0.1.1 - 2026-04-20
 
 - Added claim Areas so new Holder territory can carry owner, size, painted-pixel and contributor information.
