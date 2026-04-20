@@ -22,13 +22,54 @@ jobs:
           ssh-keyscan -p "${{ secrets.PIXEL_SSH_PORT }}" "${{ secrets.PIXEL_HOST }}" >> ~/.ssh/known_hosts
 
       - name: Deploy on server
+        id: deploy
         run: |
-          ssh -i ~/.ssh/pixel_key -p "${{ secrets.PIXEL_SSH_PORT }}" deploy@${{ secrets.PIXEL_HOST }} '
-            set -e
-            cd /opt/pixelproject
-            git fetch origin main
-            git reset --hard origin/main
-            docker compose -f compose.prod.yml up -d --build --remove-orphans
-            docker image prune -f
-            docker compose -f compose.prod.yml ps
-          '
+          set +e
+
+          ssh -i ~/.ssh/pixel_key -p "${{ secrets.PIXEL_SSH_PORT }}" deploy@${{ secrets.PIXEL_HOST }} 'bash -s' <<'REMOTE' 2>&1 | tee deploy.log
+          set -euo pipefail
+
+          git config --global --add safe.directory /opt/pixelproject
+
+          cd /opt/pixelproject
+
+          git fetch origin main
+          git reset --hard origin/main
+
+          docker compose -f compose.prod.yml up -d --build --remove-orphans
+          docker image prune -f
+
+          docker compose -f compose.prod.yml ps
+
+          curl -fsS https://pixel.zappos-dev.work/api/v1/health
+          REMOTE
+
+          STATUS=${PIPESTATUS[0]}
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+          exit 0
+
+      - name: Notify Discord success
+        if: steps.deploy.outputs.status == '0'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -sS -X POST "$DISCORD_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":\"PixelProject deploy successful.\nBranch: main\nCommit: ${{ github.sha }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
+
+      - name: Notify Discord failure
+        if: steps.deploy.outputs.status != '0'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          tail -c 180000 deploy.log > deploy_error.log
+
+          curl -sS -X POST "$DISCORD_WEBHOOK_URL" \
+            -F 'payload_json={"content":"PixelProject deploy FAILED. Error log is attached."}' \
+            -F "files[0]=@deploy_error.log;type=text/plain"
+
+      - name: Fail workflow if deploy failed
+        if: steps.deploy.outputs.status != '0'
+        run: |
+          exit 1
