@@ -36,6 +36,21 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
 
+          set_env_value() {
+            local key="$1"
+            local value="$2"
+
+            if grep -q "^${key}=" .env; then
+              sed -i "s|^${key}=.*|${key}=${value}|" .env
+            else
+              printf '\n%s=%s\n' "$key" "$value" >> .env
+            fi
+          }
+
+          set_env_value WORLD_CHUNK_SIZE 4000
+          set_env_value WORLD_EXPANSION_BUFFER 0
+          set_env_value WORLD_EXPANSION_CLAIM_FILL_RATIO 0.7
+
           export WORLD_CHUNK_SIZE=4000
           export WORLD_EXPANSION_BUFFER=0
           export WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7

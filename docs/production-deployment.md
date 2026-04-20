@@ -387,6 +387,21 @@ git config --global --add safe.directory /opt/pixelproject
 cd /opt/pixelproject
 git fetch origin main
 git reset --hard origin/main
+
+set_env_value() {
+  local key="$1"
+  local value="$2"
+
+  if grep -q "^${key}=" .env; then
+    sed -i "s|^${key}=.*|${key}=${value}|" .env
+  else
+    printf '\n%s=%s\n' "$key" "$value" >> .env
+  fi
+}
+
+set_env_value WORLD_CHUNK_SIZE 4000
+set_env_value WORLD_EXPANSION_BUFFER 0
+set_env_value WORLD_EXPANSION_CLAIM_FILL_RATIO 0.7
 export WORLD_CHUNK_SIZE=4000
 export WORLD_EXPANSION_BUFFER=0
 export WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7
@@ -396,7 +411,7 @@ docker compose -f compose.prod.yml ps
 curl -fsS https://pixel.zappos-dev.work/api/v1/health
 ```
 
-The workflow exports the current world growth values before `docker compose up` so an older server-local Compose default does not keep the backend on the previous `5,000 x 5,000` setup.
+The workflow upserts the current world growth values into the server-local `.env` and exports them before `docker compose up`. This prevents older server-local Compose or `.env` defaults from keeping the backend on the previous `5,000 x 5,000` setup.
 
 The workflow uses `concurrency` group `pixelproject-production`, so only one production deployment should run at a time.
 
