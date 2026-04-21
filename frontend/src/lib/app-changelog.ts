@@ -11,6 +11,42 @@ export type ChangelogEntry = {
 
 export const APP_CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.1.7",
+    date: "Apr 21, 2026",
+    sections: [
+      {
+        title: "New Features",
+        items: [
+          "Players can now open a personal area list and jump directly to their own claimed territories.",
+          "Normal Pixels are now tracked separately from Holders, with their own balance, limit and regeneration timer.",
+          "Painting can now submit tile-grouped batches, similar to Wplace-style paint requests.",
+        ],
+      },
+      {
+        title: "Improvements",
+        items: [
+          "Claim rendering now shows a light permission-colored shimmer with a thin outer outline around visible unpainted claim areas.",
+          "Claim tiles are cached per viewer, so owner, contributor and blocked colors match the current player.",
+          "Large rectangle claims use compact rectangle payloads and bulk backend inserts instead of sending every pixel back to the browser.",
+          "Paint and claim saves now refresh only the affected paint or claim tiles.",
+          "The build panel is easier to reopen, shows the active resource type and handles very large pending claims more calmly.",
+          "World tile cache warming now reuses the shared tile-warming service.",
+        ],
+      },
+      {
+        title: "Bug Fixes",
+        items: [
+          "Claim outlines no longer become thick one-pixel world barriers while zooming.",
+          "Painted artwork no longer gets blocked or foreign claim borders drawn through it.",
+          "Fresh accounts no longer see another player's claim colors as if they were their own permissions.",
+          "Claim areas should stay visible while zooming instead of disappearing with stale tile state.",
+          "Transparent paint correctly makes claim shimmer visible again and invalidates the right claim tiles.",
+          "Auth fallback states now avoid offering Google login while the auth service is unavailable.",
+        ],
+      },
+    ],
+  },
+  {
     version: "0.1.6",
     date: "Apr 20, 2026",
     sections: [

@@ -15,11 +15,22 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     )
     await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_key VARCHAR(64)"))
     await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_history JSONB"))
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS holders_unlimited BOOLEAN"))
     await connection.execute(
         text("ALTER TABLE users ADD COLUMN IF NOT EXISTS holders_last_updated_at TIMESTAMPTZ")
     )
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS claim_area_limit INTEGER"))
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS normal_pixels INTEGER"))
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS normal_pixel_limit INTEGER"))
+    await connection.execute(
+        text("ALTER TABLE users ADD COLUMN IF NOT EXISTS normal_pixels_last_updated_at TIMESTAMPTZ")
+    )
     await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS holders_placed_total INTEGER"))
     await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS claimed_pixels_count INTEGER"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN holders_unlimited SET DEFAULT TRUE"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN claim_area_limit SET DEFAULT 1"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN normal_pixels SET DEFAULT 64"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN normal_pixel_limit SET DEFAULT 64"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN avatar_url TYPE TEXT"))
     await connection.execute(
         text("UPDATE users SET public_id = nextval('users_public_id_seq') WHERE public_id IS NULL")
@@ -30,6 +41,7 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(
         text("UPDATE users SET avatar_history = '[]'::jsonb WHERE avatar_history IS NULL")
     )
+    await connection.execute(text("UPDATE users SET holders_unlimited = TRUE WHERE holders_unlimited IS NULL"))
     await connection.execute(
         text("UPDATE users SET avatar_url = NULL WHERE avatar_url LIKE 'https://lh3.googleusercontent.com/%'")
     )
@@ -38,6 +50,19 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     )
     await connection.execute(
         text("UPDATE users SET holders_last_updated_at = NOW() WHERE holders_last_updated_at IS NULL")
+    )
+    await connection.execute(
+        text("UPDATE users SET claim_area_limit = 1 WHERE claim_area_limit IS NULL OR claim_area_limit < 1")
+    )
+    await connection.execute(
+        text("UPDATE users SET normal_pixels = 64 WHERE normal_pixels IS NULL OR normal_pixels < 0")
+    )
+    await connection.execute(
+        text("UPDATE users SET normal_pixel_limit = 64 WHERE normal_pixel_limit IS NULL OR normal_pixel_limit < 0")
+    )
+    await connection.execute(text("UPDATE users SET normal_pixels = LEAST(normal_pixels, normal_pixel_limit)"))
+    await connection.execute(
+        text("UPDATE users SET normal_pixels_last_updated_at = NOW() WHERE normal_pixels_last_updated_at IS NULL")
     )
     await connection.execute(
         text("UPDATE users SET holders_placed_total = 0 WHERE holders_placed_total IS NULL")
@@ -51,7 +76,12 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(text("ALTER TABLE users ALTER COLUMN public_id SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN avatar_key SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN avatar_history SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN holders_unlimited SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN holders_last_updated_at SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN claim_area_limit SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN normal_pixels SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN normal_pixel_limit SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN normal_pixels_last_updated_at SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN holders_placed_total SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN claimed_pixels_count SET NOT NULL"))
     await connection.execute(

@@ -5,21 +5,26 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 
 import {
   claimWorldPixels,
+  fetchClaimOutlinePixels,
   fetchClaimArea,
   fetchAuthSession,
+  fetchMyClaimAreas,
   fetchVisibleWorldPixels,
   fetchWorldOverview,
   getClientApiBaseUrl,
   getWorldTileUrl,
   inviteAreaContributor,
   logoutAuthSession,
-  paintWorldPixel,
+  paintWorldPixels,
   updateClaimArea,
   updateDisplayName,
   uploadAvatar,
   type AuthUser,
   type AuthSessionStatus,
   type ClaimAreaSummary,
+  type ClaimAreaListItem,
+  type ClaimOutlineSegment,
+  type PaintTileInput,
   type WorldOverview,
   type WorldPixel,
 } from "@/lib/api";
@@ -47,6 +52,8 @@ type DragState = PanDragState;
 type BuildMode = "claim" | "paint";
 
 type ClaimTool = "brush" | "rectangle";
+
+type ActiveModal = "info" | "changelog" | "login" | "shop" | "avatar" | "areas";
 
 type PointerPosition = {
   x: number;
@@ -77,7 +84,6 @@ type WorldTile = {
   left: number;
   top: number;
   size: number;
-  revision: number;
 };
 
 type GridLine = {
@@ -93,6 +99,13 @@ type PixelCoordinate = {
 
 type PendingPaint = PixelCoordinate & {
   colorId: number;
+};
+
+type PendingClaimRectangle = {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
 };
 
 type ProfileMessage = {
@@ -173,6 +186,28 @@ type PerfDebugWindow = Window & {
   __pixelPerfClear?: () => void;
 };
 
+type PendingClaimSegment = {
+  key: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  isBulk: boolean;
+};
+
+type PendingPaintSegment = PendingClaimSegment & {
+  color: string;
+  isTransparent: boolean;
+};
+
+type ClaimOverlayStatus = "owner" | "contributor" | "blocked" | "starter";
+
+type ClaimOutlinePath = {
+  key: string;
+  status: ClaimOverlayStatus;
+  d: string;
+};
+
 const DEFAULT_ZOOM = 3;
 const DEFAULT_MIN_ZOOM = 0.05;
 const ABSOLUTE_MIN_ZOOM = 0.001;
@@ -189,6 +224,10 @@ const AUTH_REFRESH_INTERVAL_MS = 60000;
 const HOLDER_TICK_MS = 1000;
 const PIXEL_FETCH_DEBOUNCE_MS = 120;
 const PIXEL_FETCH_MARGIN = 2;
+const CLAIM_OUTLINE_FETCH_DEBOUNCE_MS = 40;
+const CLAIM_OUTLINE_FETCH_MARGIN = 2;
+const CLAIM_BATCH_PIXEL_LIMIT = 500_000;
+const BULK_PENDING_CLAIM_THRESHOLD = 20_000;
 const PERF_EVENT_NAME = "pixelproject:perf-event";
 const PERF_FRAME_GAP_THRESHOLD_MS = 42;
 const PERF_LOG_LIMIT = 500;
@@ -201,13 +240,20 @@ const BUILD_MODE_LABEL: Record<BuildMode, string> = {
 };
 const BUILD_MODE_HELP: Record<BuildMode, string> = {
   claim: "Claim only. Uses Holders and has no color palette.",
-  paint: "Paint only. Uses the palette and only works inside your claimed area.",
+  paint: "Paint only. Uses Normal Pixels and only works inside your claimed area.",
+};
+const CLAIM_OUTLINE_COLORS: Record<ClaimOverlayStatus, string> = {
+  owner: "rgba(118, 255, 228, 0.9)",
+  contributor: "rgba(255, 183, 95, 0.9)",
+  blocked: "rgba(255, 110, 110, 0.84)",
+  starter: "rgba(255, 232, 156, 0.9)",
 };
 
 const FALLBACK_AUTH_STATUS: AuthSessionStatus = {
   authenticated: false,
   google_oauth_configured: false,
   user: null,
+  request_failed: true,
 };
 
 let perfDebugEnabledCache: boolean | null = null;
@@ -305,11 +351,38 @@ function getWorldTileKey(tileX: number, tileY: number): string {
   return `${tileX}:${tileY}`;
 }
 
-function getPixelTileKey(pixel: PixelCoordinate): string {
-  return getWorldTileKey(
-    Math.floor(pixel.x / WORLD_TILE_SIZE),
-    Math.floor(pixel.y / WORLD_TILE_SIZE),
-  );
+function getPixelTileCoordinate(pixel: PixelCoordinate): { tileX: number; tileY: number } {
+  return {
+    tileX: Math.floor(pixel.x / WORLD_TILE_SIZE),
+    tileY: Math.floor(pixel.y / WORLD_TILE_SIZE),
+  };
+}
+
+function getTileLocalOffset(pixel: PixelCoordinate): number {
+  const { tileX, tileY } = getPixelTileCoordinate(pixel);
+  const localX = pixel.x - tileX * WORLD_TILE_SIZE;
+  const localY = pixel.y - tileY * WORLD_TILE_SIZE;
+  return localY * WORLD_TILE_SIZE + localX;
+}
+
+function buildPaintTilePayload(paints: PendingPaint[]): PaintTileInput[] {
+  const tiles = new Map<string, PaintTileInput>();
+
+  for (const paint of paints) {
+    const { tileX, tileY } = getPixelTileCoordinate(paint);
+    const tileKey = getWorldTileKey(tileX, tileY);
+    const existingTile = tiles.get(tileKey);
+    const tile = existingTile ?? {
+      x: tileX,
+      y: tileY,
+      pixels: {},
+    };
+
+    tile.pixels[String(getTileLocalOffset(paint))] = paint.colorId;
+    tiles.set(tileKey, tile);
+  }
+
+  return [...tiles.values()];
 }
 
 function screenPointToWorldPixel(screenX: number, screenY: number, camera: CameraState): PixelCoordinate {
@@ -319,7 +392,7 @@ function screenPointToWorldPixel(screenX: number, screenY: number, camera: Camer
   };
 }
 
-function buildPendingClaimMap(claims: PixelCoordinate[]): Set<string> {
+function buildPendingClaimPixelMap(claims: PixelCoordinate[]): Set<string> {
   return new Set(claims.map(getPixelKey));
 }
 
@@ -392,20 +465,268 @@ function getPixelLine(start: PixelCoordinate, end: PixelCoordinate): PixelCoordi
   return points;
 }
 
-function getRectanglePixels(start: PixelCoordinate, end: PixelCoordinate): PixelCoordinate[] {
-  const minX = Math.min(start.x, end.x);
-  const maxX = Math.max(start.x, end.x);
-  const minY = Math.min(start.y, end.y);
-  const maxY = Math.max(start.y, end.y);
-  const pixels: PixelCoordinate[] = [];
+function createPendingClaimRectangle(
+  start: PixelCoordinate,
+  end: PixelCoordinate,
+): PendingClaimRectangle {
+  return {
+    minX: Math.min(start.x, end.x),
+    maxX: Math.max(start.x, end.x),
+    minY: Math.min(start.y, end.y),
+    maxY: Math.max(start.y, end.y),
+  };
+}
 
-  for (let y = minY; y <= maxY; y += 1) {
-    for (let x = minX; x <= maxX; x += 1) {
-      pixels.push({ x, y });
+function getPendingClaimRectanglePixelCount(rectangle: PendingClaimRectangle): number {
+  return (rectangle.maxX - rectangle.minX + 1) * (rectangle.maxY - rectangle.minY + 1);
+}
+
+function getPendingClaimCount(
+  pendingClaimPixels: PixelCoordinate[],
+  pendingClaimRectangles: PendingClaimRectangle[],
+): number {
+  return pendingClaimPixels.length + pendingClaimRectangles.reduce(
+    (total, rectangle) => total + getPendingClaimRectanglePixelCount(rectangle),
+    0,
+  );
+}
+
+function isPixelInsidePendingClaimRectangle(
+  pixel: PixelCoordinate,
+  rectangle: PendingClaimRectangle,
+): boolean {
+  return (
+    pixel.x >= rectangle.minX &&
+    pixel.x <= rectangle.maxX &&
+    pixel.y >= rectangle.minY &&
+    pixel.y <= rectangle.maxY
+  );
+}
+
+function hasPendingClaimAtPixel(
+  pixel: PixelCoordinate,
+  pendingClaimPixelMap: Set<string>,
+  pendingClaimRectangles: PendingClaimRectangle[],
+): boolean {
+  if (pendingClaimPixelMap.has(getPixelKey(pixel))) {
+    return true;
+  }
+
+  return pendingClaimRectangles.some((rectangle) => isPixelInsidePendingClaimRectangle(pixel, rectangle));
+}
+
+function splitPendingClaimRectangleAtPixel(
+  rectangle: PendingClaimRectangle,
+  pixel: PixelCoordinate,
+): PendingClaimRectangle[] {
+  if (!isPixelInsidePendingClaimRectangle(pixel, rectangle)) {
+    return [rectangle];
+  }
+
+  const nextRectangles: PendingClaimRectangle[] = [];
+
+  if (pixel.y > rectangle.minY) {
+    nextRectangles.push({
+      minX: rectangle.minX,
+      maxX: rectangle.maxX,
+      minY: rectangle.minY,
+      maxY: pixel.y - 1,
+    });
+  }
+
+  if (pixel.y < rectangle.maxY) {
+    nextRectangles.push({
+      minX: rectangle.minX,
+      maxX: rectangle.maxX,
+      minY: pixel.y + 1,
+      maxY: rectangle.maxY,
+    });
+  }
+
+  if (pixel.x > rectangle.minX) {
+    nextRectangles.push({
+      minX: rectangle.minX,
+      maxX: pixel.x - 1,
+      minY: pixel.y,
+      maxY: pixel.y,
+    });
+  }
+
+  if (pixel.x < rectangle.maxX) {
+    nextRectangles.push({
+      minX: pixel.x + 1,
+      maxX: rectangle.maxX,
+      minY: pixel.y,
+      maxY: pixel.y,
+    });
+  }
+
+  return nextRectangles;
+}
+
+function buildPendingClaimSegments(
+  pendingClaimPixels: PixelCoordinate[],
+  pendingClaimRectangles: PendingClaimRectangle[],
+  camera: CameraState,
+): PendingClaimSegment[] {
+  const rows = new Map<number, number[]>();
+
+  for (const pixel of pendingClaimPixels) {
+    const row = rows.get(pixel.y);
+    if (row) {
+      row.push(pixel.x);
+    } else {
+      rows.set(pixel.y, [pixel.x]);
     }
   }
 
-  return pixels;
+  const segments: PendingClaimSegment[] = [];
+
+  for (const [y, xs] of rows) {
+    xs.sort((left, right) => left - right);
+    let runStart = xs[0];
+    let previousX = xs[0];
+
+    for (let index = 1; index <= xs.length; index += 1) {
+      const currentX = xs[index];
+      const continuesRun = currentX === previousX + 1;
+
+      if (continuesRun) {
+        previousX = currentX;
+        continue;
+      }
+
+      segments.push({
+        key: `pending-claim-${y}-${runStart}-${previousX}`,
+        left: camera.x + runStart * camera.zoom,
+        top: camera.y + y * camera.zoom,
+        width: (previousX - runStart + 1) * camera.zoom,
+        height: camera.zoom,
+        isBulk: false,
+      });
+
+      runStart = currentX;
+      previousX = currentX;
+    }
+  }
+
+  for (const rectangle of pendingClaimRectangles) {
+    segments.push({
+      key: `pending-claim-rectangle-${rectangle.minX}-${rectangle.minY}-${rectangle.maxX}-${rectangle.maxY}`,
+      left: camera.x + rectangle.minX * camera.zoom,
+      top: camera.y + rectangle.minY * camera.zoom,
+      width: (rectangle.maxX - rectangle.minX + 1) * camera.zoom,
+      height: (rectangle.maxY - rectangle.minY + 1) * camera.zoom,
+      isBulk: true,
+    });
+  }
+
+  return segments;
+}
+
+function buildPendingPaintSegments(
+  pendingPaints: PendingPaint[],
+  camera: CameraState,
+): PendingPaintSegment[] {
+  const rows = new Map<string, { y: number; colorId: number; xs: number[] }>();
+
+  for (const pixel of pendingPaints) {
+    const key = `${pixel.y}:${pixel.colorId}`;
+    const existing = rows.get(key);
+
+    if (existing) {
+      existing.xs.push(pixel.x);
+      continue;
+    }
+
+    rows.set(key, {
+      y: pixel.y,
+      colorId: pixel.colorId,
+      xs: [pixel.x],
+    });
+  }
+
+  const segments: PendingPaintSegment[] = [];
+
+  for (const row of rows.values()) {
+    row.xs.sort((left, right) => left - right);
+    let runStart = row.xs[0];
+    let previousX = row.xs[0];
+
+    for (let index = 1; index <= row.xs.length; index += 1) {
+      const currentX = row.xs[index];
+      const continuesRun = currentX === previousX + 1;
+
+      if (continuesRun) {
+        previousX = currentX;
+        continue;
+      }
+
+      segments.push({
+        key: `pending-paint-${row.y}-${row.colorId}-${runStart}-${previousX}`,
+        left: camera.x + runStart * camera.zoom,
+        top: camera.y + row.y * camera.zoom,
+        width: (previousX - runStart + 1) * camera.zoom,
+        height: camera.zoom,
+        isBulk: false,
+        color: PIXEL_PALETTE[row.colorId]?.hex ?? "#ffffff",
+        isTransparent: row.colorId === TRANSPARENT_COLOR_ID,
+      });
+
+      runStart = currentX;
+      previousX = currentX;
+    }
+  }
+
+  return segments;
+}
+
+function snapSvgLine(value: number): number {
+  return Math.round(value) + 0.5;
+}
+
+function buildClaimOutlinePaths(
+  outlineSegments: ClaimOutlineSegment[],
+  camera: CameraState,
+): ClaimOutlinePath[] {
+  const commandsByKey = new Map<string, { status: ClaimOverlayStatus; commands: string[] }>();
+
+  for (const segment of outlineSegments) {
+    const key = `${segment.orientation}:${segment.status}`;
+    const existing = commandsByKey.get(key) ?? {
+      status: segment.status,
+      commands: [],
+    };
+
+    if (segment.orientation === "horizontal") {
+      const y = snapSvgLine(camera.y + segment.line * camera.zoom);
+      const x1 = snapSvgLine(camera.x + segment.start * camera.zoom);
+      const x2 = snapSvgLine(camera.x + segment.end * camera.zoom);
+      existing.commands.push(`M${x1} ${y}H${x2}`);
+    } else {
+      const x = snapSvgLine(camera.x + segment.line * camera.zoom);
+      const y1 = snapSvgLine(camera.y + segment.start * camera.zoom);
+      const y2 = snapSvgLine(camera.y + segment.end * camera.zoom);
+      existing.commands.push(`M${x} ${y1}V${y2}`);
+    }
+
+    commandsByKey.set(key, existing);
+  }
+
+  const statusOrder: Record<ClaimOverlayStatus, number> = {
+    blocked: 0,
+    contributor: 1,
+    owner: 2,
+    starter: 3,
+  };
+
+  return [...commandsByKey.entries()]
+    .map(([key, value]) => ({
+      key,
+      status: value.status,
+      d: value.commands.join(""),
+    }))
+    .sort((left, right) => statusOrder[left.status] - statusOrder[right.status]);
 }
 
 function formatDateTime(value: string): string {
@@ -415,14 +736,27 @@ function formatDateTime(value: string): string {
   }).format(new Date(value));
 }
 
+function formatCount(value: number): string {
+  return new Intl.NumberFormat("en-GB").format(value);
+}
+
 function getProjectedHolderState(
   user: AuthUser | null,
   nowMs: number,
-): { displayedHolders: number; statusText: string } {
+): { displayedHolders: number; statusText: string; isUnlimited: boolean } {
   if (user === null) {
     return {
       displayedHolders: 0,
       statusText: "",
+      isUnlimited: false,
+    };
+  }
+
+  if (user.holders_unlimited) {
+    return {
+      displayedHolders: Number.POSITIVE_INFINITY,
+      statusText: `Unlimited Holders - ${user.claim_area_limit} area max`,
+      isUnlimited: true,
     };
   }
 
@@ -430,6 +764,7 @@ function getProjectedHolderState(
     return {
       displayedHolders: user.holders,
       statusText: "Holder storage full",
+      isUnlimited: false,
     };
   }
 
@@ -443,6 +778,7 @@ function getProjectedHolderState(
     return {
       displayedHolders,
       statusText: "Holder storage full",
+      isUnlimited: false,
     };
   }
 
@@ -452,6 +788,7 @@ function getProjectedHolderState(
   return {
     displayedHolders,
     statusText: `Next holder in ${Math.max(0, Math.ceil(remainingMs / 1000))}s`,
+    isUnlimited: false,
   };
 }
 
@@ -459,7 +796,9 @@ function getCurrentDisplayedHolders(user: AuthUser | null): number {
   return getProjectedHolderState(user, Date.now()).displayedHolders;
 }
 
-function useProjectedHolderState(user: AuthUser | null): { displayedHolders: number; statusText: string } {
+function useProjectedHolderState(
+  user: AuthUser | null,
+): { displayedHolders: number; statusText: string; isUnlimited: boolean } {
   const [projection, setProjection] = useState(() => getProjectedHolderState(user, Date.now()));
 
   useEffect(() => {
@@ -490,24 +829,124 @@ function useProjectedHolderState(user: AuthUser | null): { displayedHolders: num
   return projection;
 }
 
-function HolderTaskbarStatus({
+function getProjectedNormalPixelState(
+  user: AuthUser | null,
+  nowMs: number,
+): { displayedPixels: number; statusText: string } {
+  if (user === null) {
+    return {
+      displayedPixels: 0,
+      statusText: "",
+    };
+  }
+
+  if (user.normal_pixels >= user.normal_pixel_limit) {
+    return {
+      displayedPixels: user.normal_pixels,
+      statusText: "Pixel storage full",
+    };
+  }
+
+  const intervalMs = Math.max(1000, user.normal_pixel_regeneration_interval_seconds * 1000);
+  const lastUpdatedMs = new Date(user.normal_pixels_last_updated_at).getTime();
+  const elapsedMs = Math.max(0, nowMs - lastUpdatedMs);
+  const regenerated = Math.floor(elapsedMs / intervalMs);
+  const displayedPixels = Math.min(user.normal_pixel_limit, user.normal_pixels + regenerated);
+
+  if (displayedPixels >= user.normal_pixel_limit) {
+    return {
+      displayedPixels,
+      statusText: "Pixel storage full",
+    };
+  }
+
+  const remainderMs = elapsedMs % intervalMs;
+  const remainingMs = remainderMs === 0 ? intervalMs : intervalMs - remainderMs;
+
+  return {
+    displayedPixels,
+    statusText: `Next pixel in ${Math.max(0, Math.ceil(remainingMs / 1000))}s`,
+  };
+}
+
+function getCurrentDisplayedNormalPixels(user: AuthUser | null): number {
+  return getProjectedNormalPixelState(user, Date.now()).displayedPixels;
+}
+
+function useProjectedNormalPixelState(
+  user: AuthUser | null,
+): { displayedPixels: number; statusText: string } {
+  const [projection, setProjection] = useState(() => getProjectedNormalPixelState(user, Date.now()));
+
+  useEffect(() => {
+    const syncProjection = (): void => {
+      markPerfEvent("normal pixel tick", user ? `#${user.public_id}` : "anonymous");
+      const nextProjection = getProjectedNormalPixelState(user, Date.now());
+      setProjection((current) => (
+        current.displayedPixels === nextProjection.displayedPixels &&
+        current.statusText === nextProjection.statusText
+          ? current
+          : nextProjection
+      ));
+    };
+
+    syncProjection();
+
+    if (user === null) {
+      return;
+    }
+
+    const ticker = window.setInterval(syncProjection, HOLDER_TICK_MS);
+
+    return () => {
+      window.clearInterval(ticker);
+    };
+  }, [user]);
+
+  return projection;
+}
+
+function BuildTaskbarStatus({
+  activeBuildMode,
   pendingClaims,
+  pendingPaints,
   user,
 }: {
+  activeBuildMode: BuildMode;
   pendingClaims: number;
+  pendingPaints: number;
   user: AuthUser | null;
 }) {
-  const projection = useProjectedHolderState(user);
+  const holderProjection = useProjectedHolderState(user);
+  const normalPixelProjection = useProjectedNormalPixelState(user);
 
   if (user === null) {
     return <span className="build-taskbar-status">Login to build</span>;
   }
 
-  const remainingHolders = Math.max(0, projection.displayedHolders - pendingClaims);
+  if (activeBuildMode === "claim") {
+    if (holderProjection.isUnlimited) {
+      return (
+        <span className="build-taskbar-status">
+          Unlimited Holders - {user.claim_area_limit} area max
+        </span>
+      );
+    }
+
+    const remainingHolders = Math.max(0, holderProjection.displayedHolders - pendingClaims);
+
+    return (
+      <span className="build-taskbar-status">
+        {remainingHolders} / {user.holder_limit} Holders left
+      </span>
+    );
+  }
+
+  const remainingPixels = Math.max(0, normalPixelProjection.displayedPixels - pendingPaints);
 
   return (
     <span className="build-taskbar-status">
-      {remainingHolders} / {user.holder_limit} Holders left
+      {remainingPixels} / {user.normal_pixel_limit} Pixels left
     </span>
   );
 }
@@ -520,10 +959,11 @@ function HolderPanelSummary({
   user: AuthUser | null;
 }) {
   const projection = useProjectedHolderState(user);
+  const batchFillRatio = Math.min(1, pendingClaims / CLAIM_BATCH_PIXEL_LIMIT);
 
   if (user === null) {
     return (
-      <div className="pixel-holder-summary">
+      <div className="pixel-resource-summary">
         <span>Holder left</span>
         <strong>--</strong>
         <small>Login required for Holder balance</small>
@@ -531,34 +971,112 @@ function HolderPanelSummary({
     );
   }
 
+  if (projection.isUnlimited) {
+    return (
+      <div className="pixel-resource-summary">
+        <span>Holder left</span>
+        <strong>Unlimited</strong>
+        <small>
+          {pendingClaims} pending claim{pendingClaims === 1 ? "" : "s"} - {user.claim_area_limit} claim area
+          {user.claim_area_limit === 1 ? "" : "s"} active right now
+        </small>
+        <div className="claim-batch-progress">
+          <div className="claim-batch-progress-header">
+            <span>Batch size</span>
+            <strong>{formatCount(pendingClaims)} / {formatCount(CLAIM_BATCH_PIXEL_LIMIT)}</strong>
+          </div>
+          <div className="claim-batch-progress-bar" aria-hidden="true">
+            <span style={{ width: `${batchFillRatio * 100}%` }} />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const remainingHolders = Math.max(0, projection.displayedHolders - pendingClaims);
 
   return (
-    <div className="pixel-holder-summary">
+    <div className="pixel-resource-summary">
       <span>Holder left</span>
       <strong>{remainingHolders}</strong>
       <small>
         {pendingClaims} pending claim{pendingClaims === 1 ? "" : "s"} from{" "}
         {projection.displayedHolders} ready Holders
       </small>
+      <div className="claim-batch-progress">
+        <div className="claim-batch-progress-header">
+          <span>Batch size</span>
+          <strong>{formatCount(pendingClaims)} / {formatCount(CLAIM_BATCH_PIXEL_LIMIT)}</strong>
+        </div>
+        <div className="claim-batch-progress-bar" aria-hidden="true">
+          <span style={{ width: `${batchFillRatio * 100}%` }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NormalPixelPanelSummary({
+  pendingPaints,
+  user,
+}: {
+  pendingPaints: number;
+  user: AuthUser | null;
+}) {
+  const projection = useProjectedNormalPixelState(user);
+
+  if (user === null) {
+    return (
+      <div className="pixel-resource-summary">
+        <span>Pixels left</span>
+        <strong>--</strong>
+        <small>Login required for Normal Pixel balance</small>
+      </div>
+    );
+  }
+
+  const remainingPixels = Math.max(0, projection.displayedPixels - pendingPaints);
+
+  return (
+    <div className="pixel-resource-summary">
+      <span>Pixels left</span>
+      <strong>{remainingPixels}</strong>
+      <small>
+        {pendingPaints} pending pixel{pendingPaints === 1 ? "" : "s"} from{" "}
+        {projection.displayedPixels} ready Normal Pixels
+      </small>
     </div>
   );
 }
 
 function HolderAccountCount({ user }: { user: AuthUser }) {
-  const projection = useProjectedHolderState(user);
+  const holderProjection = useProjectedHolderState(user);
+  const normalPixelProjection = useProjectedNormalPixelState(user);
+  const holderLabel = holderProjection.isUnlimited
+    ? "Unlimited"
+    : `${holderProjection.displayedHolders} / ${user.holder_limit}`;
 
   return (
     <>
-      Holders: {projection.displayedHolders} / {user.holder_limit}
+      Holders: {holderLabel} - Pixels: {normalPixelProjection.displayedPixels} / {user.normal_pixel_limit}
     </>
   );
 }
 
-function HolderAccountStatus({ user }: { user: AuthUser }) {
-  const projection = useProjectedHolderState(user);
+function NormalPixelAccountCount({ user }: { user: AuthUser }) {
+  const projection = useProjectedNormalPixelState(user);
 
-  return <strong>{projection.statusText}</strong>;
+  return (
+    <strong>
+      {projection.displayedPixels} / {user.normal_pixel_limit}
+    </strong>
+  );
+}
+
+function NormalPixelAccountStatus({ user }: { user: AuthUser }) {
+  const projection = useProjectedNormalPixelState(user);
+
+  return <small>{projection.statusText}</small>;
 }
 
 function PerfDebugOverlay() {
@@ -813,8 +1331,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const pixelIndexRef = useRef<Map<string, WorldPixel>>(new Map());
   const activeWorldBoundsRef = useRef<ActiveWorldBounds | null>(null);
   const activeChunksRef = useRef<WorldOverview["chunks"]>([]);
-  const pendingClaimsRef = useRef<PixelCoordinate[]>([]);
-  const pendingClaimMapRef = useRef<Set<string>>(new Set());
+  const pendingClaimPixelsRef = useRef<PixelCoordinate[]>([]);
+  const pendingClaimPixelMapRef = useRef<Set<string>>(new Set());
+  const pendingClaimRectanglesRef = useRef<PendingClaimRectangle[]>([]);
   const pendingPaintsRef = useRef<PendingPaint[]>([]);
   const pendingPaintMapRef = useRef<Map<string, PendingPaint>>(new Map());
   const activeBuildModeRef = useRef<BuildMode>("claim");
@@ -829,7 +1348,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     zoom: DEFAULT_ZOOM,
   });
   const pointerRef = useRef<PointerPosition>({ x: 0, y: 0, inside: false });
-  const activeModalRef = useRef<"info" | "changelog" | "login" | "shop" | "avatar" | null>(null);
+  const activeModalRef = useRef<ActiveModal | null>(null);
   const namePromptShownRef = useRef(false);
   const [camera, setCamera] = useState<CameraState>({
     x: 0,
@@ -839,7 +1358,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [world, setWorld] = useState<WorldOverview>(initialWorld);
   const [showGrid, setShowGrid] = useState(true);
   const [darkMode, setDarkMode] = useState(true);
-  const [activeModal, setActiveModal] = useState<"info" | "changelog" | "login" | "shop" | "avatar" | null>(null);
+  const [activeModal, setActiveModal] = useState<ActiveModal | null>(null);
   const [authStatus, setAuthStatus] = useState<AuthSessionStatus>(FALLBACK_AUTH_STATUS);
   const [authLoading, setAuthLoading] = useState(true);
   const [authBusy, setAuthBusy] = useState(false);
@@ -855,12 +1374,15 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [rectangleAnchor, setRectangleAnchor] = useState<PixelCoordinate | null>(null);
   const [buildPanelOpen, setBuildPanelOpen] = useState(false);
   const [buildPanelPosition, setBuildPanelPosition] = useState<BuildPanelPosition | null>(null);
-  const [pendingClaims, setPendingClaims] = useState<PixelCoordinate[]>([]);
+  const [pendingClaimPixels, setPendingClaimPixels] = useState<PixelCoordinate[]>([]);
+  const [pendingClaimRectangles, setPendingClaimRectangles] = useState<PendingClaimRectangle[]>([]);
   const [pendingPaints, setPendingPaints] = useState<PendingPaint[]>([]);
   const [placementBusy, setPlacementBusy] = useState(false);
   const [placementMessage, setPlacementMessage] = useState<ProfileMessage | null>(null);
   const [visiblePixels, setVisiblePixels] = useState<WorldPixel[]>([]);
-  const [tileRevisions, setTileRevisions] = useState<Record<string, number>>({});
+  const [claimOutlineSegments, setClaimOutlineSegments] = useState<ClaimOutlineSegment[]>([]);
+  const [claimTileRevisions, setClaimTileRevisions] = useState<Record<string, number>>({});
+  const [paintTileRevisions, setPaintTileRevisions] = useState<Record<string, number>>({});
   const [viewportSize, setViewportSize] = useState<ViewportSize>({ width: 0, height: 0 });
   const [isCentered, setIsCentered] = useState(false);
   const [spaceToolActive, setSpaceToolActive] = useState(false);
@@ -870,6 +1392,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [areaDraftDescription, setAreaDraftDescription] = useState("");
   const [areaInvitePublicId, setAreaInvitePublicId] = useState("");
   const [areaMessage, setAreaMessage] = useState<ProfileMessage | null>(null);
+  const [ownedAreas, setOwnedAreas] = useState<ClaimAreaListItem[]>([]);
+  const [ownedAreasLoading, setOwnedAreasLoading] = useState(false);
+  const [ownedAreasMessage, setOwnedAreasMessage] = useState<ProfileMessage | null>(null);
   worldRenderCountRef.current += 1;
   const worldOutsidePatternId = `${outsidePatternIdBase}-outside-pattern`;
   const worldOutsideMaskId = `${outsidePatternIdBase}-outside-mask`;
@@ -884,6 +1409,25 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setAuthStatus(nextStatus);
     setAuthLoading(false);
     markPerfEvent("auth refresh done", nextStatus.authenticated ? "authenticated" : "guest");
+  }, []);
+
+  const refreshOwnedAreas = useCallback(async (): Promise<void> => {
+    setOwnedAreasLoading(true);
+    setOwnedAreasMessage(null);
+    const result = await fetchMyClaimAreas();
+
+    if (!result.ok) {
+      setOwnedAreas([]);
+      setOwnedAreasMessage({
+        tone: "error",
+        text: result.error ?? "Your claim areas could not be loaded.",
+      });
+      setOwnedAreasLoading(false);
+      return;
+    }
+
+    setOwnedAreas(result.areas);
+    setOwnedAreasLoading(false);
   }, []);
 
   useEffect(() => {
@@ -901,6 +1445,14 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   useEffect(() => {
     void refreshAuthStatus();
   }, [refreshAuthStatus]);
+
+  useEffect(() => {
+    if (activeModal !== "areas" || !authStatus.authenticated) {
+      return;
+    }
+
+    void refreshOwnedAreas();
+  }, [activeModal, authStatus.authenticated, refreshOwnedAreas]);
 
   useEffect(() => {
     let cancelled = false;
@@ -922,6 +1474,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   useEffect(() => {
     if (!authStatus.authenticated) {
+      setOwnedAreas([]);
       return;
     }
 
@@ -1141,6 +1694,33 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     world.chunk_size,
   ]);
 
+  const focusClaimArea = useCallback((area: ClaimAreaListItem): void => {
+    const targetWidth = Math.max(area.bounds.width, 12);
+    const targetHeight = Math.max(area.bounds.height, 12);
+    const viewportWidth = Math.max(viewportSize.width, 1);
+    const viewportHeight = Math.max(viewportSize.height, 1);
+    const fitAreaZoom = Math.min(
+      viewportWidth / (targetWidth * 1.35),
+      viewportHeight / (targetHeight * 1.35),
+    );
+    const nextZoom = clampZoom(
+      Math.min(MAX_ZOOM, Math.max(minZoom, Math.min(16, fitAreaZoom))),
+      minZoom,
+    );
+
+    setSelectedPixel({
+      x: Math.floor(area.bounds.center_x),
+      y: Math.floor(area.bounds.center_y),
+    });
+    setCamera(clampCamera({
+      zoom: nextZoom,
+      x: viewportWidth / 2 - area.bounds.center_x * nextZoom,
+      y: viewportHeight / 2 - area.bounds.center_y * nextZoom,
+    }));
+    setActiveModal(null);
+    setBuildPanelOpen(false);
+  }, [clampCamera, minZoom, viewportSize.height, viewportSize.width]);
+
   const handleNativeWheel = useCallback((event: WheelEvent): void => {
     event.preventDefault();
     markPerfEvent("wheel zoom");
@@ -1294,7 +1874,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     world.chunk_size,
   ]);
 
-  const gridVisible = showGrid && camera.zoom >= GRID_THRESHOLD;
+  const canShowGrid = camera.zoom >= GRID_THRESHOLD;
+  const gridVisible = showGrid && canShowGrid;
   const gridLines = useMemo(() => {
     if (!gridVisible || viewportSize.width === 0 || viewportSize.height === 0) {
       return {
@@ -1512,7 +2093,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           left: snapScreen(camera.x + tileOriginX * camera.zoom),
           top: snapScreen(camera.y + tileOriginY * camera.zoom),
           size: Math.ceil(WORLD_TILE_SIZE * camera.zoom),
-          revision: tileRevisions[key] ?? 0,
         });
       }
     }
@@ -1527,7 +2107,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     camera.x,
     camera.y,
     camera.zoom,
-    tileRevisions,
     viewportSize.height,
     viewportSize.width,
   ]);
@@ -1562,6 +2141,70 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     viewportSize.width,
   ]);
 
+  const claimOutlineFetchBounds = useMemo(() => {
+    if (!gridVisible || viewportSize.width === 0 || viewportSize.height === 0) {
+      return null;
+    }
+
+    return {
+      minX: Math.max(activeWorldBounds.minX, Math.floor(-camera.x / camera.zoom) - CLAIM_OUTLINE_FETCH_MARGIN),
+      maxX: Math.min(
+        activeWorldBounds.maxX - 1,
+        Math.ceil((viewportSize.width - camera.x) / camera.zoom) + CLAIM_OUTLINE_FETCH_MARGIN,
+      ),
+      minY: Math.max(activeWorldBounds.minY, Math.floor(-camera.y / camera.zoom) - CLAIM_OUTLINE_FETCH_MARGIN),
+      maxY: Math.min(
+        activeWorldBounds.maxY - 1,
+        Math.ceil((viewportSize.height - camera.y) / camera.zoom) + CLAIM_OUTLINE_FETCH_MARGIN,
+      ),
+    };
+  }, [
+    activeWorldBounds.maxX,
+    activeWorldBounds.maxY,
+    activeWorldBounds.minX,
+    activeWorldBounds.minY,
+    camera.x,
+    camera.y,
+    camera.zoom,
+    gridVisible,
+    viewportSize.height,
+    viewportSize.width,
+  ]);
+
+  const refreshVisiblePixelWindow = useCallback(async (): Promise<void> => {
+    if (pixelFetchBounds === null) {
+      return;
+    }
+
+    markPerfEvent("pixel fetch start");
+    const result = await fetchVisibleWorldPixels(
+      pixelFetchBounds.minX,
+      pixelFetchBounds.maxX,
+      pixelFetchBounds.minY,
+      pixelFetchBounds.maxY,
+    );
+
+    visiblePixelsRef.current = result.pixels;
+    pixelIndexRef.current = new Map(result.pixels.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
+    setVisiblePixels(result.pixels);
+    markPerfEvent("pixel fetch done", `${result.pixels.length} pixels`);
+  }, [pixelFetchBounds]);
+
+  const refreshClaimOutlineNow = useCallback(async (): Promise<void> => {
+    if (claimOutlineFetchBounds === null) {
+      setClaimOutlineSegments([]);
+      return;
+    }
+
+    const result = await fetchClaimOutlinePixels(
+      claimOutlineFetchBounds.minX,
+      claimOutlineFetchBounds.maxX,
+      claimOutlineFetchBounds.minY,
+      claimOutlineFetchBounds.maxY,
+    );
+    setClaimOutlineSegments(result.segments);
+  }, [claimOutlineFetchBounds]);
+
   useEffect(() => {
     if (pixelFetchBounds === null) {
       return;
@@ -1573,19 +2216,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       `${pixelFetchBounds.minX}:${pixelFetchBounds.minY} -> ${pixelFetchBounds.maxX}:${pixelFetchBounds.maxY}`,
     );
     const fetchTimeout = window.setTimeout(async () => {
-      markPerfEvent("pixel fetch start");
-      const result = await fetchVisibleWorldPixels(
-        pixelFetchBounds.minX,
-        pixelFetchBounds.maxX,
-        pixelFetchBounds.minY,
-        pixelFetchBounds.maxY,
-      );
-
       if (!cancelled) {
-        visiblePixelsRef.current = result.pixels;
-        pixelIndexRef.current = new Map(result.pixels.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
-        setVisiblePixels(result.pixels);
-        markPerfEvent("pixel fetch done", `${result.pixels.length} pixels`);
+        await refreshVisiblePixelWindow();
       }
     }, PIXEL_FETCH_DEBOUNCE_MS);
 
@@ -1593,24 +2225,65 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       cancelled = true;
       window.clearTimeout(fetchTimeout);
     };
-  }, [pixelFetchBounds]);
+  }, [pixelFetchBounds, refreshVisiblePixelWindow]);
+
+  useEffect(() => {
+    if (claimOutlineFetchBounds === null) {
+      setClaimOutlineSegments([]);
+      return;
+    }
+
+    let cancelled = false;
+    markPerfEvent(
+      "claim outline fetch scheduled",
+      `${claimOutlineFetchBounds.minX}:${claimOutlineFetchBounds.minY} -> ${claimOutlineFetchBounds.maxX}:${claimOutlineFetchBounds.maxY}`,
+    );
+    const fetchTimeout = window.setTimeout(async () => {
+      markPerfEvent("claim outline fetch start");
+      const result = await fetchClaimOutlinePixels(
+        claimOutlineFetchBounds.minX,
+        claimOutlineFetchBounds.maxX,
+        claimOutlineFetchBounds.minY,
+        claimOutlineFetchBounds.maxY,
+      );
+
+      if (!cancelled) {
+        setClaimOutlineSegments(result.segments);
+        markPerfEvent("claim outline fetch done", `${result.segments.length} segments`);
+      }
+    }, CLAIM_OUTLINE_FETCH_DEBOUNCE_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(fetchTimeout);
+    };
+  }, [claimOutlineFetchBounds]);
 
   const pixelIndex = useMemo(() => {
     return new Map(visiblePixels.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
   }, [visiblePixels]);
-  const pendingClaimMap = useMemo(() => buildPendingClaimMap(pendingClaims), [pendingClaims]);
+  const pendingClaimPixelMap = useMemo(
+    () => buildPendingClaimPixelMap(pendingClaimPixels),
+    [pendingClaimPixels],
+  );
   const pendingPaintMap = useMemo(() => buildPendingPaintMap(pendingPaints), [pendingPaints]);
   visiblePixelsRef.current = visiblePixels;
   pixelIndexRef.current = pixelIndex;
-  pendingClaimsRef.current = pendingClaims;
-  pendingClaimMapRef.current = pendingClaimMap;
+  pendingClaimPixelsRef.current = pendingClaimPixels;
+  pendingClaimPixelMapRef.current = pendingClaimPixelMap;
+  pendingClaimRectanglesRef.current = pendingClaimRectangles;
   pendingPaintsRef.current = pendingPaints;
   pendingPaintMapRef.current = pendingPaintMap;
 
-  const syncPendingClaims = useCallback((nextClaims: PixelCoordinate[]): void => {
-    pendingClaimsRef.current = nextClaims;
-    pendingClaimMapRef.current = buildPendingClaimMap(nextClaims);
-    setPendingClaims(nextClaims);
+  const syncPendingClaims = useCallback((
+    nextPixels: PixelCoordinate[],
+    nextRectangles: PendingClaimRectangle[],
+  ): void => {
+    pendingClaimPixelsRef.current = nextPixels;
+    pendingClaimPixelMapRef.current = buildPendingClaimPixelMap(nextPixels);
+    pendingClaimRectanglesRef.current = nextRectangles;
+    setPendingClaimPixels(nextPixels);
+    setPendingClaimRectangles(nextRectangles);
   }, []);
 
   const syncPendingPaints = useCallback((nextPaints: PendingPaint[]): void => {
@@ -1619,12 +2292,25 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setPendingPaints(nextPaints);
   }, []);
 
-  const markWorldTileDirty = useCallback((pixel: PixelCoordinate): void => {
-    const tileKey = getPixelTileKey(pixel);
-    setTileRevisions((current) => ({
-      ...current,
-      [tileKey]: (current[tileKey] ?? 0) + 1,
-    }));
+  const markWorldTilesDirty = useCallback((
+    layer: "claims" | "paint",
+    tiles: Array<{ tile_x: number; tile_y: number }>,
+  ): void => {
+    if (tiles.length === 0) {
+      return;
+    }
+
+    const setRevisions = layer === "claims" ? setClaimTileRevisions : setPaintTileRevisions;
+    setRevisions((current) => {
+      const next = { ...current };
+
+      for (const tile of tiles) {
+        const tileKey = getWorldTileKey(tile.tile_x, tile.tile_y);
+        next[tileKey] = (next[tileKey] ?? 0) + 1;
+      }
+
+      return next;
+    });
   }, []);
 
   const getPlacementState = useCallback((pixel: PixelCoordinate | null): PlacementState => {
@@ -1642,7 +2328,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     const bounds = activeWorldBoundsRef.current;
     const activeChunks = activeChunksRef.current;
     const pixelMap = pixelIndexRef.current;
-    const pendingClaimsMap = pendingClaimMapRef.current;
+    const pendingClaimPixelMap = pendingClaimPixelMapRef.current;
+    const pendingClaimRectangles = pendingClaimRectanglesRef.current;
     const pendingPaintsMap = pendingPaintMapRef.current;
     const zoom = zoomRef.current;
     const nextUser = currentUserRef.current;
@@ -1671,7 +2358,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         pixel.y < chunk.origin_y + chunk.height
       ));
     const pixelRecord = pixelMap.get(pixelKey) ?? null;
-    const isPendingClaim = pendingClaimsMap.has(pixelKey);
+    const isPendingClaim = hasPendingClaimAtPixel(pixel, pendingClaimPixelMap, pendingClaimRectangles);
     const pendingPaint = pendingPaintsMap.get(pixelKey) ?? null;
 
     if (
@@ -1693,6 +2380,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       pixelRecord !== null &&
       !pixelRecord.is_starter &&
       (
+        pixelRecord.viewer_relation === "owner" ||
+        pixelRecord.viewer_relation === "contributor" ||
         pixelRecord.owner_user_id === nextUser.id ||
         (pixelRecord.area_id !== null && knownPaintableAreaIdsRef.current.has(pixelRecord.area_id))
       ) &&
@@ -1700,15 +2389,19 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     let canClaim = false;
 
     if (pixelRecord === null && !isPendingClaim) {
-      const neighborKeys = [
-        `${pixel.x - 1}:${pixel.y}`,
-        `${pixel.x + 1}:${pixel.y}`,
-        `${pixel.x}:${pixel.y - 1}`,
-        `${pixel.x}:${pixel.y + 1}`,
+      const neighborPixels = [
+        { x: pixel.x - 1, y: pixel.y },
+        { x: pixel.x + 1, y: pixel.y },
+        { x: pixel.x, y: pixel.y - 1 },
+        { x: pixel.x, y: pixel.y + 1 },
       ];
-      canClaim = neighborKeys.some((key) => {
-        const neighbor = pixelMap.get(key);
-        return pendingClaimsMap.has(key) || (neighbor ? neighbor.is_starter || neighbor.owner_user_id !== null : false);
+      canClaim = neighborPixels.some((neighborPixel) => {
+        const neighborKey = getPixelKey(neighborPixel);
+        const neighbor = pixelMap.get(neighborKey);
+        return (
+          hasPendingClaimAtPixel(neighborPixel, pendingClaimPixelMap, pendingClaimRectangles) ||
+          (neighbor ? neighbor.is_starter || neighbor.owner_user_id !== null : false)
+        );
       });
     }
 
@@ -1784,28 +2477,19 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }, [selectedPixelRecord?.area_id]);
 
   const renderedPendingClaims = useMemo(() => {
-    return pendingClaims.map((pixel) => ({
-      key: `pending-claim-${getPixelKey(pixel)}`,
-      left: camera.x + pixel.x * camera.zoom,
-      top: camera.y + pixel.y * camera.zoom,
-      width: camera.zoom,
-      height: camera.zoom,
-      isSelected: selectedPixel?.x === pixel.x && selectedPixel?.y === pixel.y,
-    }));
-  }, [camera.x, camera.y, camera.zoom, pendingClaims, selectedPixel]);
+    return buildPendingClaimSegments(pendingClaimPixels, pendingClaimRectangles, camera);
+  }, [camera, pendingClaimPixels, pendingClaimRectangles]);
+
+  const claimOutlinePaths = useMemo(() => {
+    return buildClaimOutlinePaths(
+      claimOutlineSegments,
+      camera,
+    );
+  }, [camera, claimOutlineSegments]);
 
   const renderedPendingPaints = useMemo(() => {
-    return pendingPaints.map((pixel) => ({
-      key: `pending-paint-${getPixelKey(pixel)}`,
-      left: camera.x + pixel.x * camera.zoom,
-      top: camera.y + pixel.y * camera.zoom,
-      width: camera.zoom,
-      height: camera.zoom,
-      color: PIXEL_PALETTE[pixel.colorId]?.hex ?? "#ffffff",
-      isTransparent: pixel.colorId === TRANSPARENT_COLOR_ID,
-      isSelected: selectedPixel?.x === pixel.x && selectedPixel?.y === pixel.y,
-    }));
-  }, [camera.x, camera.y, camera.zoom, pendingPaints, selectedPixel]);
+    return buildPendingPaintSegments(pendingPaints, camera);
+  }, [camera, pendingPaints]);
 
   const selectedPixelOverlay = useMemo(() => {
     if (selectedPixel === null) {
@@ -1821,10 +2505,25 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   const canClaimSelectedPixel = selectedPlacementState.canClaim;
   const canPaintSelectedPixel = selectedPlacementState.canPaint;
-  const activePendingCount = activeBuildMode === "claim" ? pendingClaims.length : pendingPaints.length;
+  const pendingClaimCount = useMemo(
+    () => getPendingClaimCount(pendingClaimPixels, pendingClaimRectangles),
+    [pendingClaimPixels, pendingClaimRectangles],
+  );
+  const bulkPendingClaimOverlay = pendingClaimCount >= BULK_PENDING_CLAIM_THRESHOLD;
+  const activePendingCount = activeBuildMode === "claim" ? pendingClaimCount : pendingPaints.length;
   const activePendingLabel = activeBuildMode === "claim"
-    ? `${pendingClaims.length} pending claim${pendingClaims.length === 1 ? "" : "s"}`
+    ? `${pendingClaimCount} pending claim${pendingClaimCount === 1 ? "" : "s"}`
     : `${pendingPaints.length} pending pixel${pendingPaints.length === 1 ? "" : "s"}`;
+  const selectedPendingClaim = useMemo(() => {
+    if (selectedPixel === null) {
+      return false;
+    }
+
+    return hasPendingClaimAtPixel(selectedPixel, pendingClaimPixelMap, pendingClaimRectangles);
+  }, [pendingClaimPixelMap, pendingClaimRectangles, selectedPixel]);
+  const canRemoveSelectedPending = activeBuildMode === "claim"
+    ? selectedPendingClaim
+    : selectedPendingPaint !== null;
 
   const placementLabel = useMemo(() => {
     if (placementBusy) {
@@ -1876,7 +2575,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     if (selectedPixel === null) {
       return activeBuildMode === "claim"
         ? "Select a connected empty cell or press Space over the canvas to stage Holder claims."
-        : "Select one of your claimed cells or press Space over your territory to stage paint changes.";
+        : "Select one of your claimed cells or press Space over your territory to stage Normal Pixel changes.";
     }
 
     if (activeBuildMode === "claim") {
@@ -1899,12 +2598,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     if (selectedPendingPaint) {
       return selectedPendingPaint.colorId === TRANSPARENT_COLOR_ID
-        ? "This erase is staged locally. Keep brushing with Space, then submit all pending changes together."
-        : "This color is staged locally. Keep painting with Space, then submit all pending pixels together.";
+        ? "This erase is staged locally. Keep brushing with Space, then submit all pending changes together. Each saved change spends 1 Normal Pixel."
+        : "This color is staged locally. Keep painting with Space, then submit all pending pixels together. Each saved change spends 1 Normal Pixel.";
     }
 
     if (canPaintSelectedPixel) {
-      return "Normal mode paints owned or contributed territory. Choose a palette color or Transparent, press Space over cells, then submit.";
+      return "Normal mode paints owned or contributed territory. Choose a palette color or Transparent, press Space over cells, then submit. Saved pixels use your Normal Pixel balance.";
     }
 
     if (selectedPixelRecord === null || selectedPlacementState.isPendingClaim) {
@@ -2007,14 +2706,20 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         return false;
       }
 
-      const nextClaims = pendingClaimsRef.current;
-      const claimKey = getPixelKey(targetPixel);
-
-      if (pendingClaimMapRef.current.has(claimKey)) {
+      if (hasPendingClaimAtPixel(
+        targetPixel,
+        pendingClaimPixelMapRef.current,
+        pendingClaimRectanglesRef.current,
+      )) {
         return false;
       }
 
-      if (nextClaims.length >= getCurrentDisplayedHolders(nextUser)) {
+      const pendingClaimCount = getPendingClaimCount(
+        pendingClaimPixelsRef.current,
+        pendingClaimRectanglesRef.current,
+      );
+
+      if (pendingClaimCount >= getCurrentDisplayedHolders(nextUser)) {
         if (!options?.quiet) {
           setPlacementMessage({
             tone: "error",
@@ -2024,11 +2729,21 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         return false;
       }
 
-      const updatedClaims = [...nextClaims, targetPixel];
-      syncPendingClaims(updatedClaims);
+      if (pendingClaimCount >= CLAIM_BATCH_PIXEL_LIMIT) {
+        if (!options?.quiet) {
+          setPlacementMessage({
+            tone: "error",
+            text: `Claim batches are limited to ${formatCount(CLAIM_BATCH_PIXEL_LIMIT)} pixels.`,
+          });
+        }
+        return false;
+      }
+
+      const updatedClaimPixels = [...pendingClaimPixelsRef.current, targetPixel];
+      syncPendingClaims(updatedClaimPixels, pendingClaimRectanglesRef.current);
       setPlacementMessage({
         tone: "info",
-        text: `${updatedClaims.length} Holder claim${updatedClaims.length === 1 ? "" : "s"} staged locally.`,
+        text: `${pendingClaimCount + 1} Holder claim${pendingClaimCount + 1 === 1 ? "" : "s"} staged locally.`,
       });
       return true;
     }
@@ -2050,6 +2765,16 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     };
     const remainingPaints = pendingPaintsRef.current.filter((paint) => getPixelKey(paint) !== paintKey);
     const updatedPaints = [...remainingPaints, nextPaint];
+    if (updatedPaints.length > getCurrentDisplayedNormalPixels(nextUser)) {
+      if (!options?.quiet) {
+        setPlacementMessage({
+          tone: "error",
+          text: "Not enough Normal Pixels for more pending paint.",
+        });
+      }
+      return false;
+    }
+
     syncPendingPaints(updatedPaints);
     setPlacementMessage({
       tone: "info",
@@ -2068,45 +2793,85 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return false;
     }
 
-    const rectanglePixels = getRectanglePixels(start, end);
-    const pendingMap = pendingClaimMapRef.current;
-    const newPixels = rectanglePixels.filter((pixel) => !pendingMap.has(getPixelKey(pixel)));
-
-    if (newPixels.length === 0) {
-      setPlacementMessage({ tone: "info", text: "This rectangle is already staged." });
-      return false;
-    }
+    const rectangle = createPendingClaimRectangle(start, end);
+    const pixelMap = pixelIndexRef.current;
+    const bounds = activeWorldBoundsRef.current;
+    const activeChunks = activeChunksRef.current;
+    const pendingClaimPixels = pendingClaimPixelsRef.current;
+    const pendingClaimPixelMap = pendingClaimPixelMapRef.current;
+    const pendingClaimRectangles = pendingClaimRectanglesRef.current;
+    const currentPendingClaimCount = getPendingClaimCount(pendingClaimPixels, pendingClaimRectangles);
 
     const displayedHolders = getCurrentDisplayedHolders(nextUser);
-    if (pendingClaimsRef.current.length + newPixels.length > displayedHolders) {
-      setPlacementMessage({
-        tone: "error",
-        text: "Not enough Holders for this rectangle.",
-      });
+    let touchesClaimRoute = false;
+
+    if (bounds === null) {
+      setPlacementMessage({ tone: "error", text: "The active world is not ready yet." });
       return false;
     }
 
-    let touchesClaimRoute = false;
+    let newPixelCount = 0;
+    let overlapsPendingClaim = false;
 
-    for (const pixel of newPixels) {
-      const state = getPlacementState(pixel);
+    for (let y = rectangle.minY; y <= rectangle.maxY; y += 1) {
+      for (let x = rectangle.minX; x <= rectangle.maxX; x += 1) {
+        const pixel = { x, y };
+        const isInsideWorld = activeChunks.length === 0
+          ? pixel.x >= bounds.minX &&
+            pixel.x < bounds.maxX &&
+            pixel.y >= bounds.minY &&
+            pixel.y < bounds.maxY
+          : activeChunks.some((chunk) => (
+            pixel.x >= chunk.origin_x &&
+            pixel.x < chunk.origin_x + chunk.width &&
+            pixel.y >= chunk.origin_y &&
+            pixel.y < chunk.origin_y + chunk.height
+          ));
 
-      if (!state.isInsideWorld) {
-        setPlacementMessage({ tone: "error", text: "The rectangle leaves the active world." });
-        return false;
+        if (!isInsideWorld) {
+          setPlacementMessage({ tone: "error", text: "The rectangle leaves the active world." });
+          return false;
+        }
+
+        const pixelKey = getPixelKey(pixel);
+        if (pixelMap.has(pixelKey)) {
+          setPlacementMessage({
+            tone: "error",
+            text: "The rectangle includes already claimed territory.",
+          });
+          return false;
+        }
+
+        if (hasPendingClaimAtPixel(pixel, pendingClaimPixelMap, pendingClaimRectangles)) {
+          overlapsPendingClaim = true;
+          continue;
+        }
+
+        newPixelCount += 1;
+
+        if (!touchesClaimRoute) {
+          const neighborPixels = [
+            { x: pixel.x - 1, y: pixel.y },
+            { x: pixel.x + 1, y: pixel.y },
+            { x: pixel.x, y: pixel.y - 1 },
+            { x: pixel.x, y: pixel.y + 1 },
+          ];
+
+          touchesClaimRoute = neighborPixels.some((neighborPixel) => {
+            const neighborKey = getPixelKey(neighborPixel);
+            const neighbor = pixelMap.get(neighborKey);
+            return (
+              hasPendingClaimAtPixel(neighborPixel, pendingClaimPixelMap, pendingClaimRectangles) ||
+              (neighbor ? neighbor.is_starter || neighbor.owner_user_id !== null : false)
+            );
+          });
+        }
       }
+    }
 
-      if (state.pixelRecord !== null) {
-        setPlacementMessage({
-          tone: "error",
-          text: "The rectangle includes already claimed territory.",
-        });
-        return false;
-      }
-
-      if (state.canClaim) {
-        touchesClaimRoute = true;
-      }
+    if (newPixelCount === 0) {
+      setPlacementMessage({ tone: "info", text: "This rectangle is already staged." });
+      return false;
     }
 
     if (!touchesClaimRoute) {
@@ -2117,14 +2882,45 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return false;
     }
 
-    const updatedClaims = [...pendingClaimsRef.current, ...newPixels];
-    syncPendingClaims(updatedClaims);
+    if (currentPendingClaimCount + newPixelCount > displayedHolders) {
+      setPlacementMessage({
+        tone: "error",
+        text: "Not enough Holders for the new part of this rectangle.",
+      });
+      return false;
+    }
+
+    if (currentPendingClaimCount + newPixelCount > CLAIM_BATCH_PIXEL_LIMIT) {
+      setPlacementMessage({
+        tone: "error",
+        text: `This rectangle would exceed the ${formatCount(CLAIM_BATCH_PIXEL_LIMIT)} pixel batch limit.`,
+      });
+      return false;
+    }
+
+    if (!overlapsPendingClaim) {
+      syncPendingClaims(pendingClaimPixels, [...pendingClaimRectangles, rectangle]);
+    } else {
+      const newPixels: PixelCoordinate[] = [];
+
+      for (let y = rectangle.minY; y <= rectangle.maxY; y += 1) {
+        for (let x = rectangle.minX; x <= rectangle.maxX; x += 1) {
+          const pixel = { x, y };
+          if (!hasPendingClaimAtPixel(pixel, pendingClaimPixelMap, pendingClaimRectangles)) {
+            newPixels.push(pixel);
+          }
+        }
+      }
+
+      syncPendingClaims([...pendingClaimPixels, ...newPixels], pendingClaimRectangles);
+    }
+
     setPlacementMessage({
       tone: "info",
-      text: `${newPixels.length} rectangle claim${newPixels.length === 1 ? "" : "s"} staged locally.`,
+      text: `${newPixelCount} rectangle claim${newPixelCount === 1 ? "" : "s"} staged locally.`,
     });
     return true;
-  }, [getPlacementState, syncPendingClaims]);
+  }, [syncPendingClaims]);
 
   const stageSpaceStroke = useCallback((targetPixel: PixelCoordinate): void => {
     let stroke = spaceStrokeRef.current;
@@ -2409,41 +3205,60 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     event.target.value = "";
   }
 
-  const applySavedPixel = useCallback((nextPixel: WorldPixel, nextUser: AuthUser): void => {
-    const previousPixel = visiblePixelsRef.current.find(
-      (pixel) => pixel.id === nextPixel.id || (pixel.x === nextPixel.x && pixel.y === nextPixel.y),
-    );
-    const nextPixels = visiblePixelsRef.current.filter(
-      (pixel) => pixel.id !== nextPixel.id && !(pixel.x === nextPixel.x && pixel.y === nextPixel.y),
-    );
-    nextPixels.push(nextPixel);
+  const applySavedPaints = useCallback((savedPaints: PendingPaint[], nextUser: AuthUser): void => {
+    const nextPixels = [...visiblePixelsRef.current];
+    const pixelIndex = new Map(nextPixels.map((pixel, index) => [getPixelKey(pixel), index]));
+    const now = new Date().toISOString();
+    let selectedAreaPaintDelta = 0;
+
+    for (const paint of savedPaints) {
+      const pixelKey = getPixelKey(paint);
+      const pixelIndexValue = pixelIndex.get(pixelKey);
+
+      if (pixelIndexValue === undefined) {
+        continue;
+      }
+
+      const previousPixel = nextPixels[pixelIndexValue];
+      const nextColorId = paint.colorId === TRANSPARENT_COLOR_ID ? null : paint.colorId;
+
+      if (previousPixel.color_id === nextColorId) {
+        continue;
+      }
+
+      nextPixels[pixelIndexValue] = {
+        ...previousPixel,
+        color_id: nextColorId,
+        updated_at: now,
+      };
+
+      if (selectedArea !== null && previousPixel.area_id === selectedArea.id) {
+        selectedAreaPaintDelta += Number(nextColorId !== null) - Number(previousPixel.color_id !== null);
+      }
+    }
+
     visiblePixelsRef.current = nextPixels;
-    pixelIndexRef.current = new Map(nextPixels.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
+    pixelIndexRef.current = new Map(nextPixels.map((pixel) => [getPixelKey(pixel), pixel]));
     setVisiblePixels(nextPixels);
     currentUserRef.current = nextUser;
     setAuthStatus((current) => ({
       ...current,
       user: nextUser,
     }));
-    markWorldTileDirty(nextPixel);
-    setSelectedPixel({ x: nextPixel.x, y: nextPixel.y });
-    setSelectedArea((currentArea) => {
-      if (currentArea === null || nextPixel.area_id !== currentArea.id) {
-        return currentArea;
-      }
 
-      const delta = Number(nextPixel.color_id !== null) - Number(previousPixel?.color_id !== null);
+    if (selectedAreaPaintDelta !== 0) {
+      setSelectedArea((currentArea) => {
+        if (currentArea === null) {
+          return currentArea;
+        }
 
-      if (delta === 0) {
-        return currentArea;
-      }
-
-      return {
-        ...currentArea,
-        painted_pixels_count: Math.max(0, currentArea.painted_pixels_count + delta),
-      };
-    });
-  }, [markWorldTileDirty]);
+        return {
+          ...currentArea,
+          painted_pixels_count: Math.max(0, currentArea.painted_pixels_count + selectedAreaPaintDelta),
+        };
+      });
+    }
+  }, [selectedArea]);
 
   async function handlePlacementAction(): Promise<void> {
     if (currentUser === null || placementBusy || activePendingCount === 0) {
@@ -2454,17 +3269,21 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setPlacementMessage(null);
 
     if (activeBuildMode === "claim") {
-      const claimsToSubmit = [...pendingClaimsRef.current];
-      const failedIndex = await submitPendingClaims(claimsToSubmit);
+      const pendingClaimCountToSubmit = getPendingClaimCount(
+        pendingClaimPixelsRef.current,
+        pendingClaimRectanglesRef.current,
+      );
+      const failedIndex = await submitPendingClaims(
+        pendingClaimPixelsRef.current,
+        pendingClaimRectanglesRef.current,
+      );
 
       if (failedIndex === -1) {
-        syncPendingClaims([]);
+        syncPendingClaims([], []);
         setPlacementMessage({
           tone: "success",
-          text: `${claimsToSubmit.length} Holder claim${claimsToSubmit.length === 1 ? "" : "s"} saved.`,
+          text: `${pendingClaimCountToSubmit} Holder claim${pendingClaimCountToSubmit === 1 ? "" : "s"} saved.`,
         });
-      } else {
-        syncPendingClaims(claimsToSubmit.slice(failedIndex));
       }
 
       setPlacementBusy(false);
@@ -2487,10 +3306,21 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setPlacementBusy(false);
   }
 
-  async function submitPendingClaims(claimsToSubmit: PixelCoordinate[]): Promise<number> {
-    const result = await claimWorldPixels(claimsToSubmit);
+  async function submitPendingClaims(
+    claimPixelsToSubmit: PixelCoordinate[],
+    claimRectanglesToSubmit: PendingClaimRectangle[],
+  ): Promise<number> {
+    const result = await claimWorldPixels({
+      pixels: claimPixelsToSubmit,
+      rectangles: claimRectanglesToSubmit.map((rectangle) => ({
+        minX: rectangle.minX,
+        maxX: rectangle.maxX,
+        minY: rectangle.minY,
+        maxY: rectangle.maxY,
+      })),
+    });
 
-    if (!result.ok || result.user === null || result.area === null || result.pixels.length === 0) {
+    if (!result.ok || result.user === null || result.area === null) {
       setPlacementMessage({
         tone: "error",
         text: result.error ?? "Claim submission failed. Pending claims stayed local.",
@@ -2498,9 +3328,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return 0;
     }
 
-    for (const pixel of result.pixels) {
-      applySavedPixel(pixel, result.user);
-    }
+    setAuthStatus((current) => ({
+      ...current,
+      user: result.user,
+    }));
+    markWorldTilesDirty("claims", result.claim_tiles);
+    await refreshVisiblePixelWindow();
+    await refreshClaimOutlineNow();
 
     setSelectedArea(result.area);
     setAreaDraftName(result.area.name);
@@ -2511,20 +3345,24 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }
 
   async function submitPendingPaints(paintsToSubmit: PendingPaint[]): Promise<number> {
-    for (let index = 0; index < paintsToSubmit.length; index += 1) {
-      const paint = paintsToSubmit[index];
-      const result = await paintWorldPixel(paint.x, paint.y, paint.colorId);
+    const result = await paintWorldPixels(buildPaintTilePayload(paintsToSubmit));
 
-      if (!result.ok || result.pixel === null || result.user === null) {
-        setPlacementMessage({
-          tone: "error",
-          text: result.error ?? "Pixel submission failed. Remaining pixels stayed pending.",
-        });
-        return index;
-      }
-
-      applySavedPixel(result.pixel, result.user);
+    if (!result.ok || result.user === null) {
+      setPlacementMessage({
+        tone: "error",
+        text: result.error ?? "Pixel submission failed. Pending pixels stayed local.",
+      });
+      return 0;
     }
+
+    setAuthStatus((current) => ({
+      ...current,
+      user: result.user,
+    }));
+    markWorldTilesDirty("paint", result.paint_tiles);
+    markWorldTilesDirty("claims", result.claim_tiles);
+    applySavedPaints(paintsToSubmit, result.user);
+    await refreshClaimOutlineNow();
 
     return -1;
   }
@@ -2625,7 +3463,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   function handleClearActivePending(): void {
     if (activeBuildMode === "claim") {
-      syncPendingClaims([]);
+      syncPendingClaims([], []);
       setRectangleAnchor(null);
     } else {
       syncPendingPaints([]);
@@ -2634,6 +3472,64 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setPlacementMessage({
       tone: "info",
       text: `${BUILD_MODE_LABEL[activeBuildMode]} pending changes cleared.`,
+    });
+  }
+
+  function handleRemoveSelectedPending(): void {
+    if (selectedPixel === null) {
+      return;
+    }
+
+    if (activeBuildMode === "claim") {
+      const selectedKey = getPixelKey(selectedPixel);
+
+      if (pendingClaimPixelMapRef.current.has(selectedKey)) {
+        const nextPendingClaimPixels = pendingClaimPixelsRef.current.filter(
+          (pixel) => getPixelKey(pixel) !== selectedKey,
+        );
+        syncPendingClaims(nextPendingClaimPixels, pendingClaimRectanglesRef.current);
+        setPlacementMessage({
+          tone: "info",
+          text: "Selected staged Holder claim removed.",
+        });
+        return;
+      }
+
+      const nextPendingClaimRectangles: PendingClaimRectangle[] = [];
+      let removed = false;
+
+      for (const rectangle of pendingClaimRectanglesRef.current) {
+        if (!removed && isPixelInsidePendingClaimRectangle(selectedPixel, rectangle)) {
+          nextPendingClaimRectangles.push(...splitPendingClaimRectangleAtPixel(rectangle, selectedPixel));
+          removed = true;
+          continue;
+        }
+
+        nextPendingClaimRectangles.push(rectangle);
+      }
+
+      if (!removed) {
+        return;
+      }
+
+      syncPendingClaims(pendingClaimPixelsRef.current, nextPendingClaimRectangles);
+      setPlacementMessage({
+        tone: "info",
+        text: "Selected staged Holder claim removed.",
+      });
+      return;
+    }
+
+    if (selectedPendingPaint === null) {
+      return;
+    }
+
+    const selectedKey = getPixelKey(selectedPixel);
+    const nextPendingPaints = pendingPaintsRef.current.filter((paint) => getPixelKey(paint) !== selectedKey);
+    syncPendingPaints(nextPendingPaints);
+    setPlacementMessage({
+      tone: "info",
+      text: "Selected pending pixel removed.",
     });
   }
 
@@ -2743,14 +3639,23 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
       <div className="world-hud world-hud-right">
         {currentUser ? (
-          <button
-            aria-label="Open shop"
-            className="hud-icon-button hud-shop-button"
-            onClick={() => setActiveModal("shop")}
-            type="button"
-          >
-            <ShopIcon />
-          </button>
+          <>
+            <button
+              className="hud-login-button hud-areas-button"
+              onClick={() => setActiveModal("areas")}
+              type="button"
+            >
+              Areas
+            </button>
+            <button
+              aria-label="Open shop"
+              className="hud-icon-button hud-shop-button"
+              onClick={() => setActiveModal("shop")}
+              type="button"
+            >
+              <ShopIcon />
+            </button>
+          </>
         ) : null}
         <button className="hud-login-button" onClick={() => setActiveModal("login")} type="button">
           {accountButtonLabel}
@@ -2868,14 +3773,17 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       </div>
 
       <div className="world-hud world-hud-bottom">
-        <button
-          aria-label="Toggle grid"
-          className={modalButtonClass(showGrid)}
-          onClick={() => setShowGrid((current) => !current)}
-          type="button"
-        >
-          Grid
-        </button>
+        {canShowGrid ? (
+          <button
+            aria-label="Toggle grid"
+            aria-pressed={gridVisible}
+            className={modalButtonClass(gridVisible)}
+            onClick={() => setShowGrid((current) => !current)}
+            type="button"
+          >
+            Grid
+          </button>
+        ) : null}
         <button
           aria-label="Toggle dark mode"
           className={modalButtonClass(darkMode)}
@@ -2895,7 +3803,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           >
             <span>{BUILD_MODE_LABEL.claim}</span>
             <small>Claim only</small>
-            {pendingClaims.length > 0 ? <strong>{pendingClaims.length}</strong> : null}
+            {pendingClaimCount > 0 ? <strong>{pendingClaimCount}</strong> : null}
           </button>
           <button
             className={`build-tool-button ${activeBuildMode === "paint" ? "is-active" : ""}`}
@@ -2906,7 +3814,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
             <small>Palette</small>
             {pendingPaints.length > 0 ? <strong>{pendingPaints.length}</strong> : null}
           </button>
-          <HolderTaskbarStatus pendingClaims={pendingClaims.length} user={currentUser} />
+          <BuildTaskbarStatus
+            activeBuildMode={activeBuildMode}
+            pendingClaims={pendingClaimCount}
+            pendingPaints={pendingPaints.length}
+            user={currentUser}
+          />
         </div>
       </div>
 
@@ -2933,17 +3846,21 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               <div className="pixel-placement-header-actions">
                 <span className="pixel-placement-owner">{selectedCellLabel}</span>
                 <button
-                  aria-label="Close build panel"
+                  aria-label="Minimize build panel"
                   className="pixel-panel-close"
                   onClick={handleCloseBuildPanel}
                   onPointerDown={(event) => event.stopPropagation()}
                   type="button"
                 >
-                  X
+                  -
                 </button>
               </div>
             </div>
-            <HolderPanelSummary pendingClaims={pendingClaims.length} user={currentUser} />
+            {activeBuildMode === "claim" ? (
+              <HolderPanelSummary pendingClaims={pendingClaimCount} user={currentUser} />
+            ) : (
+              <NormalPixelPanelSummary pendingPaints={pendingPaints.length} user={currentUser} />
+            )}
             {activeBuildMode === "claim" ? (
               <div className="claim-tool-row" aria-label="Holder claim tools">
                 <button
@@ -2987,14 +3904,24 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
             <div className="pixel-placement-footer">
               <div className="pixel-pending-row">
                 <span>{activePendingLabel}</span>
-                <button
-                  className="pixel-clear-button"
-                  disabled={placementBusy || activePendingCount === 0}
-                  onClick={handleClearActivePending}
-                  type="button"
-                >
-                  Clear
-                </button>
+                <div className="pixel-pending-actions">
+                  <button
+                    className="pixel-clear-button"
+                    disabled={placementBusy || !canRemoveSelectedPending}
+                    onClick={handleRemoveSelectedPending}
+                    type="button"
+                  >
+                    Remove selected
+                  </button>
+                  <button
+                    className="pixel-clear-button"
+                    disabled={placementBusy || activePendingCount === 0}
+                    onClick={handleClearActivePending}
+                    type="button"
+                  >
+                    Clear
+                  </button>
+                </div>
               </div>
               <p className="pixel-placement-help">{placementHelpText}</p>
               {placementMessage ? (
@@ -3011,6 +3938,18 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
             </div>
           </div>
         </div>
+      ) : null}
+
+      {!buildPanelOpen ? (
+        <button
+          aria-label="Open build panel"
+          className="build-panel-launcher"
+          onClick={() => setBuildPanelOpen(true)}
+          type="button"
+        >
+          <span>{BUILD_MODE_LABEL[activeBuildMode]}</span>
+          <strong>{activePendingCount > 0 ? `${activePendingCount} pending` : "Open panel"}</strong>
+        </button>
       ) : null}
 
       <div
@@ -3130,22 +4069,50 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           />
         </svg>
         <div className="world-claim-layer" aria-hidden="true">
-          {renderedWorldTiles.map((tile) => (
-            <span
-              className="world-tile"
-              key={`claim-${tile.key}`}
-              style={{
-                left: `${tile.left}px`,
-                top: `${tile.top}px`,
-                width: `${tile.size}px`,
-                height: `${tile.size}px`,
-                backgroundImage: `url("${getWorldTileUrl("claims", tile.tileX, tile.tileY, tile.revision)}")`,
-              }}
-            />
-          ))}
+          <div className="world-claim-tile-layer">
+            {renderedWorldTiles.map((tile) => (
+              <span
+                className="world-tile"
+                key={`claim-${tile.key}`}
+                style={{
+                  left: `${tile.left}px`,
+                  top: `${tile.top}px`,
+                  width: `${tile.size}px`,
+                  height: `${tile.size}px`,
+                  backgroundImage: `url("${getWorldTileUrl(
+                    "claims",
+                    tile.tileX,
+                    tile.tileY,
+                    claimTileRevisions[tile.key] ?? 0,
+                    currentUser ? String(currentUser.public_id) : "guest",
+                  )}")`,
+                }}
+              />
+            ))}
+          </div>
+          {claimOutlinePaths.length > 0 ? (
+            <svg
+              aria-hidden="true"
+              className="world-claim-outline-layer"
+              height={viewportSize.height}
+              shapeRendering="crispEdges"
+              width={viewportSize.width}
+            >
+              {claimOutlinePaths.map((path) => (
+                <path
+                  d={path.d}
+                  fill="none"
+                  key={path.key}
+                  stroke={CLAIM_OUTLINE_COLORS[path.status]}
+                  strokeWidth="1"
+                  vectorEffect="non-scaling-stroke"
+                />
+              ))}
+            </svg>
+          ) : null}
           {renderedPendingClaims.map((pixel) => (
             <span
-              className={`world-pending-claim ${pixel.isSelected ? "is-selected" : ""}`}
+              className={`world-pending-claim ${bulkPendingClaimOverlay || pixel.isBulk ? "is-bulk" : ""}`}
               key={pixel.key}
               style={{
                 left: `${pixel.left}px`,
@@ -3166,13 +4133,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                 top: `${tile.top}px`,
                 width: `${tile.size}px`,
                 height: `${tile.size}px`,
-                backgroundImage: `url("${getWorldTileUrl("paint", tile.tileX, tile.tileY, tile.revision)}")`,
+                backgroundImage: `url("${getWorldTileUrl("paint", tile.tileX, tile.tileY, paintTileRevisions[tile.key] ?? 0)}")`,
               }}
             />
           ))}
           {renderedPendingPaints.map((pixel) => (
             <span
-              className={`world-pending-paint ${pixel.isTransparent ? "is-transparent" : ""} ${pixel.isSelected ? "is-selected" : ""}`}
+              className={`world-pending-paint ${pixel.isTransparent ? "is-transparent" : ""}`}
               key={pixel.key}
               style={{
                 left: `${pixel.left}px`,
@@ -3338,6 +4305,79 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         </div>
       ) : null}
 
+      {activeModal === "areas" ? (
+        <div className="modal-backdrop" onClick={() => setActiveModal(null)} role="presentation">
+          <section
+            aria-labelledby="areas-title"
+            className="modal-window login-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div>
+                <p className="modal-eyebrow">Claims</p>
+                <h2 id="areas-title">My areas</h2>
+              </div>
+              <button className="modal-close" onClick={() => setActiveModal(null)} type="button">
+                Close
+              </button>
+            </div>
+            <div className="modal-scroll-area">
+              <div className="modal-card owned-area-card">
+                <div className="owned-area-toolbar">
+                  <span>{ownedAreasLoading ? "Loading..." : `${ownedAreas.length} area${ownedAreas.length === 1 ? "" : "s"}`}</span>
+                  <button
+                    className="pixel-clear-button"
+                    disabled={ownedAreasLoading}
+                    onClick={() => void refreshOwnedAreas()}
+                    type="button"
+                  >
+                    Refresh
+                  </button>
+                </div>
+                {ownedAreasMessage ? (
+                  <p className={`account-feedback is-${ownedAreasMessage.tone}`}>{ownedAreasMessage.text}</p>
+                ) : null}
+                {!ownedAreasLoading && ownedAreas.length === 0 ? (
+                  <p className="account-helper">No owned claim areas found.</p>
+                ) : null}
+                <div className="owned-area-list">
+                  {ownedAreas.map((area) => {
+                    const paintedRatio = area.claimed_pixels_count === 0
+                      ? 0
+                      : Math.round((area.painted_pixels_count / area.claimed_pixels_count) * 100);
+
+                    return (
+                      <article className="owned-area-item" key={area.id}>
+                        <div className="owned-area-main">
+                          <strong>{area.name}</strong>
+                          <span>
+                            {formatCount(area.claimed_pixels_count)} claims - {paintedRatio}% painted
+                          </span>
+                          <small>
+                            {area.bounds.min_x}:{area.bounds.min_y} to {area.bounds.max_x}:{area.bounds.max_y}
+                          </small>
+                        </div>
+                        <div className="owned-area-meta">
+                          <small>{area.bounds.width} x {area.bounds.height}</small>
+                          <small>{formatDateTime(area.last_activity_at)}</small>
+                        </div>
+                        <button
+                          className="google-button owned-area-jump"
+                          onClick={() => focusClaimArea(area)}
+                          type="button"
+                        >
+                          Jump
+                        </button>
+                      </article>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
       {activeModal === "login" ? (
         <div className="modal-backdrop" onClick={() => setActiveModal(null)} role="presentation">
           <section
@@ -3413,9 +4453,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                       <small>{currentUser.claimed_pixels_count} active claimed pixels</small>
                     </article>
                     <article className="account-stat-card">
-                      <span className="account-stat-label">Regeneration</span>
-                      <HolderAccountStatus user={currentUser} />
-                      <small>Projected locally from backend timestamps</small>
+                      <span className="account-stat-label">Normal Pixels</span>
+                      <NormalPixelAccountCount user={currentUser} />
+                      <NormalPixelAccountStatus user={currentUser} />
                     </article>
                     <article className="account-stat-card">
                       <span className="account-stat-label">Last Login</span>
@@ -3482,13 +4522,20 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                   </p>
                   <button
                     className="google-button"
-                    disabled={authLoading || authBusy || !authStatus.google_oauth_configured}
+                    disabled={
+                      authLoading ||
+                      authBusy ||
+                      authStatus.request_failed === true ||
+                      !authStatus.google_oauth_configured
+                    }
                     onClick={handleGoogleLogin}
                     type="button"
                   >
                     {authLoading
                       ? "Checking auth..."
-                      : authStatus.google_oauth_configured
+                      : authStatus.request_failed === true
+                        ? "Auth service unavailable"
+                        : authStatus.google_oauth_configured
                         ? "Continue with Google"
                         : "Google OAuth not configured"}
                   </button>

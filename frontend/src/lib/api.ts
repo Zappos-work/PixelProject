@@ -82,10 +82,17 @@ export type AuthUser = {
   role: string;
   is_banned: boolean;
   holders: number;
+  holders_unlimited: boolean;
   holder_limit: number;
   holder_regeneration_interval_seconds: number;
   holders_last_updated_at: string;
   next_holder_regeneration_at: string | null;
+  claim_area_limit: number;
+  normal_pixels: number;
+  normal_pixel_limit: number;
+  normal_pixel_regeneration_interval_seconds: number;
+  normal_pixels_last_updated_at: string;
+  next_normal_pixel_regeneration_at: string | null;
   created_at: string;
   last_login_at: string;
   needs_display_name_setup: boolean;
@@ -102,6 +109,7 @@ export type AuthSessionStatus = {
   authenticated: boolean;
   google_oauth_configured: boolean;
   user: AuthUser | null;
+  request_failed?: boolean;
 };
 
 export type WorldPixel = {
@@ -116,6 +124,7 @@ export type WorldPixel = {
   owner_display_name: string | null;
   area_id: string | null;
   is_starter: boolean;
+  viewer_relation: "owner" | "contributor" | "blocked" | "starter" | "unclaimed" | null;
   created_at: string;
   updated_at: string;
 };
@@ -129,7 +138,29 @@ export type WorldPixelWindow = {
   pixels: WorldPixel[];
 };
 
+export type ClaimOutlineSegment = {
+  orientation: "horizontal" | "vertical";
+  line: number;
+  start: number;
+  end: number;
+  status: "owner" | "contributor" | "blocked" | "starter";
+};
+
+export type ClaimOutlineWindow = {
+  min_x: number;
+  max_x: number;
+  min_y: number;
+  max_y: number;
+  truncated: boolean;
+  segments: ClaimOutlineSegment[];
+};
+
 export type WorldTileLayer = "claims" | "paint";
+
+const WORLD_TILE_STYLE_VERSION: Record<WorldTileLayer, string> = {
+  claims: "access-v3",
+  paint: "v2",
+};
 
 const apiBaseUrl =
   process.env.API_SERVER_URL ??
@@ -189,6 +220,7 @@ const fallbackAuthSession: AuthSessionStatus = {
   authenticated: false,
   google_oauth_configured: false,
   user: null,
+  request_failed: true,
 };
 
 const fallbackWorldPixels: WorldPixelWindow = {
@@ -198,6 +230,15 @@ const fallbackWorldPixels: WorldPixelWindow = {
   max_y: 0,
   truncated: false,
   pixels: [],
+};
+
+const fallbackClaimOutline: ClaimOutlineWindow = {
+  min_x: 0,
+  max_x: 0,
+  min_y: 0,
+  max_y: 0,
+  truncated: false,
+  segments: [],
 };
 
 export type UpdateDisplayNameResult = {
@@ -237,6 +278,22 @@ export type PixelPaintResult = {
   error: string | null;
 };
 
+export type PaintTileInput = {
+  x: number;
+  y: number;
+  pixels: Record<string, number>;
+};
+
+export type PixelBatchPaintResult = {
+  ok: boolean;
+  user: AuthUser | null;
+  painted_count: number;
+  paint_tiles: WorldTileCoordinate[];
+  claim_tiles: WorldTileCoordinate[];
+  status: number | null;
+  error: string | null;
+};
+
 export type AreaOwnerSummary = {
   id: string;
   public_id: number;
@@ -265,11 +322,57 @@ export type ClaimAreaSummary = {
   last_activity_at: string;
 };
 
+export type ClaimAreaBounds = {
+  min_x: number;
+  max_x: number;
+  min_y: number;
+  max_y: number;
+  width: number;
+  height: number;
+  center_x: number;
+  center_y: number;
+};
+
+export type ClaimAreaListItem = {
+  id: string;
+  name: string;
+  description: string;
+  claimed_pixels_count: number;
+  painted_pixels_count: number;
+  contributor_count: number;
+  bounds: ClaimAreaBounds;
+  created_at: string;
+  updated_at: string;
+  last_activity_at: string;
+};
+
+export type ClaimAreaListResult = {
+  ok: boolean;
+  areas: ClaimAreaListItem[];
+  status: number | null;
+  error: string | null;
+};
+
+export type ClaimRectangleInput = {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+};
+
+export type WorldTileCoordinate = {
+  tile_x: number;
+  tile_y: number;
+};
+
 export type PixelBatchClaimResult = {
   ok: boolean;
   pixels: WorldPixel[];
   user: AuthUser | null;
   area: ClaimAreaSummary | null;
+  claimed_count: number;
+  returned_pixel_count: number;
+  claim_tiles: WorldTileCoordinate[];
   status: number | null;
   error: string | null;
 };
@@ -343,8 +446,17 @@ export function getWorldTileUrl(
   tileX: number,
   tileY: number,
   revision = 0,
+  viewerKey?: string,
 ): string {
-  const params = new URLSearchParams({ v: String(revision) });
+  const params = new URLSearchParams({
+    v: String(revision),
+    s: WORLD_TILE_STYLE_VERSION[layer],
+  });
+
+  if (viewerKey) {
+    params.set("u", viewerKey);
+  }
+
   return `${clientApiBaseUrl}/world/tiles/${layer}/${tileX}/${tileY}.png?${params.toString()}`;
 }
 
@@ -497,6 +609,7 @@ export async function fetchVisibleWorldPixels(
     });
     const response = await fetch(`${clientApiBaseUrl}/world/pixels?${params.toString()}`, {
       cache: "no-store",
+      credentials: "include",
     });
 
     if (!response.ok) {
@@ -506,6 +619,34 @@ export async function fetchVisibleWorldPixels(
     return (await response.json()) as WorldPixelWindow;
   } catch {
     return fallbackWorldPixels;
+  }
+}
+
+export async function fetchClaimOutlinePixels(
+  minX: number,
+  maxX: number,
+  minY: number,
+  maxY: number,
+): Promise<ClaimOutlineWindow> {
+  try {
+    const params = new URLSearchParams({
+      min_x: String(minX),
+      max_x: String(maxX),
+      min_y: String(minY),
+      max_y: String(maxY),
+    });
+    const response = await fetch(`${clientApiBaseUrl}/world/claims/outline?${params.toString()}`, {
+      cache: "no-store",
+      credentials: "include",
+    });
+
+    if (!response.ok) {
+      throw new Error(`Request failed with status ${response.status}`);
+    }
+
+    return (await response.json()) as ClaimOutlineWindow;
+  } catch {
+    return fallbackClaimOutline;
   }
 }
 
@@ -549,7 +690,10 @@ export async function claimWorldPixel(x: number, y: number): Promise<PixelClaimR
   }
 }
 
-export async function claimWorldPixels(pixels: Array<{ x: number; y: number }>): Promise<PixelBatchClaimResult> {
+export async function claimWorldPixels(input: {
+  pixels: Array<{ x: number; y: number }>;
+  rectangles?: ClaimRectangleInput[];
+}): Promise<PixelBatchClaimResult> {
   try {
     const response = await fetch(`${clientApiBaseUrl}/world/claims/batch`, {
       method: "POST",
@@ -557,7 +701,15 @@ export async function claimWorldPixels(pixels: Array<{ x: number; y: number }>):
         "Content-Type": "application/json",
       },
       credentials: "include",
-      body: JSON.stringify({ pixels }),
+      body: JSON.stringify({
+        pixels: input.pixels,
+        rectangles: (input.rectangles ?? []).map((rectangle) => ({
+          min_x: rectangle.minX,
+          max_x: rectangle.maxX,
+          min_y: rectangle.minY,
+          max_y: rectangle.maxY,
+        })),
+      }),
     });
 
     if (!response.ok) {
@@ -566,6 +718,9 @@ export async function claimWorldPixels(pixels: Array<{ x: number; y: number }>):
         pixels: [],
         user: null,
         area: null,
+        claimed_count: 0,
+        returned_pixel_count: 0,
+        claim_tiles: [],
         status: response.status,
         error: await readApiError(response, "Batch claim failed."),
       };
@@ -575,12 +730,18 @@ export async function claimWorldPixels(pixels: Array<{ x: number; y: number }>):
       pixels: WorldPixel[];
       user: AuthUser;
       area: ClaimAreaSummary;
+      claimed_count: number;
+      returned_pixel_count: number;
+      claim_tiles: WorldTileCoordinate[];
     };
     return {
       ok: true,
       pixels: payload.pixels,
       user: payload.user,
       area: payload.area,
+      claimed_count: payload.claimed_count,
+      returned_pixel_count: payload.returned_pixel_count,
+      claim_tiles: payload.claim_tiles,
       status: response.status,
       error: null,
     };
@@ -590,6 +751,9 @@ export async function claimWorldPixels(pixels: Array<{ x: number; y: number }>):
       pixels: [],
       user: null,
       area: null,
+      claimed_count: 0,
+      returned_pixel_count: 0,
+      claim_tiles: [],
       status: null,
       error: "Batch claim failed.",
     };
@@ -644,6 +808,60 @@ export async function paintWorldPixel(
   }
 }
 
+export async function paintWorldPixels(tiles: PaintTileInput[]): Promise<PixelBatchPaintResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/world/paint`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      credentials: "include",
+      body: JSON.stringify({
+        season: 0,
+        tiles,
+      }),
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        user: null,
+        painted_count: 0,
+        paint_tiles: [],
+        claim_tiles: [],
+        status: response.status,
+        error: await readApiError(response, "Pixel painting failed."),
+      };
+    }
+
+    const payload = (await response.json()) as {
+      user: AuthUser;
+      painted_count: number;
+      paint_tiles: WorldTileCoordinate[];
+      claim_tiles: WorldTileCoordinate[];
+    };
+    return {
+      ok: true,
+      user: payload.user,
+      painted_count: payload.painted_count,
+      paint_tiles: payload.paint_tiles,
+      claim_tiles: payload.claim_tiles,
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      user: null,
+      painted_count: 0,
+      paint_tiles: [],
+      claim_tiles: [],
+      status: null,
+      error: "Pixel painting failed.",
+    };
+  }
+}
+
 export async function fetchClaimArea(areaId: string): Promise<ClaimAreaResult> {
   try {
     const response = await fetch(`${clientApiBaseUrl}/world/areas/${areaId}`, {
@@ -672,6 +890,39 @@ export async function fetchClaimArea(areaId: string): Promise<ClaimAreaResult> {
       area: null,
       status: null,
       error: "Area request failed.",
+    };
+  }
+}
+
+export async function fetchMyClaimAreas(): Promise<ClaimAreaListResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/world/areas/mine`, {
+      cache: "no-store",
+      credentials: "include",
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        areas: [],
+        status: response.status,
+        error: await readApiError(response, "Area list request failed."),
+      };
+    }
+
+    const payload = (await response.json()) as { areas: ClaimAreaListItem[] };
+    return {
+      ok: true,
+      areas: payload.areas,
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      areas: [],
+      status: null,
+      error: "Area list request failed.",
     };
   }
 }

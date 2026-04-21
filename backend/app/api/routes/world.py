@@ -1,17 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
 
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.modules.auth.service import resolve_authenticated_user
+from app.modules.auth.service import peek_authenticated_user, resolve_authenticated_user
 from app.schemas.world import (
     AreaContributorInviteRequest,
+    ClaimAreaListResponse,
+    ClaimOutlineWindow,
     ClaimAreaSummary,
     ClaimAreaUpdateRequest,
     PixelBatchClaimRequest,
     PixelBatchClaimResponse,
+    PixelBatchPaintRequest,
+    PixelBatchPaintResponse,
     PixelClaimRequest,
     PixelClaimResponse,
     PixelColor,
@@ -28,8 +31,11 @@ from app.services.pixels import (
     claim_world_pixels,
     ensure_world_tile_png,
     get_claim_area_details,
+    get_claim_outline_pixels,
     get_visible_world_pixels,
     invite_area_contributor,
+    list_owned_claim_areas,
+    paint_world_pixels,
     paint_world_pixel,
     update_claim_area_metadata,
 )
@@ -50,35 +56,68 @@ async def world_palette() -> list[PixelColor]:
 
 @router.get("/pixels", response_model=WorldPixelWindow)
 async def world_pixels(
+    request: Request,
     min_x: int = Query(...),
     max_x: int = Query(...),
     min_y: int = Query(...),
     max_y: int = Query(...),
     session: AsyncSession = Depends(get_db),
 ) -> WorldPixelWindow:
-    return await get_visible_world_pixels(session, min_x, max_x, min_y, max_y)
+    settings = get_settings()
+    viewer = await peek_authenticated_user(request, session, settings)
+    return await get_visible_world_pixels(session, min_x, max_x, min_y, max_y, viewer)
+
+
+@router.get("/claims/outline", response_model=ClaimOutlineWindow)
+async def claim_outline(
+    request: Request,
+    min_x: int = Query(...),
+    max_x: int = Query(...),
+    min_y: int = Query(...),
+    max_y: int = Query(...),
+    session: AsyncSession = Depends(get_db),
+) -> ClaimOutlineWindow:
+    settings = get_settings()
+    viewer = await peek_authenticated_user(request, session, settings)
+    return await get_claim_outline_pixels(session, min_x, max_x, min_y, max_y, viewer)
 
 
 @router.get("/tiles/{layer}/{tile_x}/{tile_y}.png")
 async def world_tile(
+    request: Request,
     layer: str,
     tile_x: int,
     tile_y: int,
     session: AsyncSession = Depends(get_db),
-) -> FileResponse:
+) -> Response:
+    settings = get_settings()
+    viewer = await peek_authenticated_user(request, session, settings) if layer == "claims" else None
+
     try:
-        tile_path = await ensure_world_tile_png(session, layer, tile_x, tile_y)
+        tile_path = await ensure_world_tile_png(session, layer, tile_x, tile_y, viewer)
+        try:
+            tile_bytes = tile_path.read_bytes()
+        except FileNotFoundError:
+            tile_path = await ensure_world_tile_png(session, layer, tile_x, tile_y, viewer)
+            tile_bytes = tile_path.read_bytes()
     except WorldTileError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=503, detail="World tile refresh is still in progress. Please retry.") from error
 
-    return FileResponse(
-        tile_path,
-        media_type="image/png",
-        headers={
-            "Cache-Control": "public, max-age=5, must-revalidate",
-            "X-PixelProject-Tile": f"{layer}/{tile_x}/{tile_y}",
-        },
-    )
+    headers = {
+        "Cache-Control": (
+            "private, max-age=5, must-revalidate"
+            if layer == "claims"
+            else "public, max-age=5, must-revalidate"
+        ),
+        "X-PixelProject-Tile": f"{layer}/{tile_x}/{tile_y}",
+    }
+
+    if layer == "claims":
+        headers["Vary"] = "Cookie"
+
+    return Response(content=tile_bytes, media_type="image/png", headers=headers)
 
 
 @router.post("/claims", response_model=PixelClaimResponse)
@@ -117,6 +156,10 @@ async def claim_pixels(
             user,
             [(pixel.x, pixel.y) for pixel in payload.pixels],
             settings,
+            rectangles=[
+                (rectangle.min_x, rectangle.max_x, rectangle.min_y, rectangle.max_y)
+                for rectangle in payload.rectangles
+            ],
         )
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
@@ -138,6 +181,43 @@ async def paint_pixel(
         return await paint_world_pixel(session, user, payload.x, payload.y, payload.color_id, settings)
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+
+@router.post("/paint", response_model=PixelBatchPaintResponse)
+async def paint_pixels(
+    payload: PixelBatchPaintRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> PixelBatchPaintResponse:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, session, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    try:
+        return await paint_world_pixels(
+            session,
+            user,
+            [(tile.x, tile.y, tile.pixels) for tile in payload.tiles],
+            settings,
+        )
+    except PixelPlacementError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+
+@router.get("/areas/mine", response_model=ClaimAreaListResponse)
+async def my_areas(
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> ClaimAreaListResponse:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, session, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    return await list_owned_claim_areas(session, user)
 
 
 @router.get("/areas/{area_id}", response_model=ClaimAreaSummary)

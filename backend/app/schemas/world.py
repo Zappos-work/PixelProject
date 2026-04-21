@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.schemas.auth import AuthUserSummary
 
@@ -76,6 +76,7 @@ class WorldPixelSummary(BaseModel):
     owner_display_name: str | None
     area_id: UUID | None
     is_starter: bool
+    viewer_relation: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -89,13 +90,38 @@ class WorldPixelWindow(BaseModel):
     pixels: list[WorldPixelSummary]
 
 
+class ClaimOutlineSegment(BaseModel):
+    orientation: str
+    line: int
+    start: int
+    end: int
+    status: str
+
+
+class ClaimOutlineWindow(BaseModel):
+    min_x: int
+    max_x: int
+    min_y: int
+    max_y: int
+    truncated: bool
+    segments: list[ClaimOutlineSegment]
+
+
 class PixelClaimRequest(BaseModel):
     x: int
     y: int
 
 
+class ClaimRectangleRequest(BaseModel):
+    min_x: int
+    max_x: int
+    min_y: int
+    max_y: int
+
+
 class PixelBatchClaimRequest(BaseModel):
-    pixels: list[Point]
+    pixels: list[Point] = Field(default_factory=list)
+    rectangles: list[ClaimRectangleRequest] = Field(default_factory=list)
 
 
 class PixelClaimResponse(BaseModel):
@@ -113,6 +139,28 @@ class PixelPaintResponse(BaseModel):
     pixel: WorldPixelSummary
     user: AuthUserSummary
 
+
+class PaintTileRequest(BaseModel):
+    x: int
+    y: int
+    pixels: dict[str, int]
+
+
+class PixelBatchPaintRequest(BaseModel):
+    season: int = 0
+    tiles: list[PaintTileRequest] = Field(default_factory=list)
+
+
+class WorldTileCoordinate(BaseModel):
+    tile_x: int
+    tile_y: int
+
+
+class PixelBatchPaintResponse(BaseModel):
+    user: AuthUserSummary
+    painted_count: int
+    paint_tiles: list[WorldTileCoordinate]
+    claim_tiles: list[WorldTileCoordinate]
 
 class AreaOwnerSummary(BaseModel):
     id: UUID
@@ -142,10 +190,41 @@ class ClaimAreaSummary(BaseModel):
     last_activity_at: datetime
 
 
+class ClaimAreaBounds(BaseModel):
+    min_x: int
+    max_x: int
+    min_y: int
+    max_y: int
+    width: int
+    height: int
+    center_x: float
+    center_y: float
+
+
+class ClaimAreaListItem(BaseModel):
+    id: UUID
+    name: str
+    description: str
+    claimed_pixels_count: int
+    painted_pixels_count: int
+    contributor_count: int
+    bounds: ClaimAreaBounds
+    created_at: datetime
+    updated_at: datetime
+    last_activity_at: datetime
+
+
+class ClaimAreaListResponse(BaseModel):
+    areas: list[ClaimAreaListItem]
+
+
 class PixelBatchClaimResponse(BaseModel):
     pixels: list[WorldPixelSummary]
     user: AuthUserSummary
     area: ClaimAreaSummary
+    claimed_count: int
+    returned_pixel_count: int
+    claim_tiles: list[WorldTileCoordinate]
 
 
 class ClaimAreaUpdateRequest(BaseModel):

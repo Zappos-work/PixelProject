@@ -32,8 +32,17 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(32), default="player", nullable=False)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     holders: Mapped[int] = mapped_column(Integer, default=128, nullable=False)
+    holders_unlimited: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     holder_limit: Mapped[int] = mapped_column(Integer, default=1000, nullable=False)
     holders_last_updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    claim_area_limit: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    normal_pixels: Mapped[int] = mapped_column(Integer, default=64, nullable=False)
+    normal_pixel_limit: Mapped[int] = mapped_column(Integer, default=64, nullable=False)
+    normal_pixels_last_updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,

@@ -23,10 +23,17 @@ class AuthUserSummary(BaseModel):
     role: str
     is_banned: bool
     holders: int
+    holders_unlimited: bool
     holder_limit: int
     holder_regeneration_interval_seconds: int
     holders_last_updated_at: datetime
     next_holder_regeneration_at: datetime | None = None
+    claim_area_limit: int
+    normal_pixels: int
+    normal_pixel_limit: int
+    normal_pixel_regeneration_interval_seconds: int
+    normal_pixels_last_updated_at: datetime
+    next_normal_pixel_regeneration_at: datetime | None = None
     created_at: datetime
     last_login_at: datetime
     needs_display_name_setup: bool

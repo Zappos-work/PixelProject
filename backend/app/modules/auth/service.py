@@ -180,11 +180,108 @@ def get_user_level(user: User, settings: Settings) -> tuple[int, int, int]:
     return level, progress_current, step
 
 
-def get_next_holder_regeneration_at(user: User, settings: Settings) -> datetime | None:
-    if user.holders >= user.holder_limit:
+def _get_next_regeneration_at(
+    current_amount: int,
+    limit: int,
+    last_updated_at: datetime,
+    interval_seconds: int,
+) -> datetime | None:
+    if current_amount >= limit:
         return None
 
-    return user.holders_last_updated_at + timedelta(seconds=settings.holder_regeneration_interval_seconds)
+    return last_updated_at + timedelta(seconds=max(1, interval_seconds))
+
+
+def get_next_holder_regeneration_at(user: User, settings: Settings) -> datetime | None:
+    if user.holders_unlimited:
+        return None
+
+    return _get_next_regeneration_at(
+        user.holders,
+        user.holder_limit,
+        user.holders_last_updated_at,
+        settings.holder_regeneration_interval_seconds,
+    )
+
+
+def get_next_normal_pixel_regeneration_at(user: User, settings: Settings) -> datetime | None:
+    return _get_next_regeneration_at(
+        user.normal_pixels,
+        user.normal_pixel_limit,
+        user.normal_pixels_last_updated_at,
+        settings.normal_pixel_regeneration_interval_seconds,
+    )
+
+
+def _apply_regenerating_resource(
+    user: User,
+    amount_attr: str,
+    limit_attr: str,
+    updated_attr: str,
+    interval_seconds: int,
+    current_time: datetime,
+) -> None:
+    current_amount = max(0, int(getattr(user, amount_attr) or 0))
+    limit = max(0, int(getattr(user, limit_attr) or 0))
+
+    if current_amount > limit:
+        current_amount = limit
+
+    setattr(user, amount_attr, current_amount)
+    setattr(user, limit_attr, limit)
+
+    updated_at = getattr(user, updated_attr)
+    if updated_at is None:
+        setattr(user, updated_attr, current_time)
+        return
+
+    if current_amount >= limit:
+        setattr(user, amount_attr, limit)
+        setattr(user, updated_attr, current_time)
+        return
+
+    elapsed_seconds = max(0, int((current_time - updated_at).total_seconds()))
+    step_seconds = max(1, interval_seconds)
+    regenerated = elapsed_seconds // step_seconds
+
+    if regenerated <= 0:
+        return
+
+    next_amount = min(limit, current_amount + regenerated)
+    reached_cap = next_amount >= limit
+    setattr(user, amount_attr, next_amount)
+    setattr(
+        user,
+        updated_attr,
+        current_time if reached_cap else updated_at + timedelta(seconds=regenerated * step_seconds),
+    )
+
+
+async def _spend_regenerating_resource(
+    user: User,
+    amount_attr: str,
+    limit_attr: str,
+    updated_attr: str,
+    amount: int,
+    current_time: datetime,
+    error_detail: str,
+) -> User:
+    if amount <= 0:
+        return user
+
+    current_amount = max(0, int(getattr(user, amount_attr) or 0))
+    limit = max(0, int(getattr(user, limit_attr) or 0))
+
+    if current_amount < amount:
+        raise UserStateError(error_detail, 409)
+
+    was_full = current_amount >= limit
+    setattr(user, amount_attr, current_amount - amount)
+
+    if was_full:
+        setattr(user, updated_attr, current_time)
+
+    return user
 
 
 def build_auth_user_summary(user: User, settings: Settings | None = None) -> AuthUserSummary:
@@ -206,10 +303,17 @@ def build_auth_user_summary(user: User, settings: Settings | None = None) -> Aut
         role=user.role,
         is_banned=user.is_banned,
         holders=user.holders,
+        holders_unlimited=user.holders_unlimited,
         holder_limit=user.holder_limit,
         holder_regeneration_interval_seconds=resolved_settings.holder_regeneration_interval_seconds,
         holders_last_updated_at=user.holders_last_updated_at,
         next_holder_regeneration_at=get_next_holder_regeneration_at(user, resolved_settings),
+        claim_area_limit=user.claim_area_limit,
+        normal_pixels=user.normal_pixels,
+        normal_pixel_limit=user.normal_pixel_limit,
+        normal_pixel_regeneration_interval_seconds=resolved_settings.normal_pixel_regeneration_interval_seconds,
+        normal_pixels_last_updated_at=user.normal_pixels_last_updated_at,
+        next_normal_pixel_regeneration_at=get_next_normal_pixel_regeneration_at(user, resolved_settings),
         created_at=user.created_at,
         last_login_at=user.last_login_at,
         needs_display_name_setup=needs_display_name_setup(user),
@@ -333,8 +437,13 @@ async def upsert_google_user(
             role="player",
             is_banned=False,
             holders=resolved_settings.holder_start_amount,
+            holders_unlimited=resolved_settings.holders_unlimited_default,
             holder_limit=resolved_settings.holder_start_limit,
             holders_last_updated_at=now,
+            claim_area_limit=resolved_settings.claim_area_start_limit,
+            normal_pixels=resolved_settings.normal_pixel_start_amount,
+            normal_pixel_limit=resolved_settings.normal_pixel_start_limit,
+            normal_pixels_last_updated_at=now,
             holders_placed_total=0,
             claimed_pixels_count=0,
             last_login_at=now,
@@ -346,6 +455,15 @@ async def upsert_google_user(
         user.display_name = user.display_name or DEFAULT_DISPLAY_NAME
         user.avatar_key = CUSTOM_AVATAR_KEY if user.avatar_url else DEFAULT_AVATAR_KEY
         user.avatar_history = user.avatar_history or []
+        user.holders_unlimited = bool(user.holders_unlimited)
+        user.claim_area_limit = max(1, int(user.claim_area_limit or resolved_settings.claim_area_start_limit))
+        user.normal_pixel_limit = max(0, int(user.normal_pixel_limit or resolved_settings.normal_pixel_start_limit))
+        user.normal_pixels = min(
+            max(0, int(user.normal_pixels or resolved_settings.normal_pixel_start_amount)),
+            user.normal_pixel_limit,
+        )
+        if user.normal_pixels_last_updated_at is None:
+            user.normal_pixels_last_updated_at = now
         user.last_login_at = now
 
     await db.commit()
@@ -487,21 +605,22 @@ async def spend_holders(
     now: datetime | None = None,
 ) -> User:
     current_time = now or datetime.now(timezone.utc)
+    if user.holders_unlimited:
+        return user
+
     if amount <= 0:
         return user
 
     await apply_holder_regeneration(db, user, settings, current_time)
-
-    if user.holders < amount:
-        raise UserStateError("Not enough Holders available.", 409)
-
-    was_full = user.holders >= user.holder_limit
-    user.holders -= amount
-
-    if was_full:
-        user.holders_last_updated_at = current_time
-
-    return user
+    return await _spend_regenerating_resource(
+        user,
+        "holders",
+        "holder_limit",
+        "holders_last_updated_at",
+        amount,
+        current_time,
+        "Not enough Holders available.",
+    )
 
 
 async def apply_holder_regeneration(
@@ -511,39 +630,57 @@ async def apply_holder_regeneration(
     now: datetime | None = None,
 ) -> User:
     current_time = now or datetime.now(timezone.utc)
-
-    if user.holders < 0:
-        user.holders = 0
-
-    if user.holder_limit < 0:
-        user.holder_limit = 0
-
-    if user.holders > user.holder_limit:
-        user.holders = user.holder_limit
-
-    if user.holders_last_updated_at is None:
-        user.holders_last_updated_at = current_time
+    if user.holders_unlimited:
         return user
 
-    if user.holders >= user.holder_limit:
-        user.holders = user.holder_limit
-        user.holders_last_updated_at = current_time
+    _apply_regenerating_resource(
+        user,
+        "holders",
+        "holder_limit",
+        "holders_last_updated_at",
+        settings.holder_regeneration_interval_seconds,
+        current_time,
+    )
+    return user
+
+
+async def spend_normal_pixels(
+    db: AsyncSession,
+    user: User,
+    amount: int,
+    settings: Settings,
+    now: datetime | None = None,
+) -> User:
+    current_time = now or datetime.now(timezone.utc)
+    if amount <= 0:
         return user
 
-    elapsed_seconds = max(0, int((current_time - user.holders_last_updated_at).total_seconds()))
-    interval_seconds = max(1, settings.holder_regeneration_interval_seconds)
-    regenerated = elapsed_seconds // interval_seconds
+    await apply_normal_pixel_regeneration(db, user, settings, current_time)
+    return await _spend_regenerating_resource(
+        user,
+        "normal_pixels",
+        "normal_pixel_limit",
+        "normal_pixels_last_updated_at",
+        amount,
+        current_time,
+        "Not enough Normal Pixels available.",
+    )
 
-    if regenerated <= 0:
-        return user
 
-    next_holder_count = min(user.holder_limit, user.holders + regenerated)
-    user_reached_cap = next_holder_count >= user.holder_limit
-    user.holders = next_holder_count
-    user.holders_last_updated_at = (
-        current_time
-        if user_reached_cap
-        else user.holders_last_updated_at + timedelta(seconds=regenerated * interval_seconds)
+async def apply_normal_pixel_regeneration(
+    db: AsyncSession,
+    user: User,
+    settings: Settings,
+    now: datetime | None = None,
+) -> User:
+    current_time = now or datetime.now(timezone.utc)
+    _apply_regenerating_resource(
+        user,
+        "normal_pixels",
+        "normal_pixel_limit",
+        "normal_pixels_last_updated_at",
+        settings.normal_pixel_regeneration_interval_seconds,
+        current_time,
     )
     return user
 
@@ -618,8 +755,35 @@ async def resolve_authenticated_user(
         return None
 
     await apply_holder_regeneration(db, user, resolved_settings, now)
+    await apply_normal_pixel_regeneration(db, user, resolved_settings, now)
     await db.commit()
     return user
+
+
+async def peek_authenticated_user(
+    request: Request,
+    db: AsyncSession,
+    settings: Settings | None = None,
+) -> User | None:
+    resolved_settings = settings or get_settings()
+    session_token = request.cookies.get(resolved_settings.auth_session_cookie_name)
+
+    if not session_token:
+        return None
+
+    session_record = await db.scalar(
+        select(AuthSession).where(
+            AuthSession.token_hash == hash_session_token(session_token, resolved_settings)
+        )
+    )
+
+    if session_record is None:
+        return None
+
+    if session_record.expires_at <= datetime.now(timezone.utc):
+        return None
+
+    return await db.get(User, session_record.user_id)
 
 
 async def clear_user_session(
