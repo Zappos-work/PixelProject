@@ -1,9 +1,10 @@
+import asyncio
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, insert, or_, select, tuple_
+from sqlalchemy import Integer, and_, func, insert, or_, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from PIL import Image
@@ -81,12 +82,18 @@ VALID_COLOR_IDS = {color["id"] for color in PIXEL_PALETTE}
 MAX_VISIBLE_PIXELS = 50_000
 MAX_CLAIM_OUTLINE_PIXELS = 100_000
 WORLD_TILE_SIZE = 1000
+WORLD_LOW_TILE_DETAIL_SCALE = 4
+WORLD_LOW_TILE_SIZE = WORLD_TILE_SIZE * WORLD_LOW_TILE_DETAIL_SCALE
+WORLD_LOW_TILE_IMAGE_SIZE = WORLD_TILE_SIZE // 2
 WORLD_TILE_CACHE_DIR = Path(".tile-cache")
 WORLD_TILE_CACHE_LAYER_PATHS = {
     "claims": Path("claims-access-v3"),
+    "claims-low": Path("claims-access-v3-lod8"),
     "paint": Path("palette-v2") / "paint",
+    "paint-low": Path("palette-v2") / "paint-lod8",
 }
-WORLD_TILE_LAYERS = {"claims", "paint"}
+WORLD_TILE_LAYERS = {"claims", "claims-low", "paint", "paint-low"}
+WORLD_TILE_RENDER_LOCKS: dict[tuple[str, int, int, str], asyncio.Lock] = {}
 MAX_BATCH_CLAIM_PIXELS = 500_000
 MAX_BATCH_PAINT_PIXELS = 20_000
 CLAIM_EXISTING_QUERY_BATCH_SIZE = 10_000
@@ -132,10 +139,60 @@ PALETTE_RGBA = {
     for color in PIXEL_PALETTE
     if color["hex"] != "transparent"
 }
+IMAGE_NEAREST_RESAMPLE = getattr(Image, "Resampling", Image).NEAREST
 
 
 def get_world_tile_key(x: int, y: int) -> tuple[int, int]:
     return x // WORLD_TILE_SIZE, y // WORLD_TILE_SIZE
+
+
+def get_world_tile_detail_scale(layer: str) -> int:
+    return WORLD_LOW_TILE_DETAIL_SCALE if layer.endswith("-low") else 1
+
+
+def get_world_tile_world_size(layer: str) -> int:
+    return WORLD_LOW_TILE_SIZE if layer.endswith("-low") else WORLD_TILE_SIZE
+
+
+def get_world_tile_image_size(layer: str) -> int:
+    return WORLD_LOW_TILE_IMAGE_SIZE if layer.endswith("-low") else WORLD_TILE_SIZE
+
+
+def get_world_tile_pixel_scale(layer: str) -> int:
+    return get_world_tile_world_size(layer) // get_world_tile_image_size(layer)
+
+
+def is_claim_world_tile_layer(layer: str) -> bool:
+    return layer.startswith("claims")
+
+
+def is_paint_world_tile_layer(layer: str) -> bool:
+    return layer.startswith("paint")
+
+
+def _get_world_tile_key_for_layer(x: int, y: int, layer: str) -> tuple[int, int]:
+    tile_size = get_world_tile_world_size(layer)
+    return x // tile_size, y // tile_size
+
+
+def _get_detail_tile_coordinate_for_layer(tile_x: int, tile_y: int, layer: str) -> tuple[int, int]:
+    detail_scale = get_world_tile_detail_scale(layer)
+    return tile_x // detail_scale, tile_y // detail_scale
+
+
+def _expand_world_tile_layers(layers: set[str] | None = None) -> set[str]:
+    requested_layers = layers or WORLD_TILE_LAYERS
+    expanded_layers: set[str] = set()
+
+    for layer in requested_layers:
+        if layer == "claims":
+            expanded_layers.update({"claims", "claims-low"})
+        elif layer == "paint":
+            expanded_layers.update({"paint", "paint-low"})
+        else:
+            expanded_layers.add(layer)
+
+    return expanded_layers
 
 
 def get_world_tile_cache_dir(layer: str) -> Path:
@@ -157,32 +214,102 @@ def get_world_tile_cache_path(
 ) -> Path:
     cache_dir = get_world_tile_cache_dir(layer)
 
-    if layer == "claims":
+    if is_claim_world_tile_layer(layer):
         cache_dir = cache_dir / _get_claim_tile_viewer_cache_key(viewer)
 
     return cache_dir / f"{tile_x}_{tile_y}.png"
 
 
-def get_world_tile_bounds(tile_x: int, tile_y: int) -> tuple[int, int, int, int]:
-    min_x = tile_x * WORLD_TILE_SIZE
-    min_y = tile_y * WORLD_TILE_SIZE
-    return min_x, min_x + WORLD_TILE_SIZE - 1, min_y, min_y + WORLD_TILE_SIZE - 1
+def _render_low_world_tile_from_detail_cache(
+    layer: str,
+    tile_x: int,
+    tile_y: int,
+    viewer: User | None = None,
+) -> Image.Image | None:
+    if not layer.endswith("-low"):
+        return None
+
+    detail_layer = "claims" if is_claim_world_tile_layer(layer) else "paint"
+    image_size = get_world_tile_image_size(layer)
+    detail_size = image_size // WORLD_LOW_TILE_DETAIL_SCALE
+    detail_origin_x = tile_x * WORLD_LOW_TILE_DETAIL_SCALE
+    detail_origin_y = tile_y * WORLD_LOW_TILE_DETAIL_SCALE
+    detail_paths: list[tuple[int, int, Path]] = []
+
+    for offset_y in range(WORLD_LOW_TILE_DETAIL_SCALE):
+        for offset_x in range(WORLD_LOW_TILE_DETAIL_SCALE):
+            detail_tile_x = detail_origin_x + offset_x
+            detail_tile_y = detail_origin_y + offset_y
+            detail_path = get_world_tile_cache_path(detail_layer, detail_tile_x, detail_tile_y, viewer)
+
+            if not detail_path.exists():
+                return None
+
+            detail_paths.append((offset_x, offset_y, detail_path))
+
+    image = Image.new("RGBA", (image_size, image_size), (0, 0, 0, 0))
+
+    for offset_x, offset_y, detail_path in detail_paths:
+        with Image.open(detail_path) as source_image:
+            detail_image = source_image.convert("RGBA").resize(
+                (detail_size, detail_size),
+                resample=IMAGE_NEAREST_RESAMPLE,
+            )
+
+        image.alpha_composite(detail_image, (offset_x * detail_size, offset_y * detail_size))
+
+    return image
 
 
-def get_world_tile_range(start: int, length: int) -> range:
-    first = start // WORLD_TILE_SIZE
-    last = (start + length - 1) // WORLD_TILE_SIZE
+def _get_world_tile_render_lock_by_key(
+    layer: str,
+    tile_x: int,
+    tile_y: int,
+    viewer_key: str,
+) -> asyncio.Lock:
+    key = (layer, tile_x, tile_y, viewer_key)
+    lock = WORLD_TILE_RENDER_LOCKS.get(key)
+
+    if lock is None:
+        lock = asyncio.Lock()
+        WORLD_TILE_RENDER_LOCKS[key] = lock
+
+    return lock
+
+
+def _get_world_tile_render_lock(
+    layer: str,
+    tile_x: int,
+    tile_y: int,
+    viewer: User | None = None,
+) -> asyncio.Lock:
+    viewer_key = _get_claim_tile_viewer_cache_key(viewer) if is_claim_world_tile_layer(layer) else "shared"
+    return _get_world_tile_render_lock_by_key(layer, tile_x, tile_y, viewer_key)
+
+
+def get_world_tile_bounds(tile_x: int, tile_y: int, layer: str = "paint") -> tuple[int, int, int, int]:
+    tile_size = get_world_tile_world_size(layer)
+    min_x = tile_x * tile_size
+    min_y = tile_y * tile_size
+    return min_x, min_x + tile_size - 1, min_y, min_y + tile_size - 1
+
+
+def get_world_tile_range(start: int, length: int, layer: str = "paint") -> range:
+    tile_size = get_world_tile_world_size(layer)
+    first = start // tile_size
+    last = (start + length - 1) // tile_size
     return range(first, last + 1)
 
 
 def invalidate_world_tile(tile_x: int, tile_y: int, layers: set[str] | None = None) -> None:
-    invalidated_layers = layers or WORLD_TILE_LAYERS
+    invalidated_layers = _expand_world_tile_layers(layers)
 
     for layer in invalidated_layers:
-        paths = [get_world_tile_cache_path(layer, tile_x, tile_y)]
+        layer_tile_x, layer_tile_y = _get_detail_tile_coordinate_for_layer(tile_x, tile_y, layer)
+        paths = [get_world_tile_cache_path(layer, layer_tile_x, layer_tile_y)]
 
-        if layer == "claims":
-            paths.extend(get_world_tile_cache_dir(layer).glob(f"*/{tile_x}_{tile_y}.png"))
+        if is_claim_world_tile_layer(layer):
+            paths.extend(get_world_tile_cache_dir(layer).glob(f"*/{layer_tile_x}_{layer_tile_y}.png"))
 
         for path in paths:
             try:
@@ -213,20 +340,24 @@ async def warm_active_world_tile_cache(
     active_chunks = (
         await session.scalars(select(WorldChunk).where(WorldChunk.is_active.is_(True)))
     ).all()
-    tile_coordinates: set[tuple[int, int]] = set()
-
-    for chunk in active_chunks:
-        for tile_x in get_world_tile_range(chunk.origin_x, chunk.width):
-            for tile_y in get_world_tile_range(chunk.origin_y, chunk.height):
-                tile_coordinates.add((tile_x, tile_y))
-
-    sorted_tiles = sorted(tile_coordinates, key=lambda tile: (tile[1], tile[0]))
+    warmed_tiles = 0
 
     for layer in selected_layers:
+        tile_coordinates: set[tuple[int, int]] = set()
+
+        for chunk in active_chunks:
+            for tile_x in get_world_tile_range(chunk.origin_x, chunk.width, layer):
+                for tile_y in get_world_tile_range(chunk.origin_y, chunk.height, layer):
+                    tile_coordinates.add((tile_x, tile_y))
+
+        sorted_tiles = sorted(tile_coordinates, key=lambda tile: (tile[1], tile[0]))
+
         for tile_x, tile_y in sorted_tiles:
             await ensure_world_tile_png(session, layer, tile_x, tile_y)
 
-    return len(sorted_tiles), len(sorted_tiles) * len(selected_layers)
+        warmed_tiles += len(sorted_tiles)
+
+    return warmed_tiles, warmed_tiles
 
 
 def build_world_pixel_summary(pixel: WorldPixel, owner: User | None) -> WorldPixelSummary:
@@ -695,76 +826,267 @@ async def ensure_world_tile_png(
     if tile_path.exists():
         return tile_path
 
-    tile_path.parent.mkdir(parents=True, exist_ok=True)
-    min_x, max_x, min_y, max_y = get_world_tile_bounds(tile_x, tile_y)
+    async with _get_world_tile_render_lock(layer, tile_x, tile_y, viewer):
+        if tile_path.exists():
+            return tile_path
 
-    if layer == "paint":
-        result = await session.execute(
-            select(WorldPixel.x, WorldPixel.y, WorldPixel.color_id)
-            .where(
-                WorldPixel.x >= min_x,
-                WorldPixel.x <= max_x,
-                WorldPixel.y >= min_y,
-                WorldPixel.y <= max_y,
-                WorldPixel.color_id.is_not(None),
-            )
-        )
-        image = Image.new("RGBA", (WORLD_TILE_SIZE, WORLD_TILE_SIZE), (0, 0, 0, 0))
-        pixels = image.load()
+        tile_path.parent.mkdir(parents=True, exist_ok=True)
+        min_x, max_x, min_y, max_y = get_world_tile_bounds(tile_x, tile_y, layer)
+        image_size = get_world_tile_image_size(layer)
+        pixel_scale = get_world_tile_pixel_scale(layer)
+        image = _render_low_world_tile_from_detail_cache(layer, tile_x, tile_y, viewer)
 
-        for x, y, color_id in result.all():
-            if color_id is None:
-                continue
+        if image is None and is_paint_world_tile_layer(layer):
+            image = Image.new("RGBA", (image_size, image_size), (0, 0, 0, 0))
+            pixels = image.load()
 
-            pixels[x - min_x, y - min_y] = PALETTE_RGBA.get(color_id, (255, 255, 255, 255))
-    else:
-        result = await session.execute(
-            select(
-                WorldPixel.x,
-                WorldPixel.y,
-                WorldPixel.owner_user_id,
-                WorldPixel.area_id,
-                WorldPixel.is_starter,
-                WorldPixel.color_id,
-            )
-            .where(
-                WorldPixel.x >= min_x,
-                WorldPixel.x <= max_x,
-                WorldPixel.y >= min_y,
-                WorldPixel.y <= max_y,
-                WorldPixel.color_id.is_(None),
-                or_(WorldPixel.owner_user_id.is_not(None), WorldPixel.is_starter.is_(True)),
-            )
-        )
-        image = Image.new("RGBA", (WORLD_TILE_SIZE, WORLD_TILE_SIZE), (0, 0, 0, 0))
-        pixels = image.load()
-        rows = result.all()
-        contributor_area_ids = await _get_viewer_contributor_area_ids(
-            session,
-            viewer,
-            {
-                area_id
-                for _x, _y, _owner_user_id, area_id, is_starter, _color_id in rows
-                if area_id is not None and not is_starter
-            },
-        )
+            if pixel_scale == 1:
+                result = await session.execute(
+                    select(WorldPixel.x, WorldPixel.y, WorldPixel.color_id)
+                    .where(
+                        WorldPixel.x >= min_x,
+                        WorldPixel.x <= max_x,
+                        WorldPixel.y >= min_y,
+                        WorldPixel.y <= max_y,
+                        WorldPixel.color_id.is_not(None),
+                    )
+                )
 
-        for x, y, owner_user_id, area_id, is_starter, _color_id in rows:
-            if owner_user_id is None and not is_starter:
-                continue
+                for x, y, color_id in result.all():
+                    if color_id is None:
+                        continue
 
-            pixels[x - min_x, y - min_y] = _get_claim_tile_rgba(
-                owner_user_id,
-                area_id,
-                bool(is_starter),
-                viewer,
-                contributor_area_ids,
-            )
+                    pixels[x - min_x, y - min_y] = PALETTE_RGBA.get(color_id, (255, 255, 255, 255))
+            else:
+                local_x = func.floor((WorldPixel.x - min_x) / pixel_scale).cast(Integer).label("local_x")
+                local_y = func.floor((WorldPixel.y - min_y) / pixel_scale).cast(Integer).label("local_y")
+                result = await session.execute(
+                    select(local_x, local_y, func.max(WorldPixel.color_id))
+                    .where(
+                        WorldPixel.x >= min_x,
+                        WorldPixel.x <= max_x,
+                        WorldPixel.y >= min_y,
+                        WorldPixel.y <= max_y,
+                        WorldPixel.color_id.is_not(None),
+                    )
+                    .group_by(local_x, local_y)
+                )
 
-    temp_path = tile_path.with_suffix(".tmp.png")
-    image.save(temp_path, format="PNG", compress_level=4)
-    temp_path.replace(tile_path)
+                for local_pixel_x, local_pixel_y, color_id in result.all():
+                    if color_id is None:
+                        continue
+
+                    pixels[local_pixel_x, local_pixel_y] = PALETTE_RGBA.get(color_id, (255, 255, 255, 255))
+        elif image is None:
+            image = Image.new("RGBA", (image_size, image_size), (0, 0, 0, 0))
+            pixels = image.load()
+
+            if pixel_scale == 1:
+                result = await session.execute(
+                    select(
+                        WorldPixel.x,
+                        WorldPixel.y,
+                        WorldPixel.owner_user_id,
+                        WorldPixel.area_id,
+                        WorldPixel.is_starter,
+                    )
+                    .where(
+                        WorldPixel.x >= min_x,
+                        WorldPixel.x <= max_x,
+                        WorldPixel.y >= min_y,
+                        WorldPixel.y <= max_y,
+                        WorldPixel.color_id.is_(None),
+                        or_(WorldPixel.owner_user_id.is_not(None), WorldPixel.is_starter.is_(True)),
+                    )
+                )
+
+                rows = result.all()
+                contributor_area_ids = await _get_viewer_contributor_area_ids(
+                    session,
+                    viewer,
+                    {
+                        area_id
+                        for _x, _y, _owner_user_id, area_id, is_starter in rows
+                        if area_id is not None and not is_starter
+                    },
+                )
+
+                for x, y, owner_user_id, area_id, is_starter in rows:
+                    if owner_user_id is None and not is_starter:
+                        continue
+
+                    pixels[x - min_x, y - min_y] = _get_claim_tile_rgba(
+                        owner_user_id,
+                        area_id,
+                        bool(is_starter),
+                        viewer,
+                        contributor_area_ids,
+                    )
+            else:
+                local_x = func.floor((WorldPixel.x - min_x) / pixel_scale).cast(Integer).label("local_x")
+                local_y = func.floor((WorldPixel.y - min_y) / pixel_scale).cast(Integer).label("local_y")
+                result = await session.execute(
+                    select(
+                        local_x,
+                        local_y,
+                        WorldPixel.owner_user_id,
+                        WorldPixel.area_id,
+                        WorldPixel.is_starter,
+                    )
+                    .where(
+                        WorldPixel.x >= min_x,
+                        WorldPixel.x <= max_x,
+                        WorldPixel.y >= min_y,
+                        WorldPixel.y <= max_y,
+                        WorldPixel.color_id.is_(None),
+                        or_(WorldPixel.owner_user_id.is_not(None), WorldPixel.is_starter.is_(True)),
+                    )
+                    .group_by(local_x, local_y, WorldPixel.owner_user_id, WorldPixel.area_id, WorldPixel.is_starter)
+                )
+
+                rows = result.all()
+                contributor_area_ids = await _get_viewer_contributor_area_ids(
+                    session,
+                    viewer,
+                    {
+                        area_id
+                        for _local_x, _local_y, _owner_user_id, area_id, is_starter in rows
+                        if area_id is not None and not is_starter
+                    },
+                )
+
+                for local_pixel_x, local_pixel_y, owner_user_id, area_id, is_starter in rows:
+                    if owner_user_id is None and not is_starter:
+                        continue
+
+                    pixels[local_pixel_x, local_pixel_y] = _get_claim_tile_rgba(
+                        owner_user_id,
+                        area_id,
+                        bool(is_starter),
+                        viewer,
+                        contributor_area_ids,
+                    )
+
+        temp_path = tile_path.with_name(f"{tile_path.stem}.{uuid4().hex}.tmp.png")
+        try:
+            image.save(temp_path, format="PNG", compress_level=1 if layer.endswith("-low") else 4)
+            temp_path.replace(tile_path)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     return tile_path
+
+
+async def patch_cached_paint_tiles(
+    session: AsyncSession,
+    paint_changes: list[tuple[int, int, int | None]],
+) -> None:
+    latest_pixels = await _get_existing_pixels_map_at(
+        session,
+        [(x, y) for x, y, _color_id in paint_changes],
+    )
+    changes_by_tile: dict[tuple[str, int, int], list[tuple[int, int, int | None]]] = {}
+
+    for x, y, _color_id in paint_changes:
+        latest_pixel = latest_pixels.get((x, y))
+        if latest_pixel is None:
+            continue
+
+        for layer in ("paint", "paint-low"):
+            if layer == "paint-low" and latest_pixel.color_id is None:
+                tile_x, tile_y = get_world_tile_key(x, y)
+                invalidate_world_tile(tile_x, tile_y, {"paint-low"})
+                continue
+
+            tile_x, tile_y = _get_world_tile_key_for_layer(x, y, layer)
+            changes_by_tile.setdefault((layer, tile_x, tile_y), []).append((x, y, latest_pixel.color_id))
+
+    for (layer, tile_x, tile_y), tile_changes in changes_by_tile.items():
+        tile_path = get_world_tile_cache_path(layer, tile_x, tile_y)
+
+        async with _get_world_tile_render_lock(layer, tile_x, tile_y):
+            if not tile_path.exists():
+                continue
+
+            min_x, _max_x, min_y, _max_y = get_world_tile_bounds(tile_x, tile_y, layer)
+            pixel_scale = get_world_tile_pixel_scale(layer)
+            temp_path = tile_path.with_name(f"{tile_path.stem}.{uuid4().hex}.tmp.png")
+
+            try:
+                with Image.open(tile_path) as source_image:
+                    image = source_image.convert("RGBA")
+
+                pixels = image.load()
+
+                for x, y, color_id in tile_changes:
+                    pixels[(x - min_x) // pixel_scale, (y - min_y) // pixel_scale] = (
+                        (0, 0, 0, 0)
+                        if color_id is None
+                        else PALETTE_RGBA.get(color_id, (255, 255, 255, 255))
+                    )
+
+                image.save(temp_path, format="PNG", compress_level=1)
+                temp_path.replace(tile_path)
+            except OSError:
+                try:
+                    tile_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            finally:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+async def patch_cached_claim_tiles_hidden(
+    claim_coordinates: list[tuple[int, int]],
+) -> None:
+    coordinates_by_tile: dict[tuple[str, int, int], list[tuple[int, int]]] = {}
+
+    for x, y in claim_coordinates:
+        for layer in ("claims", "claims-low"):
+            tile_x, tile_y = _get_world_tile_key_for_layer(x, y, layer)
+            coordinates_by_tile.setdefault((layer, tile_x, tile_y), []).append((x, y))
+
+    for (layer, tile_x, tile_y), coordinates in coordinates_by_tile.items():
+        claim_cache_dir = get_world_tile_cache_dir(layer)
+        min_x, _max_x, min_y, _max_y = get_world_tile_bounds(tile_x, tile_y, layer)
+        pixel_scale = get_world_tile_pixel_scale(layer)
+
+        for tile_path in claim_cache_dir.glob(f"*/{tile_x}_{tile_y}.png"):
+            viewer_key = tile_path.parent.name
+
+            async with _get_world_tile_render_lock_by_key(layer, tile_x, tile_y, viewer_key):
+                if not tile_path.exists():
+                    continue
+
+                temp_path = tile_path.with_name(f"{tile_path.stem}.{uuid4().hex}.tmp.png")
+
+                try:
+                    with Image.open(tile_path) as source_image:
+                        image = source_image.convert("RGBA")
+
+                    pixels = image.load()
+
+                    for x, y in coordinates:
+                        pixels[(x - min_x) // pixel_scale, (y - min_y) // pixel_scale] = (0, 0, 0, 0)
+
+                    image.save(temp_path, format="PNG", compress_level=1)
+                    temp_path.replace(tile_path)
+                except OSError:
+                    try:
+                        tile_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                finally:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
 
 def _normalize_area_name(name: str | None) -> str:
@@ -1058,6 +1380,25 @@ async def _bulk_insert_claimed_pixels(
             )
 
         await session.execute(insert(WorldPixel), rows)
+
+
+async def _increment_world_chunk_claim_counts(
+    session: AsyncSession,
+    pixels: list[tuple[int, int]],
+    settings: Settings,
+) -> None:
+    chunk_counts: dict[tuple[int, int], int] = {}
+
+    for x, y in pixels:
+        chunk_coordinate = get_chunk_coordinates_for_pixel(x, y, settings)
+        chunk_counts[chunk_coordinate] = chunk_counts.get(chunk_coordinate, 0) + 1
+
+    for (chunk_x, chunk_y), claimed_count in chunk_counts.items():
+        await session.execute(
+            update(WorldChunk)
+            .where(WorldChunk.chunk_x == chunk_x, WorldChunk.chunk_y == chunk_y)
+            .values(claimed_pixels_count=WorldChunk.claimed_pixels_count + claimed_count)
+        )
 
 
 async def _get_adjacent_claim_pixels(
@@ -1398,6 +1739,7 @@ async def claim_world_pixels(
         normalized_pixels,
         resolved_settings,
     )
+    await _increment_world_chunk_claim_counts(session, normalized_pixels, resolved_settings)
 
     area.claimed_pixels_count += claimed_count
     area.last_activity_at = now
@@ -1491,11 +1833,27 @@ async def paint_world_pixels(
     paint_tile_coordinates = _get_tile_coordinates_for_pixels(
         [(pixel.x, pixel.y) for pixel, _previous_color_id, _next_color_id in changes]
     )
+    paint_cache_changes = [
+        (pixel.x, pixel.y, next_color_id)
+        for pixel, _previous_color_id, next_color_id in changes
+    ]
     claim_tile_coordinates = _get_tile_coordinates_for_pixels(
         [
             (pixel.x, pixel.y)
             for pixel, previous_color_id, next_color_id in changes
             if (previous_color_id is None) != (next_color_id is None)
+        ]
+    )
+    claim_cache_hide_coordinates = [
+        (pixel.x, pixel.y)
+        for pixel, previous_color_id, next_color_id in changes
+        if previous_color_id is None and next_color_id is not None
+    ]
+    claim_show_tile_coordinates = _get_tile_coordinates_for_pixels(
+        [
+            (pixel.x, pixel.y)
+            for pixel, previous_color_id, next_color_id in changes
+            if previous_color_id is not None and next_color_id is None
         ]
     )
 
@@ -1518,11 +1876,14 @@ async def paint_world_pixels(
 
     await session.commit()
 
-    if paint_tile_coordinates:
-        invalidate_world_tiles(paint_tile_coordinates, {"paint"})
+    if paint_cache_changes:
+        await patch_cached_paint_tiles(session, paint_cache_changes)
 
-    if claim_tile_coordinates:
-        invalidate_world_tiles(claim_tile_coordinates, {"claims"})
+    if claim_cache_hide_coordinates:
+        await patch_cached_claim_tiles_hidden(claim_cache_hide_coordinates)
+
+    if claim_show_tile_coordinates:
+        invalidate_world_tiles(claim_show_tile_coordinates, {"claims"})
 
     await session.refresh(user)
 
@@ -1594,12 +1955,13 @@ async def paint_world_pixel(
         area.last_activity_at = now
 
     await session.commit()
-    dirty_layers = {"paint"}
 
-    if (previous_color_id is None) != (normalized_color_id is None):
-        dirty_layers.add("claims")
+    if previous_color_id is None and normalized_color_id is not None:
+        await patch_cached_claim_tiles_hidden([(x, y)])
+    elif previous_color_id is not None and normalized_color_id is None:
+        invalidate_world_tile_for_pixel(x, y, {"claims"})
 
-    invalidate_world_tile_for_pixel(x, y, dirty_layers)
+    await patch_cached_paint_tiles(session, [(x, y, normalized_color_id)])
     await session.refresh(pixel)
     await session.refresh(user)
 

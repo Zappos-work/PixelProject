@@ -155,11 +155,13 @@ export type ClaimOutlineWindow = {
   segments: ClaimOutlineSegment[];
 };
 
-export type WorldTileLayer = "claims" | "paint";
+export type WorldTileLayer = "claims" | "claims-low" | "paint" | "paint-low";
 
 const WORLD_TILE_STYLE_VERSION: Record<WorldTileLayer, string> = {
   claims: "access-v3",
+  "claims-low": "access-v3-lod8",
   paint: "v2",
+  "paint-low": "v2-lod8",
 };
 
 const apiBaseUrl =

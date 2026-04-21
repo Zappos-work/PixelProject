@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
 
@@ -33,6 +34,7 @@ from app.services.pixels import (
     get_claim_area_details,
     get_claim_outline_pixels,
     get_visible_world_pixels,
+    is_claim_world_tile_layer,
     invite_area_contributor,
     list_owned_claim_areas,
     paint_world_pixels,
@@ -91,15 +93,12 @@ async def world_tile(
     session: AsyncSession = Depends(get_db),
 ) -> Response:
     settings = get_settings()
-    viewer = await peek_authenticated_user(request, session, settings) if layer == "claims" else None
+    viewer = await peek_authenticated_user(request, session, settings) if is_claim_world_tile_layer(layer) else None
 
     try:
         tile_path = await ensure_world_tile_png(session, layer, tile_x, tile_y, viewer)
-        try:
-            tile_bytes = tile_path.read_bytes()
-        except FileNotFoundError:
+        if not tile_path.exists():
             tile_path = await ensure_world_tile_png(session, layer, tile_x, tile_y, viewer)
-            tile_bytes = tile_path.read_bytes()
     except WorldTileError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
     except FileNotFoundError as error:
@@ -108,16 +107,16 @@ async def world_tile(
     headers = {
         "Cache-Control": (
             "private, max-age=5, must-revalidate"
-            if layer == "claims"
+            if is_claim_world_tile_layer(layer)
             else "public, max-age=5, must-revalidate"
         ),
         "X-PixelProject-Tile": f"{layer}/{tile_x}/{tile_y}",
     }
 
-    if layer == "claims":
+    if is_claim_world_tile_layer(layer):
         headers["Vary"] = "Cookie"
 
-    return Response(content=tile_bytes, media_type="image/png", headers=headers)
+    return FileResponse(tile_path, media_type="image/png", headers=headers)
 
 
 @router.post("/claims", response_model=PixelClaimResponse)

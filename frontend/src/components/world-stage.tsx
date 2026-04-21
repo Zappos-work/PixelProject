@@ -79,11 +79,13 @@ type ActiveChunkViewportRect = WorldBoundaryRect;
 
 type WorldTile = {
   key: string;
+  detailScale: number;
   tileX: number;
   tileY: number;
   left: number;
   top: number;
   size: number;
+  worldSize: number;
 };
 
 type GridLine = {
@@ -232,6 +234,9 @@ const PERF_EVENT_NAME = "pixelproject:perf-event";
 const PERF_FRAME_GAP_THRESHOLD_MS = 42;
 const PERF_LOG_LIMIT = 500;
 const WORLD_TILE_SIZE = 1000;
+const WORLD_LOW_TILE_DETAIL_SCALE = 4;
+const WORLD_LOW_TILE_SIZE = WORLD_TILE_SIZE * WORLD_LOW_TILE_DETAIL_SCALE;
+const WORLD_DETAIL_TILE_MIN_SCREEN_SIZE = 128;
 const WORLD_TILE_MARGIN = 1;
 const TRANSPARENT_COLOR_ID = 31;
 const BUILD_MODE_LABEL: Record<BuildMode, string> = {
@@ -347,8 +352,12 @@ function getPixelKey(pixel: PixelCoordinate): string {
   return `${pixel.x}:${pixel.y}`;
 }
 
-function getWorldTileKey(tileX: number, tileY: number): string {
-  return `${tileX}:${tileY}`;
+function getWorldTileKey(tileX: number, tileY: number, detailScale = 1): string {
+  return detailScale === 1 ? `${tileX}:${tileY}` : `low-${detailScale}:${tileX}:${tileY}`;
+}
+
+function getLowWorldTileCoordinate(detailTileCoordinate: number): number {
+  return Math.floor(detailTileCoordinate / WORLD_LOW_TILE_DETAIL_SCALE);
 }
 
 function getPixelTileCoordinate(pixel: PixelCoordinate): { tileX: number; tileY: number } {
@@ -2044,42 +2053,47 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return [];
     }
 
+    const detailTileScreenSize = WORLD_TILE_SIZE * camera.zoom;
+    const detailScale = detailTileScreenSize < WORLD_DETAIL_TILE_MIN_SCREEN_SIZE
+      ? WORLD_LOW_TILE_DETAIL_SCALE
+      : 1;
+    const tileWorldSize = detailScale === 1 ? WORLD_TILE_SIZE : WORLD_LOW_TILE_SIZE;
     const visibleMinX = Math.floor(-camera.x / camera.zoom);
     const visibleMaxX = Math.ceil((viewportSize.width - camera.x) / camera.zoom);
     const visibleMinY = Math.floor(-camera.y / camera.zoom);
     const visibleMaxY = Math.ceil((viewportSize.height - camera.y) / camera.zoom);
-    const worldMinTileX = Math.floor(activeWorldBounds.minX / WORLD_TILE_SIZE);
-    const worldMaxTileX = Math.floor((activeWorldBounds.maxX - 1) / WORLD_TILE_SIZE);
-    const worldMinTileY = Math.floor(activeWorldBounds.minY / WORLD_TILE_SIZE);
-    const worldMaxTileY = Math.floor((activeWorldBounds.maxY - 1) / WORLD_TILE_SIZE);
+    const worldMinTileX = Math.floor(activeWorldBounds.minX / tileWorldSize);
+    const worldMaxTileX = Math.floor((activeWorldBounds.maxX - 1) / tileWorldSize);
+    const worldMinTileY = Math.floor(activeWorldBounds.minY / tileWorldSize);
+    const worldMaxTileY = Math.floor((activeWorldBounds.maxY - 1) / tileWorldSize);
     const minTileX = Math.max(
       worldMinTileX,
-      Math.floor(visibleMinX / WORLD_TILE_SIZE) - WORLD_TILE_MARGIN,
+      Math.floor(visibleMinX / tileWorldSize) - WORLD_TILE_MARGIN,
     );
     const maxTileX = Math.min(
       worldMaxTileX,
-      Math.floor(visibleMaxX / WORLD_TILE_SIZE) + WORLD_TILE_MARGIN,
+      Math.floor(visibleMaxX / tileWorldSize) + WORLD_TILE_MARGIN,
     );
     const minTileY = Math.max(
       worldMinTileY,
-      Math.floor(visibleMinY / WORLD_TILE_SIZE) - WORLD_TILE_MARGIN,
+      Math.floor(visibleMinY / tileWorldSize) - WORLD_TILE_MARGIN,
     );
     const maxTileY = Math.min(
       worldMaxTileY,
-      Math.floor(visibleMaxY / WORLD_TILE_SIZE) + WORLD_TILE_MARGIN,
+      Math.floor(visibleMaxY / tileWorldSize) + WORLD_TILE_MARGIN,
     );
     const tiles: WorldTile[] = [];
 
     for (let tileY = minTileY; tileY <= maxTileY; tileY += 1) {
       for (let tileX = minTileX; tileX <= maxTileX; tileX += 1) {
-        const key = getWorldTileKey(tileX, tileY);
-        const tileOriginX = tileX * WORLD_TILE_SIZE;
-        const tileOriginY = tileY * WORLD_TILE_SIZE;
+        const key = getWorldTileKey(tileX, tileY, detailScale);
+        const tileOriginX = tileX * tileWorldSize;
+        const tileOriginY = tileY * tileWorldSize;
         const intersectsActiveChunk = activeChunks.some((chunk) => (
           tileOriginX < chunk.origin_x + chunk.width &&
-          tileOriginX + WORLD_TILE_SIZE > chunk.origin_x &&
+          tileOriginX + tileWorldSize > chunk.origin_x &&
           tileOriginY < chunk.origin_y + chunk.height &&
-          tileOriginY + WORLD_TILE_SIZE > chunk.origin_y
+          tileOriginY + tileWorldSize > chunk.origin_y
         ));
 
         if (!intersectsActiveChunk) {
@@ -2088,11 +2102,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
         tiles.push({
           key,
+          detailScale,
           tileX,
           tileY,
           left: snapScreen(camera.x + tileOriginX * camera.zoom),
           top: snapScreen(camera.y + tileOriginY * camera.zoom),
-          size: Math.ceil(WORLD_TILE_SIZE * camera.zoom),
+          size: Math.ceil(tileWorldSize * camera.zoom),
+          worldSize: tileWorldSize,
         });
       }
     }
@@ -2142,20 +2158,25 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   ]);
 
   const claimOutlineFetchBounds = useMemo(() => {
-    if (!gridVisible || viewportSize.width === 0 || viewportSize.height === 0) {
+    if (renderedWorldTiles.length === 0 || renderedWorldTiles[0]?.detailScale !== 1) {
       return null;
     }
 
+    const minTileX = Math.min(...renderedWorldTiles.map((tile) => tile.tileX));
+    const maxTileX = Math.max(...renderedWorldTiles.map((tile) => tile.tileX));
+    const minTileY = Math.min(...renderedWorldTiles.map((tile) => tile.tileY));
+    const maxTileY = Math.max(...renderedWorldTiles.map((tile) => tile.tileY));
+
     return {
-      minX: Math.max(activeWorldBounds.minX, Math.floor(-camera.x / camera.zoom) - CLAIM_OUTLINE_FETCH_MARGIN),
+      minX: Math.max(activeWorldBounds.minX, minTileX * WORLD_TILE_SIZE - CLAIM_OUTLINE_FETCH_MARGIN),
       maxX: Math.min(
         activeWorldBounds.maxX - 1,
-        Math.ceil((viewportSize.width - camera.x) / camera.zoom) + CLAIM_OUTLINE_FETCH_MARGIN,
+        (maxTileX + 1) * WORLD_TILE_SIZE - 1 + CLAIM_OUTLINE_FETCH_MARGIN,
       ),
-      minY: Math.max(activeWorldBounds.minY, Math.floor(-camera.y / camera.zoom) - CLAIM_OUTLINE_FETCH_MARGIN),
+      minY: Math.max(activeWorldBounds.minY, minTileY * WORLD_TILE_SIZE - CLAIM_OUTLINE_FETCH_MARGIN),
       maxY: Math.min(
         activeWorldBounds.maxY - 1,
-        Math.ceil((viewportSize.height - camera.y) / camera.zoom) + CLAIM_OUTLINE_FETCH_MARGIN,
+        (maxTileY + 1) * WORLD_TILE_SIZE - 1 + CLAIM_OUTLINE_FETCH_MARGIN,
       ),
     };
   }, [
@@ -2163,12 +2184,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     activeWorldBounds.maxY,
     activeWorldBounds.minX,
     activeWorldBounds.minY,
-    camera.x,
-    camera.y,
-    camera.zoom,
-    gridVisible,
-    viewportSize.height,
-    viewportSize.width,
+    renderedWorldTiles,
   ]);
 
   const refreshVisiblePixelWindow = useCallback(async (): Promise<void> => {
@@ -2303,9 +2319,18 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     const setRevisions = layer === "claims" ? setClaimTileRevisions : setPaintTileRevisions;
     setRevisions((current) => {
       const next = { ...current };
+      const dirtyKeys = new Set<string>();
 
       for (const tile of tiles) {
-        const tileKey = getWorldTileKey(tile.tile_x, tile.tile_y);
+        dirtyKeys.add(getWorldTileKey(tile.tile_x, tile.tile_y));
+        dirtyKeys.add(getWorldTileKey(
+          getLowWorldTileCoordinate(tile.tile_x),
+          getLowWorldTileCoordinate(tile.tile_y),
+          WORLD_LOW_TILE_DETAIL_SCALE,
+        ));
+      }
+
+      for (const tileKey of dirtyKeys) {
         next[tileKey] = (next[tileKey] ?? 0) + 1;
       }
 
@@ -4078,9 +4103,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                   left: `${tile.left}px`,
                   top: `${tile.top}px`,
                   width: `${tile.size}px`,
-                  height: `${tile.size}px`,
+                height: `${tile.size}px`,
                   backgroundImage: `url("${getWorldTileUrl(
-                    "claims",
+                    tile.detailScale === 1 ? "claims" : "claims-low",
                     tile.tileX,
                     tile.tileY,
                     claimTileRevisions[tile.key] ?? 0,
@@ -4133,7 +4158,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                 top: `${tile.top}px`,
                 width: `${tile.size}px`,
                 height: `${tile.size}px`,
-                backgroundImage: `url("${getWorldTileUrl("paint", tile.tileX, tile.tileY, paintTileRevisions[tile.key] ?? 0)}")`,
+                backgroundImage: `url("${getWorldTileUrl(
+                  tile.detailScale === 1 ? "paint" : "paint-low",
+                  tile.tileX,
+                  tile.tileY,
+                  paintTileRevisions[tile.key] ?? 0,
+                )}")`,
               }}
             />
           ))}

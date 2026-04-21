@@ -99,6 +99,53 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
             """
         )
     )
+
+    await connection.execute(
+        text("ALTER TABLE world_chunks ADD COLUMN IF NOT EXISTS claimed_pixels_count INTEGER DEFAULT 0")
+    )
+    await connection.execute(
+        text("UPDATE world_chunks SET claimed_pixels_count = 0 WHERE claimed_pixels_count IS NULL")
+    )
+    await connection.execute(
+        text(
+            """
+            DO $$
+            DECLARE
+                current_chunk_claims BIGINT;
+            BEGIN
+                SELECT COALESCE(SUM(claimed_pixels_count), 0)
+                INTO current_chunk_claims
+                FROM world_chunks;
+
+                IF current_chunk_claims = 0
+                   AND EXISTS (
+                       SELECT 1
+                       FROM world_pixels
+                       WHERE owner_user_id IS NOT NULL
+                         AND is_starter IS FALSE
+                       LIMIT 1
+                   )
+                THEN
+                    WITH counts AS (
+                        SELECT chunk_x, chunk_y, COUNT(*)::integer AS claimed_count
+                        FROM world_pixels
+                        WHERE owner_user_id IS NOT NULL
+                          AND is_starter IS FALSE
+                        GROUP BY chunk_x, chunk_y
+                    )
+                    UPDATE world_chunks
+                    SET claimed_pixels_count = counts.claimed_count
+                    FROM counts
+                    WHERE world_chunks.chunk_x = counts.chunk_x
+                      AND world_chunks.chunk_y = counts.chunk_y;
+                END IF;
+            END
+            $$;
+            """
+        )
+    )
+    await connection.execute(text("ALTER TABLE world_chunks ALTER COLUMN claimed_pixels_count SET DEFAULT 0"))
+    await connection.execute(text("ALTER TABLE world_chunks ALTER COLUMN claimed_pixels_count SET NOT NULL"))
     await connection.execute(
         text(
             """

@@ -138,12 +138,7 @@ async def sync_pixel_chunk_coordinates(
 
 async def get_claimed_chunk_coordinates(session: AsyncSession) -> set[tuple[int, int]]:
     result = await session.execute(
-        select(WorldPixel.chunk_x, WorldPixel.chunk_y)
-        .where(
-            WorldPixel.owner_user_id.is_not(None),
-            WorldPixel.is_starter.is_(False),
-        )
-        .distinct()
+        select(WorldChunk.chunk_x, WorldChunk.chunk_y).where(WorldChunk.claimed_pixels_count > 0)
     )
     return {(chunk_x, chunk_y) for chunk_x, chunk_y in result.all()}
 
@@ -156,14 +151,32 @@ async def count_claimed_pixels_in_shape(
         return 0
 
     return await session.scalar(
-        select(func.count())
-        .select_from(WorldPixel)
-        .where(
-            tuple_(WorldPixel.chunk_x, WorldPixel.chunk_y).in_(sorted(coordinates)),
-            WorldPixel.owner_user_id.is_not(None),
-            WorldPixel.is_starter.is_(False),
+        select(func.coalesce(func.sum(WorldChunk.claimed_pixels_count), 0)).where(
+            tuple_(WorldChunk.chunk_x, WorldChunk.chunk_y).in_(sorted(coordinates)),
         )
     ) or 0
+
+
+async def refresh_world_chunk_claim_counts(session: AsyncSession) -> None:
+    await session.execute(text("UPDATE world_chunks SET claimed_pixels_count = 0"))
+    await session.execute(
+        text(
+            """
+            WITH counts AS (
+                SELECT chunk_x, chunk_y, COUNT(*)::integer AS claimed_count
+                FROM world_pixels
+                WHERE owner_user_id IS NOT NULL
+                  AND is_starter IS FALSE
+                GROUP BY chunk_x, chunk_y
+            )
+            UPDATE world_chunks
+            SET claimed_pixels_count = counts.claimed_count
+            FROM counts
+            WHERE world_chunks.chunk_x = counts.chunk_x
+              AND world_chunks.chunk_y = counts.chunk_y
+            """
+        )
+    )
 
 
 async def sync_world_growth(
@@ -181,6 +194,7 @@ async def sync_world_growth(
 
     if sync_pixels:
         await sync_pixel_chunk_coordinates(session, resolved_settings)
+        await refresh_world_chunk_claim_counts(session)
 
     claimed_coordinates = await get_claimed_chunk_coordinates(session)
     stage = get_required_growth_stage(claimed_coordinates)

@@ -1,9 +1,12 @@
 .env
+stress-artifacts/
 .env.local
 .idea/
 .vscode/
 Thumbs.db
 .DS_Store
+__pycache__/
+*.pyc
 
 frontend/.next/
 frontend/node_modules/

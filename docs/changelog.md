@@ -16,6 +16,14 @@ Player-facing release notes for PixelProject.
 - Claim tiles are cached per viewer, so owner, contributor and blocked colors match the current player.
 - Large rectangle claims use compact rectangle payloads and bulk backend inserts instead of sending every pixel back to the browser.
 - Paint and claim saves now refresh only the affected paint or claim tiles.
+- Claim growth checks now use per-chunk claim counters instead of rescanning all claimed pixels after every Holder claim.
+- Concurrent requests for the same missing world tile now share one render instead of rendering the same PNG repeatedly.
+- Paint saves patch existing paint tiles and hide newly painted claim shimmer pixels in cached claim tiles instead of forcing full tile rerenders.
+- First page load now uses coarse cached overview tiles while zoomed out, dropping the initial full-world image fan-out from hundreds of detail requests to a small set of low-detail paint and claim tiles.
+- The backend now warms the anonymous overview tile cache in the background after startup, and low-detail tiles can be composed from existing detail tiles instead of scanning millions of pixels.
+- The home page now receives the real world overview from the server render instead of booting with a fallback world and correcting itself after hydration.
+- Cached tile PNGs are now served as files instead of being read fully into Python memory for every request.
+- Local stress tooling can create test users, seed/claim local areas, paint batches and log container stats for repeatable load tests.
 - The build panel is easier to reopen, shows the active resource type and handles very large pending claims more calmly.
 - World tile cache warming now reuses the shared tile-warming service.
 

@@ -1,4 +1,6 @@
-from contextlib import asynccontextmanager
+import asyncio
+import logging
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,17 +10,37 @@ from app.api.router import api_router
 from app.core.config import get_settings
 from app.core.redis import close_redis_client
 from app.db.bootstrap import initialize_database
-from app.db.session import dispose_engine
+from app.db.session import AsyncSessionLocal, dispose_engine
+from app.services.pixels import warm_active_world_tile_cache
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
+
+
+async def warm_initial_world_overview_tiles() -> None:
+    await asyncio.sleep(0.5)
+
+    try:
+        async with AsyncSessionLocal() as session:
+            tile_count, total = await warm_active_world_tile_cache(session, ["paint-low", "claims-low"])
+        logger.info("Warmed initial world overview tile cache: %s tile(s), %s render(s).", tile_count, total)
+    except Exception:
+        logger.exception("Initial world overview tile warmup failed.")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await initialize_database()
-    yield
-    await close_redis_client()
-    await dispose_engine()
+    overview_warmup_task = asyncio.create_task(warm_initial_world_overview_tiles())
+
+    try:
+        yield
+    finally:
+        overview_warmup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await overview_warmup_task
+        await close_redis_client()
+        await dispose_engine()
 
 
 app = FastAPI(
