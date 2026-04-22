@@ -22,7 +22,7 @@ async def warm_initial_world_overview_tiles() -> None:
 
     try:
         async with AsyncSessionLocal() as session:
-            tile_count, total = await warm_active_world_tile_cache(session, ["paint-low", "claims-low"])
+            tile_count, total = await warm_active_world_tile_cache(session, ["visual-low"])
         logger.info("Warmed initial world overview tile cache: %s tile(s), %s render(s).", tile_count, total)
     except Exception:
         logger.exception("Initial world overview tile warmup failed.")
@@ -45,7 +45,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.1.0",
+    version="0.1.8",
     lifespan=lifespan,
 )
 

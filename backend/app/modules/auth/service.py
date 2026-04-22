@@ -293,8 +293,6 @@ def build_auth_user_summary(user: User, settings: Settings | None = None) -> Aut
     return AuthUserSummary(
         id=user.id,
         public_id=user.public_id,
-        google_subject=user.google_subject,
-        email=user.email,
         display_name=user.display_name,
         display_name_changed_at=user.display_name_changed_at,
         avatar_key=user.avatar_key or DEFAULT_AVATAR_KEY,

@@ -120,12 +120,17 @@ select {
   fill: var(--world-outside-pattern-base);
 }
 
+.world-visual-layer,
 .world-claim-layer,
 .world-pixel-layer {
   position: absolute;
   inset: 0;
   overflow: hidden;
   pointer-events: none;
+}
+
+.world-visual-layer {
+  z-index: 1;
 }
 
 .world-claim-layer {
@@ -157,11 +162,51 @@ select {
 
 .world-tile {
   position: absolute;
-  background-position: center;
-  background-repeat: no-repeat;
-  background-size: 100% 100%;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.world-tile-image {
+  position: absolute;
+  display: block;
   image-rendering: pixelated;
   pointer-events: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.world-tile-detail-image {
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+
+.world-tile-detail-image.is-loaded {
+  opacity: 1;
+}
+
+.world-tile-retained-image {
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 1;
+}
+
+.world-tile-parent-image {
+  opacity: 0.96;
+  transition: opacity 120ms ease-out, filter 120ms ease-out;
+}
+
+.world-tile-parent-image.is-softened {
+  filter: blur(0.85px);
+  transform: scale(1.02);
+  transform-origin: center;
+}
+
+.world-tile-parent-image.is-hidden {
+  opacity: 0;
 }
 
 .world-claimed-pixel,
@@ -1734,8 +1779,9 @@ select {
   bottom: 1rem;
   z-index: 60;
   width: min(380px, calc(100vw - 2rem));
-  max-height: min(520px, calc(100vh - 2rem));
+  height: min(520px, calc(100vh - 2rem));
   display: grid;
+  grid-template-rows: auto auto auto auto auto minmax(0, 1fr);
   gap: 0.7rem;
   overflow: hidden;
   border: 1px solid rgba(125, 211, 165, 0.32);
@@ -1746,7 +1792,7 @@ select {
   padding: 0.85rem;
   backdrop-filter: blur(16px);
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
-  pointer-events: none;
+  pointer-events: auto;
 }
 
 .perf-debug-header,
@@ -1755,6 +1801,16 @@ select {
   align-items: center;
   justify-content: space-between;
   gap: 0.6rem;
+}
+
+.perf-debug-header {
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+.perf-debug-panel.is-dragging .perf-debug-header {
+  cursor: grabbing;
 }
 
 .perf-debug-header strong {
@@ -1772,11 +1828,53 @@ select {
   justify-content: flex-start;
 }
 
+.perf-debug-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.perf-debug-button {
+  appearance: none;
+  border: 1px solid rgba(125, 211, 165, 0.24);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #f7fbff;
+  padding: 0.42rem 0.62rem;
+  font: inherit;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+.perf-debug-button.is-active {
+  background: rgba(125, 211, 165, 0.16);
+  border-color: rgba(125, 211, 165, 0.44);
+}
+
 .perf-debug-stats span {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 999px;
   padding: 0.24rem 0.48rem;
   background: rgba(255, 255, 255, 0.04);
+}
+
+.perf-debug-snapshot {
+  display: grid;
+  gap: 0.24rem;
+  border: 1px solid rgba(56, 189, 248, 0.18);
+  border-radius: 12px;
+  padding: 0.55rem 0.6rem;
+  background: rgba(56, 189, 248, 0.06);
+}
+
+.perf-debug-snapshot strong {
+  font-size: 0.72rem;
+}
+
+.perf-debug-snapshot span {
+  color: rgba(221, 232, 242, 0.8);
+  font-size: 0.68rem;
+  line-height: 1.35;
 }
 
 .perf-debug-command {
@@ -1794,6 +1892,7 @@ select {
 .perf-debug-events {
   display: grid;
   gap: 0.44rem;
+  min-height: 0;
   overflow-y: auto;
   padding-right: 0.2rem;
 }
@@ -1828,6 +1927,26 @@ select {
 
 .perf-debug-event.is-mark {
   border-left-color: rgba(125, 211, 165, 0.8);
+}
+
+.perf-debug-event.is-action {
+  border-left-color: #34d399;
+}
+
+.perf-debug-event.is-network {
+  border-left-color: #38bdf8;
+}
+
+.perf-debug-event.is-tile {
+  border-left-color: #c084fc;
+}
+
+.perf-debug-event.is-snapshot {
+  border-left-color: #94a3b8;
+}
+
+.perf-debug-event.is-warning {
+  border-left-color: #fb923c;
 }
 
 .perf-debug-event strong {

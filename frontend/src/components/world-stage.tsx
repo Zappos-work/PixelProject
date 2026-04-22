@@ -1,14 +1,27 @@
 "use client";
 
 import Image from "next/image";
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 
 import {
   claimWorldPixels,
   fetchClaimOutlinePixels,
   fetchClaimArea,
+  fetchClaimAreaAtPixel,
   fetchAuthSession,
   fetchMyClaimAreas,
+  fetchVisibleClaimAreaPreviews,
   fetchVisibleWorldPixels,
   fetchWorldOverview,
   getClientApiBaseUrl,
@@ -21,6 +34,8 @@ import {
   uploadAvatar,
   type AuthUser,
   type AuthSessionStatus,
+  type ClaimAreaPreview,
+  type ClaimAreaRecord,
   type ClaimAreaSummary,
   type ClaimAreaListItem,
   type ClaimOutlineSegment,
@@ -85,7 +100,25 @@ type WorldTile = {
   left: number;
   top: number;
   size: number;
-  worldSize: number;
+};
+
+type WorldTileFallback = {
+  src: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  soften: boolean;
+};
+
+type WorldTileRasterProps = {
+  layer: DebugTileLayer;
+  onDebugSignal?: (signal: DebugTileSignal) => void;
+  onTileLoaded?: (layer: DebugTileLayer, tileKey: string, src: string) => void;
+  retainedSrc?: string | null;
+  tile: WorldTile;
+  src: string;
+  fallback: WorldTileFallback | null;
 };
 
 type GridLine = {
@@ -131,6 +164,14 @@ type ActiveWorldBounds = {
   centerY: number;
 };
 
+type VisibleAreaBounds = {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  key: string;
+};
+
 type PlacementState = {
   pixelRecord: WorldPixel | null;
   isInsideWorld: boolean;
@@ -160,13 +201,40 @@ type BuildPanelDragState = {
   height: number;
 };
 
+const EMPTY_PLACEMENT_STATE: PlacementState = {
+  pixelRecord: null,
+  isInsideWorld: false,
+  canClaim: false,
+  canPaint: false,
+  isPendingClaim: false,
+  pendingPaint: null,
+};
+
 type PerfMarkDetail = {
   label: string;
   detail?: string;
   at: number;
 };
 
-type PerfEventKind = "gap" | "layout" | "longtask" | "mark";
+type DebugEventDetail = {
+  kind: PerfEventKind;
+  label: string;
+  detail?: string;
+  at: number;
+  duration?: number;
+};
+
+type PerfEventKind =
+  | "gap"
+  | "layout"
+  | "longtask"
+  | "mark"
+  | "action"
+  | "network"
+  | "measure"
+  | "tile"
+  | "snapshot"
+  | "warning";
 
 type PerfEventRecord = {
   id: number;
@@ -182,10 +250,69 @@ type LayoutShiftEntry = PerformanceEntry & {
   hadRecentInput?: boolean;
 };
 
+type PerfDebugOverlayProps = {
+  getSnapshot?: () => DebugWorldSnapshot | null;
+};
+
 type PerfDebugWindow = Window & {
   __pixelPerfLog?: PerfEventRecord[];
   __pixelPerfDump?: () => string;
   __pixelPerfClear?: () => void;
+  __pixelDebugDump?: () => string;
+  __pixelDebugClear?: () => void;
+  __pixelDebugStart?: () => void;
+  __pixelDebugStop?: () => void;
+};
+
+type DebugTileLayer = "claims" | "paint" | "visual";
+
+type DebugTileSignal = {
+  layer: DebugTileLayer;
+  phase: "src" | "load" | "error";
+  tileKey: string;
+  detailScale: number;
+  hasFallback: boolean;
+  src: string;
+  duration?: number;
+};
+
+type DebugTileState = {
+  loaded: boolean;
+  failed: boolean;
+  detailScale: number;
+  hasFallback: boolean;
+  src: string;
+  updatedAt: number;
+};
+
+type DebugTileLayerSnapshot = {
+  active: number;
+  loaded: number;
+  loading: number;
+  failed: number;
+  fallbackVisible: number;
+};
+
+type DebugWorldSnapshot = {
+  zoom: number;
+  cameraX: number;
+  cameraY: number;
+  layerMode: "visual" | "semantic";
+  tileDetailScale: number | null;
+  renderedTiles: number;
+  visiblePixels: number;
+  claimOutlineSegments: number;
+  pendingClaims: number;
+  pendingPaints: number;
+  selectedPixel: string | null;
+  inspectedPixel: string | null;
+  selectedAreaId: string | null;
+  buildPanelOpen: boolean;
+  areaPanelBusy: boolean;
+  areaDetailsBusy: boolean;
+  visual: DebugTileLayerSnapshot;
+  claims: DebugTileLayerSnapshot;
+  paint: DebugTileLayerSnapshot;
 };
 
 type PendingClaimSegment = {
@@ -210,6 +337,47 @@ type ClaimOutlinePath = {
   d: string;
 };
 
+type SelectedPixelOverlay = {
+  left: number;
+  top: number;
+  size: number;
+};
+
+type GridLineSet = {
+  vertical: GridLine[];
+  horizontal: GridLine[];
+};
+
+type WorldViewportCanvasProps = {
+  activeChunkBoundaryRects: WorldBoundaryRect[];
+  activeChunkViewportRects: ActiveChunkViewportRect[];
+  bulkPendingClaimOverlay: boolean;
+  claimOutlinePaths: ClaimOutlinePath[];
+  crosshairHorizontalRef: RefObject<HTMLDivElement | null>;
+  crosshairVerticalRef: RefObject<HTMLDivElement | null>;
+  getClaimTileFallback: (tile: WorldTile) => WorldTileFallback | null;
+  getClaimTileSrc: (tile: WorldTile) => string;
+  getPaintTileFallback: (tile: WorldTile) => WorldTileFallback | null;
+  getPaintTileSrc: (tile: WorldTile) => string;
+  getVisualTileFallback: (tile: WorldTile) => WorldTileFallback | null;
+  getVisualTileSrc: (tile: WorldTile) => string;
+  gridLines: GridLineSet;
+  onTileDebugSignal?: (signal: DebugTileSignal) => void;
+  onTileLoaded?: (layer: DebugTileLayer, tileKey: string, src: string) => void;
+  outsideArtPatternImages: ReactNode;
+  renderedPendingClaims: PendingClaimSegment[];
+  renderedPendingPaints: PendingPaintSegment[];
+  renderedWorldTiles: WorldTile[];
+  retainedClaimTileSrcs: Map<string, string>;
+  retainedPaintTileSrcs: Map<string, string>;
+  retainedVisualTileSrcs: Map<string, string>;
+  selectedPixelOverlay: SelectedPixelOverlay | null;
+  useVisualTiles: boolean;
+  viewportSize: ViewportSize;
+  worldOutsideMaskId: string;
+  worldOutsidePatternId: string;
+};
+
 const DEFAULT_ZOOM = 3;
 const DEFAULT_MIN_ZOOM = 0.05;
 const ABSOLUTE_MIN_ZOOM = 0.001;
@@ -225,19 +393,40 @@ const CLICK_DISTANCE = 6;
 const AUTH_REFRESH_INTERVAL_MS = 60000;
 const HOLDER_TICK_MS = 1000;
 const PIXEL_FETCH_DEBOUNCE_MS = 120;
+const SELECTED_PIXEL_FETCH_DEBOUNCE_MS = 120;
+const SELECTED_PIXEL_FETCH_MISS_COOLDOWN_MS = 1500;
+const CAMERA_FETCH_SETTLE_MS = 180;
 const PIXEL_FETCH_MARGIN = 2;
 const CLAIM_OUTLINE_FETCH_DEBOUNCE_MS = 40;
 const CLAIM_OUTLINE_FETCH_MARGIN = 2;
+const VISIBLE_AREA_PREFETCH_DEBOUNCE_MS = 180;
+const VISIBLE_AREA_POLL_INTERVAL_MS = 5000;
+const VISIBLE_AREA_PREFETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
+const VISIBLE_AREA_PREFETCH_SNAP_WORLD_UNITS = 16;
+const VISIBLE_AREA_PREFETCH_CACHE_MS = 1200;
 const CLAIM_BATCH_PIXEL_LIMIT = 500_000;
 const BULK_PENDING_CLAIM_THRESHOLD = 20_000;
+const CLAIM_AREA_CACHE_LIMIT = 128;
 const PERF_EVENT_NAME = "pixelproject:perf-event";
+const DEBUG_EVENT_NAME = "pixelproject:debug-event";
 const PERF_FRAME_GAP_THRESHOLD_MS = 42;
 const PERF_LOG_LIMIT = 500;
+const DEBUG_EVENT_PANEL_LIMIT = 14;
+const DEBUG_SNAPSHOT_INTERVAL_MS = 1000;
+const DEBUG_WARNING_COOLDOWN_MS = 1200;
+const DEBUG_LAYOUT_SHIFT_MIN_VALUE = 0.005;
+const DEBUG_LAYOUT_SHIFT_SUPPRESSION_AFTER_ZOOM_MS = 700;
+const DEBUG_WORLD_RENDER_MARK_MIN_INTERVAL_MS = 500;
+const DEBUG_INTERACTION_MARK_MIN_INTERVAL_MS = 120;
+const DEBUG_MEASURE_THRESHOLD_MS = 8;
 const WORLD_TILE_SIZE = 1000;
-const WORLD_LOW_TILE_DETAIL_SCALE = 4;
+const WORLD_LOW_TILE_DETAIL_SCALE = 2;
 const WORLD_LOW_TILE_SIZE = WORLD_TILE_SIZE * WORLD_LOW_TILE_DETAIL_SCALE;
-const WORLD_DETAIL_TILE_MIN_SCREEN_SIZE = 128;
+const WORLD_DETAIL_TILE_MIN_SCREEN_SIZE = 300;
 const WORLD_TILE_MARGIN = 1;
+const WORLD_TILE_OVERSCAN_VIEWPORT_FACTOR = 0.35;
+const WORLD_LOW_TILE_MARGIN = 0;
+const WORLD_LOW_TILE_OVERSCAN_VIEWPORT_FACTOR = 0.08;
 const TRANSPARENT_COLOR_ID = 31;
 const BUILD_MODE_LABEL: Record<BuildMode, string> = {
   claim: "Holders",
@@ -260,6 +449,10 @@ const FALLBACK_AUTH_STATUS: AuthSessionStatus = {
   user: null,
   request_failed: true,
 };
+
+function getAuthStatusSignature(status: AuthSessionStatus): string {
+  return JSON.stringify(status);
+}
 
 let perfDebugEnabledCache: boolean | null = null;
 
@@ -286,7 +479,11 @@ function isPerfDebugEnabled(): boolean {
 
   try {
     const params = new URLSearchParams(window.location.search);
-    perfDebugEnabledCache = params.has("perf") || window.localStorage.getItem("pixelproject:perf") === "1";
+    perfDebugEnabledCache =
+      params.has("perf") ||
+      params.has("debug") ||
+      window.localStorage.getItem("pixelproject:perf") === "1" ||
+      window.localStorage.getItem("pixelproject:debug") === "1";
     return perfDebugEnabledCache;
   } catch {
     perfDebugEnabledCache = false;
@@ -310,6 +507,20 @@ function markPerfEvent(label: string, detail?: string): void {
   );
 }
 
+function getPerfMarkThrottleMs(label: string): number {
+  switch (label) {
+    case "world render":
+      return DEBUG_WORLD_RENDER_MARK_MIN_INTERVAL_MS;
+    case "wheel zoom":
+      return DEBUG_INTERACTION_MARK_MIN_INTERVAL_MS;
+    case "holder tick":
+    case "normal pixel tick":
+      return 2000;
+    default:
+      return 0;
+  }
+}
+
 function isPerfMarkDetail(value: unknown): value is PerfMarkDetail {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -319,8 +530,80 @@ function isPerfMarkDetail(value: unknown): value is PerfMarkDetail {
   return typeof candidate.label === "string" && typeof candidate.at === "number";
 }
 
+function emitDebugEvent(
+  kind: Exclude<PerfEventKind, "gap" | "layout" | "longtask" | "mark">,
+  label: string,
+  detail?: string,
+  duration?: number,
+): void {
+  if (typeof window === "undefined" || !isPerfDebugEnabled()) {
+    return;
+  }
+
+  window.dispatchEvent(
+    new CustomEvent<DebugEventDetail>(DEBUG_EVENT_NAME, {
+      detail: {
+        kind,
+        label,
+        detail,
+        at: performance.now(),
+        duration,
+      },
+    }),
+  );
+}
+
+function measureDebugWork<T>(
+  label: string,
+  task: () => T,
+  detail?: string | ((result: T) => string),
+  thresholdMs = DEBUG_MEASURE_THRESHOLD_MS,
+): T {
+  if (typeof window === "undefined" || !isPerfDebugEnabled()) {
+    return task();
+  }
+
+  const startedAt = performance.now();
+  const result = task();
+  const duration = performance.now() - startedAt;
+
+  if (duration >= thresholdMs) {
+    emitDebugEvent(
+      "measure",
+      label,
+      typeof detail === "function" ? detail(result) : detail,
+      duration,
+    );
+  }
+
+  return result;
+}
+
+function isDebugEventDetail(value: unknown): value is DebugEventDetail {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<DebugEventDetail>;
+  return (
+    typeof candidate.kind === "string" &&
+    typeof candidate.label === "string" &&
+    typeof candidate.at === "number"
+  );
+}
+
 function formatPerfTime(value: number): string {
   return `${Math.round(value)}ms`;
+}
+
+function formatDebugLayerLabel(snapshot: Pick<DebugWorldSnapshot, "layerMode" | "tileDetailScale">): string {
+  if (snapshot.tileDetailScale === null) {
+    return snapshot.layerMode;
+  }
+
+  return snapshot.tileDetailScale === 1
+    ? `${snapshot.layerMode} detail`
+    : `${snapshot.layerMode} low x${snapshot.tileDetailScale}`;
 }
 
 function getPerfDebugWindow(): PerfDebugWindow | null {
@@ -360,6 +643,17 @@ function getLowWorldTileCoordinate(detailTileCoordinate: number): number {
   return Math.floor(detailTileCoordinate / WORLD_LOW_TILE_DETAIL_SCALE);
 }
 
+function snapVisibleAreaMin(value: number): number {
+  return Math.floor(value / VISIBLE_AREA_PREFETCH_SNAP_WORLD_UNITS) * VISIBLE_AREA_PREFETCH_SNAP_WORLD_UNITS;
+}
+
+function snapVisibleAreaMax(value: number): number {
+  return (
+    Math.ceil((value + 1) / VISIBLE_AREA_PREFETCH_SNAP_WORLD_UNITS) *
+      VISIBLE_AREA_PREFETCH_SNAP_WORLD_UNITS
+  ) - 1;
+}
+
 function getPixelTileCoordinate(pixel: PixelCoordinate): { tileX: number; tileY: number } {
   return {
     tileX: Math.floor(pixel.x / WORLD_TILE_SIZE),
@@ -373,6 +667,243 @@ function getTileLocalOffset(pixel: PixelCoordinate): number {
   const localY = pixel.y - tileY * WORLD_TILE_SIZE;
   return localY * WORLD_TILE_SIZE + localX;
 }
+
+function isClaimAreaSummary(area: ClaimAreaRecord | null): area is ClaimAreaSummary {
+  return area !== null && "contributors" in area;
+}
+
+function buildAreaSelectionSignature(area: ClaimAreaRecord | null): string {
+  if (area === null) {
+    return "none";
+  }
+
+  const base = [
+    area.id,
+    area.name,
+    area.description,
+    area.owner.public_id,
+    area.owner.display_name,
+    area.claimed_pixels_count,
+    area.painted_pixels_count,
+    area.contributor_count,
+    Number(area.viewer_can_edit),
+    Number(area.viewer_can_paint),
+    area.updated_at,
+    area.last_activity_at,
+  ];
+
+  if (isClaimAreaSummary(area)) {
+    base.push(
+      area.contributors
+        .map((contributor) => `${contributor.id}:${contributor.public_id}:${contributor.display_name}`)
+        .join(","),
+    );
+  }
+
+  return base.join("|");
+}
+
+function buildLowTileFallback(tile: WorldTile, src: string): WorldTileFallback | null {
+  if (tile.detailScale !== 1) {
+    return null;
+  }
+
+  const lowTileX = getLowWorldTileCoordinate(tile.tileX);
+  const lowTileY = getLowWorldTileCoordinate(tile.tileY);
+  const relativeTileX = tile.tileX - lowTileX * WORLD_LOW_TILE_DETAIL_SCALE;
+  const relativeTileY = tile.tileY - lowTileY * WORLD_LOW_TILE_DETAIL_SCALE;
+  const scaledSize = tile.size * WORLD_LOW_TILE_DETAIL_SCALE;
+
+  return {
+    src,
+    left: -relativeTileX * tile.size,
+    top: -relativeTileY * tile.size,
+    width: scaledSize,
+    height: scaledSize,
+    soften: true,
+  };
+}
+
+function areWorldTilesEqual(left: WorldTile, right: WorldTile): boolean {
+  return (
+    left.key === right.key &&
+    left.detailScale === right.detailScale &&
+    left.tileX === right.tileX &&
+    left.tileY === right.tileY &&
+    left.left === right.left &&
+    left.top === right.top &&
+    left.size === right.size
+  );
+}
+
+function areWorldTileFallbacksEqual(
+  left: WorldTileFallback | null,
+  right: WorldTileFallback | null,
+): boolean {
+  if (left === right) {
+    return true;
+  }
+
+  if (left === null || right === null) {
+    return false;
+  }
+
+  return (
+    left.src === right.src &&
+    left.left === right.left &&
+    left.top === right.top &&
+    left.width === right.width &&
+    left.height === right.height &&
+    left.soften === right.soften
+  );
+}
+
+function areWorldTileRasterPropsEqual(
+  previous: WorldTileRasterProps,
+  next: WorldTileRasterProps,
+): boolean {
+  return (
+    previous.layer === next.layer &&
+    previous.src === next.src &&
+    previous.retainedSrc === next.retainedSrc &&
+    previous.onDebugSignal === next.onDebugSignal &&
+    previous.onTileLoaded === next.onTileLoaded &&
+    areWorldTilesEqual(previous.tile, next.tile) &&
+    areWorldTileFallbacksEqual(previous.fallback, next.fallback)
+  );
+}
+
+const WorldTileRaster = memo(function WorldTileRaster({
+  layer,
+  onDebugSignal,
+  onTileLoaded,
+  retainedSrc: cachedRetainedSrc = null,
+  tile,
+  src,
+  fallback,
+}: WorldTileRasterProps) {
+  const imageRef = useRef<HTMLImageElement | null>(null);
+  const [isLoaded, setIsLoaded] = useState(false);
+  const [retainedSrc, setRetainedSrc] = useState<string | null>(null);
+  const loadStartAtRef = useRef(typeof performance === "undefined" ? 0 : performance.now());
+  const completedSrcRef = useRef<string | null>(null);
+  const loadedSrcRef = useRef<string | null>(null);
+  const isCurrentSrcLoaded = isLoaded && loadedSrcRef.current === src;
+  const previousLoadedSrc = loadedSrcRef.current !== src ? loadedSrcRef.current : null;
+  const visibleRetainedSrc = isCurrentSrcLoaded ? null : retainedSrc ?? previousLoadedSrc ?? cachedRetainedSrc;
+  const hasParentFallback = fallback !== null;
+
+  const emitTileSignal = useCallback((
+    phase: DebugTileSignal["phase"],
+    hasVisibleFallback = hasParentFallback,
+  ): void => {
+    if (!onDebugSignal) {
+      return;
+    }
+
+    const duration = phase === "src" ? undefined : Math.max(0, performance.now() - loadStartAtRef.current);
+    onDebugSignal({
+      layer,
+      phase,
+      tileKey: tile.key,
+      detailScale: tile.detailScale,
+      hasFallback: hasVisibleFallback,
+      src,
+      duration,
+    });
+  }, [hasParentFallback, layer, onDebugSignal, src, tile.detailScale, tile.key]);
+
+  const finalizeTileLoad = useCallback((phase: "load" | "error"): void => {
+    if (completedSrcRef.current === src) {
+      return;
+    }
+
+    completedSrcRef.current = src;
+    if (phase === "load") {
+      loadedSrcRef.current = src;
+      onTileLoaded?.(layer, tile.key, src);
+      setRetainedSrc(null);
+      setIsLoaded(true);
+    } else {
+      setIsLoaded(false);
+    }
+    emitTileSignal(phase);
+  }, [emitTileSignal, layer, onTileLoaded, src, tile.key]);
+
+  useLayoutEffect(() => {
+    const nextRetainedSrc =
+      (loadedSrcRef.current !== null && loadedSrcRef.current !== src ? loadedSrcRef.current : null) ??
+      cachedRetainedSrc;
+    setRetainedSrc(nextRetainedSrc);
+    setIsLoaded(false);
+    loadStartAtRef.current = performance.now();
+    completedSrcRef.current = null;
+    emitTileSignal("src", hasParentFallback && nextRetainedSrc === null);
+  }, [cachedRetainedSrc, emitTileSignal, hasParentFallback, src]);
+
+  useLayoutEffect(() => {
+    if (imageRef.current?.complete && imageRef.current.naturalWidth > 0) {
+      finalizeTileLoad("load");
+    }
+  }, [finalizeTileLoad, src]);
+
+  return (
+    <span
+      className="world-tile"
+      style={{
+        left: `${tile.left}px`,
+        top: `${tile.top}px`,
+        width: `${tile.size}px`,
+        height: `${tile.size}px`,
+      }}
+    >
+      {fallback ? (
+        /* eslint-disable-next-line @next/next/no-img-element */
+        <img
+          alt=""
+          aria-hidden="true"
+          className={`world-tile-image world-tile-parent-image ${fallback.soften ? "is-softened" : ""} ${isCurrentSrcLoaded || visibleRetainedSrc !== null ? "is-hidden" : ""}`}
+          decoding="async"
+          draggable={false}
+          src={fallback.src}
+          style={{
+            left: `${fallback.left}px`,
+            top: `${fallback.top}px`,
+            width: `${fallback.width}px`,
+            height: `${fallback.height}px`,
+          }}
+        />
+      ) : null}
+      {visibleRetainedSrc ? (
+        /* eslint-disable-next-line @next/next/no-img-element */
+        <img
+          alt=""
+          aria-hidden="true"
+          className="world-tile-image world-tile-retained-image"
+          decoding="async"
+          draggable={false}
+          src={visibleRetainedSrc}
+        />
+      ) : null}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        alt=""
+        aria-hidden="true"
+        className={`world-tile-image world-tile-detail-image ${isCurrentSrcLoaded ? "is-loaded" : ""}`}
+        decoding="async"
+        draggable={false}
+        onError={() => {
+          finalizeTileLoad("error");
+        }}
+        onLoad={() => {
+          finalizeTileLoad("load");
+        }}
+        ref={imageRef}
+        src={src}
+      />
+    </span>
+  );
+}, areWorldTileRasterPropsEqual);
 
 function buildPaintTilePayload(paints: PendingPaint[]): PaintTileInput[] {
   const tiles = new Map<string, PaintTileInput>();
@@ -738,6 +1269,135 @@ function buildClaimOutlinePaths(
     .sort((left, right) => statusOrder[left.status] - statusOrder[right.status]);
 }
 
+function areWorldPixelsEqual(left: WorldPixel[], right: WorldPixel[]): boolean {
+  if (left === right) {
+    return true;
+  }
+
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  for (let index = 0; index < left.length; index += 1) {
+    const leftPixel = left[index];
+    const rightPixel = right[index];
+
+    if (
+      leftPixel.id !== rightPixel.id ||
+      leftPixel.x !== rightPixel.x ||
+      leftPixel.y !== rightPixel.y ||
+      leftPixel.chunk_x !== rightPixel.chunk_x ||
+      leftPixel.chunk_y !== rightPixel.chunk_y ||
+      leftPixel.color_id !== rightPixel.color_id ||
+      leftPixel.owner_user_id !== rightPixel.owner_user_id ||
+      leftPixel.owner_public_id !== rightPixel.owner_public_id ||
+      leftPixel.owner_display_name !== rightPixel.owner_display_name ||
+      leftPixel.area_id !== rightPixel.area_id ||
+      leftPixel.is_starter !== rightPixel.is_starter ||
+      leftPixel.viewer_relation !== rightPixel.viewer_relation ||
+      leftPixel.created_at !== rightPixel.created_at ||
+      leftPixel.updated_at !== rightPixel.updated_at
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function areWorldPixelRecordsEqual(
+  left: WorldPixel | null,
+  right: WorldPixel | null,
+): boolean {
+  if (left === right) {
+    return true;
+  }
+
+  if (left === null || right === null) {
+    return false;
+  }
+
+  return (
+    left.id === right.id &&
+    left.x === right.x &&
+    left.y === right.y &&
+    left.chunk_x === right.chunk_x &&
+    left.chunk_y === right.chunk_y &&
+    left.color_id === right.color_id &&
+    left.owner_user_id === right.owner_user_id &&
+    left.owner_public_id === right.owner_public_id &&
+    left.owner_display_name === right.owner_display_name &&
+    left.area_id === right.area_id &&
+    left.is_starter === right.is_starter &&
+    left.viewer_relation === right.viewer_relation &&
+    left.created_at === right.created_at &&
+    left.updated_at === right.updated_at
+  );
+}
+
+function arePendingPaintEntriesEqual(
+  left: PendingPaint | null,
+  right: PendingPaint | null,
+): boolean {
+  if (left === right) {
+    return true;
+  }
+
+  if (left === null || right === null) {
+    return false;
+  }
+
+  return (
+    left.x === right.x &&
+    left.y === right.y &&
+    left.colorId === right.colorId
+  );
+}
+
+function arePlacementStatesEqual(
+  left: PlacementState,
+  right: PlacementState,
+): boolean {
+  return (
+    areWorldPixelRecordsEqual(left.pixelRecord, right.pixelRecord) &&
+    left.isInsideWorld === right.isInsideWorld &&
+    left.canClaim === right.canClaim &&
+    left.canPaint === right.canPaint &&
+    left.isPendingClaim === right.isPendingClaim &&
+    arePendingPaintEntriesEqual(left.pendingPaint, right.pendingPaint)
+  );
+}
+
+function areClaimOutlineSegmentsEqual(
+  left: ClaimOutlineSegment[],
+  right: ClaimOutlineSegment[],
+): boolean {
+  if (left === right) {
+    return true;
+  }
+
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  for (let index = 0; index < left.length; index += 1) {
+    const leftSegment = left[index];
+    const rightSegment = right[index];
+
+    if (
+      leftSegment.orientation !== rightSegment.orientation ||
+      leftSegment.line !== rightSegment.line ||
+      leftSegment.start !== rightSegment.start ||
+      leftSegment.end !== rightSegment.end ||
+      leftSegment.status !== rightSegment.status
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 function formatDateTime(value: string): string {
   return new Intl.DateTimeFormat("en-GB", {
     dateStyle: "medium",
@@ -960,6 +1620,264 @@ function BuildTaskbarStatus({
   );
 }
 
+const WorldViewportCanvas = memo(function WorldViewportCanvas({
+  activeChunkBoundaryRects,
+  activeChunkViewportRects,
+  bulkPendingClaimOverlay,
+  claimOutlinePaths,
+  crosshairHorizontalRef,
+  crosshairVerticalRef,
+  getClaimTileFallback,
+  getClaimTileSrc,
+  getPaintTileFallback,
+  getPaintTileSrc,
+  getVisualTileFallback,
+  getVisualTileSrc,
+  gridLines,
+  onTileDebugSignal,
+  onTileLoaded,
+  outsideArtPatternImages,
+  renderedPendingClaims,
+  renderedPendingPaints,
+  renderedWorldTiles,
+  retainedClaimTileSrcs,
+  retainedPaintTileSrcs,
+  retainedVisualTileSrcs,
+  selectedPixelOverlay,
+  useVisualTiles,
+  viewportSize,
+  worldOutsideMaskId,
+  worldOutsidePatternId,
+}: WorldViewportCanvasProps) {
+  return (
+    <>
+      <div className="world-backdrop-glow" aria-hidden="true" />
+      <div
+        aria-hidden="true"
+        className="world-pixel-grid"
+      >
+        {gridLines.vertical.map((line) => (
+          <span
+            className={`world-grid-line world-grid-line-vertical ${line.major ? "is-major" : ""}`}
+            key={line.key}
+            style={{ left: `${line.position}px` }}
+          />
+        ))}
+        {gridLines.horizontal.map((line) => (
+          <span
+            className={`world-grid-line world-grid-line-horizontal ${line.major ? "is-major" : ""}`}
+            key={line.key}
+            style={{ top: `${line.position}px` }}
+          />
+        ))}
+      </div>
+      <svg
+        aria-hidden="true"
+        className="world-outside-pattern"
+        height={viewportSize.height}
+        shapeRendering="crispEdges"
+        width={viewportSize.width}
+      >
+        <defs>
+          <pattern
+            height={OUTSIDE_ART_PATTERN_SIZE}
+            id={worldOutsidePatternId}
+            patternUnits="userSpaceOnUse"
+            width={OUTSIDE_ART_PATTERN_SIZE}
+          >
+            <rect
+              className="world-outside-pattern-base"
+              height={OUTSIDE_ART_PATTERN_SIZE}
+              width={OUTSIDE_ART_PATTERN_SIZE}
+            />
+            <path
+              d="M-22 56 L 70 -36 M 18 224 L 152 90 M 140 174 L 248 66"
+              fill="none"
+              opacity="0.6"
+              stroke="var(--world-outside-hatch)"
+              strokeWidth="10"
+            />
+            <path
+              d="M-10 144 L 92 42 M 112 244 L 244 112"
+              fill="none"
+              opacity="0.45"
+              stroke="var(--world-outside-hatch)"
+              strokeWidth="6"
+            />
+            <rect fill="var(--world-outside-hatch)" height="4" opacity="0.6" width="4" x="108" y="30" />
+            <rect fill="var(--world-outside-hatch)" height="4" opacity="0.45" width="4" x="192" y="100" />
+            <rect fill="var(--world-outside-hatch)" height="4" opacity="0.45" width="4" x="26" y="190" />
+            {outsideArtPatternImages}
+          </pattern>
+          <mask id={worldOutsideMaskId}>
+            <rect fill="white" height={viewportSize.height} width={viewportSize.width} x="0" y="0" />
+            {activeChunkViewportRects.map((rect) => (
+              <rect
+                fill="black"
+                height={rect.height}
+                key={rect.key}
+                width={rect.width}
+                x={rect.left}
+                y={rect.top}
+              />
+            ))}
+          </mask>
+        </defs>
+        <rect
+          fill="var(--world-outside-shade)"
+          height={viewportSize.height}
+          mask={`url(#${worldOutsideMaskId})`}
+          width={viewportSize.width}
+          x="0"
+          y="0"
+        />
+        <rect
+          fill={`url(#${worldOutsidePatternId})`}
+          height={viewportSize.height}
+          mask={`url(#${worldOutsideMaskId})`}
+          width={viewportSize.width}
+          x="0"
+          y="0"
+        />
+      </svg>
+      {useVisualTiles ? (
+        <div className="world-visual-layer" aria-hidden="true">
+          {renderedWorldTiles.map((tile) => (
+            <WorldTileRaster
+              fallback={getVisualTileFallback(tile)}
+              key={`visual-${tile.key}`}
+              layer="visual"
+              onDebugSignal={onTileDebugSignal}
+              onTileLoaded={onTileLoaded}
+              retainedSrc={retainedVisualTileSrcs.get(tile.key) ?? null}
+              src={getVisualTileSrc(tile)}
+              tile={tile}
+            />
+          ))}
+        </div>
+      ) : null}
+      <div className="world-claim-layer" aria-hidden="true">
+        {!useVisualTiles ? (
+          <div className="world-claim-tile-layer">
+            {renderedWorldTiles.map((tile) => (
+              <WorldTileRaster
+                fallback={getClaimTileFallback(tile)}
+                key={`claim-${tile.key}`}
+                layer="claims"
+                onDebugSignal={onTileDebugSignal}
+                onTileLoaded={onTileLoaded}
+                retainedSrc={retainedClaimTileSrcs.get(tile.key) ?? null}
+                src={getClaimTileSrc(tile)}
+                tile={tile}
+              />
+            ))}
+          </div>
+        ) : null}
+        {claimOutlinePaths.length > 0 ? (
+          <svg
+            aria-hidden="true"
+            className="world-claim-outline-layer"
+            height={viewportSize.height}
+            shapeRendering="crispEdges"
+            width={viewportSize.width}
+          >
+            {claimOutlinePaths.map((path) => (
+              <path
+                d={path.d}
+                fill="none"
+                key={path.key}
+                stroke={CLAIM_OUTLINE_COLORS[path.status]}
+                strokeWidth="1"
+                vectorEffect="non-scaling-stroke"
+              />
+            ))}
+          </svg>
+        ) : null}
+        {renderedPendingClaims.map((pixel) => (
+          <span
+            className={`world-pending-claim ${bulkPendingClaimOverlay || pixel.isBulk ? "is-bulk" : ""}`}
+            key={pixel.key}
+            style={{
+              left: `${pixel.left}px`,
+              top: `${pixel.top}px`,
+              width: `${pixel.width}px`,
+              height: `${pixel.height}px`,
+            }}
+          />
+        ))}
+      </div>
+      <div className="world-pixel-layer" aria-hidden="true">
+        {!useVisualTiles ? renderedWorldTiles.map((tile) => (
+          <WorldTileRaster
+            fallback={getPaintTileFallback(tile)}
+            key={`paint-${tile.key}`}
+            layer="paint"
+            onDebugSignal={onTileDebugSignal}
+            onTileLoaded={onTileLoaded}
+            retainedSrc={retainedPaintTileSrcs.get(tile.key) ?? null}
+            src={getPaintTileSrc(tile)}
+            tile={tile}
+          />
+        )) : null}
+        {renderedPendingPaints.map((pixel) => (
+          <span
+            className={`world-pending-paint ${pixel.isTransparent ? "is-transparent" : ""}`}
+            key={pixel.key}
+            style={{
+              left: `${pixel.left}px`,
+              top: `${pixel.top}px`,
+              width: `${pixel.width}px`,
+              height: `${pixel.height}px`,
+              ...(pixel.isTransparent ? {} : { backgroundColor: pixel.color }),
+            }}
+          />
+        ))}
+      </div>
+      {selectedPixelOverlay ? (
+        <div
+          aria-hidden="true"
+          className="world-selected-pixel"
+          style={{
+            left: `${selectedPixelOverlay.left}px`,
+            top: `${selectedPixelOverlay.top}px`,
+            width: `${selectedPixelOverlay.size}px`,
+            height: `${selectedPixelOverlay.size}px`,
+          }}
+        />
+      ) : null}
+      <svg
+        aria-hidden="true"
+        className="world-limit-outline"
+        height={viewportSize.height}
+        shapeRendering="crispEdges"
+        width={viewportSize.width}
+      >
+        {activeChunkBoundaryRects.map((rect) => (
+          <rect
+            fill="currentColor"
+            height={rect.height}
+            key={rect.key}
+            width={rect.width}
+            x={rect.left}
+            y={rect.top}
+          />
+        ))}
+      </svg>
+
+      <div
+        aria-hidden="true"
+        className="world-crosshair-line world-crosshair-horizontal"
+        ref={crosshairHorizontalRef}
+      />
+      <div
+        aria-hidden="true"
+        className="world-crosshair-line world-crosshair-vertical"
+        ref={crosshairVerticalRef}
+      />
+    </>
+  );
+});
+
 function HolderPanelSummary({
   pendingClaims,
   user,
@@ -1088,17 +2006,179 @@ function NormalPixelAccountStatus({ user }: { user: AuthUser }) {
   return <small>{projection.statusText}</small>;
 }
 
-function PerfDebugOverlay() {
+function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
   const [enabled, setEnabled] = useState(false);
+  const [recording, setRecording] = useState(true);
   const [events, setEvents] = useState<PerfEventRecord[]>([]);
+  const [latestSnapshot, setLatestSnapshot] = useState<DebugWorldSnapshot | null>(null);
+  const [panelPosition, setPanelPosition] = useState<{ left: number; top: number } | null>(null);
+  const [isDraggingPanel, setIsDraggingPanel] = useState(false);
+  const panelRef = useRef<HTMLElement | null>(null);
+  const dragStateRef = useRef<{ offsetX: number; offsetY: number } | null>(null);
   const eventIdRef = useRef(0);
+  const recordingRef = useRef(true);
+  const visibleEventsRef = useRef<PerfEventRecord[]>([]);
+  const flushEventsFrameRef = useRef<number | null>(null);
   const recentMarksRef = useRef<PerfEventRecord[]>([]);
+  const throttledMarkAtRef = useRef<Map<string, number>>(new Map());
+  const previousSnapshotRef = useRef<DebugWorldSnapshot | null>(null);
+  const lastSnapshotSignatureRef = useRef("");
+  const warningCooldownRef = useRef<Map<string, number>>(new Map());
   const maxGapRef = useRef(0);
   const gapCountRef = useRef(0);
   const longTaskCountRef = useRef(0);
   const layoutShiftCountRef = useRef(0);
+  const lastZoomInteractionAtRef = useRef(0);
+  const networkCountRef = useRef(0);
+  const tileCountRef = useRef(0);
+  const warningCountRef = useRef(0);
+  const snapshotCountRef = useRef(0);
+
+  useEffect(() => {
+    recordingRef.current = recording;
+  }, [recording]);
+
+  const clampPanelPosition = useCallback((left: number, top: number): { left: number; top: number } => {
+    if (typeof window === "undefined") {
+      return { left, top };
+    }
+
+    const panelWidth = panelRef.current?.offsetWidth ?? 380;
+    const panelHeight = panelRef.current?.offsetHeight ?? 520;
+    const padding = 12;
+
+    return {
+      left: Math.min(
+        Math.max(padding, left),
+        Math.max(padding, window.innerWidth - panelWidth - padding),
+      ),
+      top: Math.min(
+        Math.max(padding, top),
+        Math.max(padding, window.innerHeight - panelHeight - padding),
+      ),
+    };
+  }, []);
+
+  const handlePanelDragStart = useCallback((event: React.PointerEvent<HTMLElement>): void => {
+    if (event.button !== 0 || panelRef.current === null) {
+      return;
+    }
+
+    const rect = panelRef.current.getBoundingClientRect();
+    dragStateRef.current = {
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+    };
+    setPanelPosition({
+      left: rect.left,
+      top: rect.top,
+    });
+    setIsDraggingPanel(true);
+    event.preventDefault();
+  }, []);
+
+  useEffect(() => {
+    if (!isDraggingPanel) {
+      return;
+    }
+
+    const handlePointerMove = (event: PointerEvent): void => {
+      const dragState = dragStateRef.current;
+
+      if (dragState === null) {
+        return;
+      }
+
+      setPanelPosition(clampPanelPosition(
+        event.clientX - dragState.offsetX,
+        event.clientY - dragState.offsetY,
+      ));
+    };
+
+    const handlePointerUp = (): void => {
+      dragStateRef.current = null;
+      setIsDraggingPanel(false);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [clampPanelPosition, isDraggingPanel]);
+
+  useEffect(() => {
+    if (panelPosition === null) {
+      return;
+    }
+
+    const handleResize = (): void => {
+      setPanelPosition((current) => (
+        current === null ? current : clampPanelPosition(current.left, current.top)
+      ));
+    };
+
+    window.addEventListener("resize", handleResize);
+
+    return () => {
+      window.removeEventListener("resize", handleResize);
+    };
+  }, [clampPanelPosition, panelPosition]);
+
+  const flushVisibleEvents = useCallback((): void => {
+    flushEventsFrameRef.current = null;
+    setEvents(visibleEventsRef.current.slice(0, DEBUG_EVENT_PANEL_LIMIT));
+  }, []);
+
+  const scheduleVisibleEventFlush = useCallback((): void => {
+    if (typeof window === "undefined" || flushEventsFrameRef.current !== null) {
+      return;
+    }
+
+    flushEventsFrameRef.current = window.requestAnimationFrame(flushVisibleEvents);
+  }, [flushVisibleEvents]);
+
+  const resetOverlayState = useCallback((): void => {
+    eventIdRef.current = 0;
+    if (flushEventsFrameRef.current !== null) {
+      window.cancelAnimationFrame(flushEventsFrameRef.current);
+      flushEventsFrameRef.current = null;
+    }
+    visibleEventsRef.current = [];
+    recentMarksRef.current = [];
+    throttledMarkAtRef.current.clear();
+    previousSnapshotRef.current = null;
+    lastSnapshotSignatureRef.current = "";
+    warningCooldownRef.current.clear();
+    maxGapRef.current = 0;
+    gapCountRef.current = 0;
+    longTaskCountRef.current = 0;
+    layoutShiftCountRef.current = 0;
+    networkCountRef.current = 0;
+    tileCountRef.current = 0;
+    warningCountRef.current = 0;
+    snapshotCountRef.current = 0;
+    setEvents([]);
+    setLatestSnapshot(null);
+  }, []);
+
+  const clearOverlayLog = useCallback((): void => {
+    const perfWindow = getPerfDebugWindow();
+
+    if (perfWindow !== null) {
+      perfWindow.__pixelPerfLog = [];
+    }
+
+    resetOverlayState();
+  }, [resetOverlayState]);
 
   const pushEvent = useCallback((event: Omit<PerfEventRecord, "id">): void => {
+    if (!recordingRef.current) {
+      return;
+    }
+
     const nextEvent: PerfEventRecord = {
       ...event,
       id: eventIdRef.current + 1,
@@ -1113,8 +2193,61 @@ function PerfDebugOverlay() {
       return;
     }
 
-    setEvents((current) => [nextEvent, ...current].slice(0, 10));
+    if (nextEvent.kind === "network") {
+      networkCountRef.current += 1;
+    }
+
+    if (nextEvent.kind === "tile") {
+      tileCountRef.current += 1;
+    }
+
+    if (nextEvent.kind === "warning") {
+      warningCountRef.current += 1;
+    }
+
+    if (nextEvent.kind === "snapshot") {
+      snapshotCountRef.current += 1;
+      return;
+    }
+
+    visibleEventsRef.current = [nextEvent, ...visibleEventsRef.current].slice(0, DEBUG_EVENT_PANEL_LIMIT);
+    scheduleVisibleEventFlush();
+  }, [scheduleVisibleEventFlush]);
+
+  const formatSnapshotDetail = useCallback((snapshot: DebugWorldSnapshot): string => {
+    const layers = snapshot.visual.active > 0
+      ? [
+          `visual ${snapshot.visual.loaded}/${snapshot.visual.active} loaded (${snapshot.visual.loading} loading, ${snapshot.visual.fallbackVisible} fallback)`,
+        ]
+      : [
+          `paint ${snapshot.paint.loaded}/${snapshot.paint.active} loaded (${snapshot.paint.loading} loading, ${snapshot.paint.fallbackVisible} fallback)`,
+          `claims ${snapshot.claims.loaded}/${snapshot.claims.active} loaded (${snapshot.claims.loading} loading, ${snapshot.claims.fallbackVisible} fallback)`,
+        ];
+
+    return [
+      `cam ${Math.round(snapshot.cameraX)}:${Math.round(snapshot.cameraY)} @ ${snapshot.zoom.toFixed(2)}x`,
+      `layer ${formatDebugLayerLabel(snapshot)}`,
+      ...layers,
+      `pixels ${snapshot.visiblePixels}, outlines ${snapshot.claimOutlineSegments}, pending ${snapshot.pendingClaims}/${snapshot.pendingPaints}`,
+    ].join(" | ");
   }, []);
+
+  const pushWarning = useCallback((key: string, label: string, detail: string): void => {
+    const now = performance.now();
+    const lastWarningAt = warningCooldownRef.current.get(key) ?? Number.NEGATIVE_INFINITY;
+
+    if (now - lastWarningAt < DEBUG_WARNING_COOLDOWN_MS) {
+      return;
+    }
+
+    warningCooldownRef.current.set(key, now);
+    pushEvent({
+      kind: "warning",
+      label,
+      detail,
+      at: now,
+    });
+  }, [pushEvent]);
 
   useEffect(() => {
     setEnabled(isPerfDebugEnabled());
@@ -1133,10 +2266,16 @@ function PerfDebugOverlay() {
 
     perfWindow.__pixelPerfLog = perfWindow.__pixelPerfLog ?? [];
     perfWindow.__pixelPerfDump = () => JSON.stringify(perfWindow.__pixelPerfLog ?? [], null, 2);
-    perfWindow.__pixelPerfClear = () => {
-      perfWindow.__pixelPerfLog = [];
+    perfWindow.__pixelPerfClear = clearOverlayLog;
+    perfWindow.__pixelDebugDump = perfWindow.__pixelPerfDump;
+    perfWindow.__pixelDebugClear = clearOverlayLog;
+    perfWindow.__pixelDebugStart = () => {
+      setRecording(true);
     };
-  }, [enabled]);
+    perfWindow.__pixelDebugStop = () => {
+      setRecording(false);
+    };
+  }, [clearOverlayLog, enabled]);
 
   useEffect(() => {
     if (!enabled) {
@@ -1178,6 +2317,14 @@ function PerfDebugOverlay() {
   }, [enabled, pushEvent]);
 
   useEffect(() => {
+    return () => {
+      if (flushEventsFrameRef.current !== null) {
+        window.cancelAnimationFrame(flushEventsFrameRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (!enabled) {
       return;
     }
@@ -1185,6 +2332,21 @@ function PerfDebugOverlay() {
     const handlePerfMark = (event: Event): void => {
       if (!(event instanceof CustomEvent) || !isPerfMarkDetail(event.detail)) {
         return;
+      }
+
+      if (event.detail.label === "wheel zoom") {
+        lastZoomInteractionAtRef.current = event.detail.at;
+      }
+
+      const throttleMs = getPerfMarkThrottleMs(event.detail.label);
+      if (throttleMs > 0) {
+        const lastAt = throttledMarkAtRef.current.get(event.detail.label) ?? Number.NEGATIVE_INFINITY;
+
+        if (event.detail.at - lastAt < throttleMs) {
+          return;
+        }
+
+        throttledMarkAtRef.current.set(event.detail.label, event.detail.at);
       }
 
       pushEvent({
@@ -1203,6 +2365,32 @@ function PerfDebugOverlay() {
   }, [enabled, pushEvent]);
 
   useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
+    const handleDebugEvent = (event: Event): void => {
+      if (!(event instanceof CustomEvent) || !isDebugEventDetail(event.detail)) {
+        return;
+      }
+
+      pushEvent({
+        kind: event.detail.kind,
+        label: event.detail.label,
+        detail: event.detail.detail ?? "",
+        at: event.detail.at,
+        duration: event.detail.duration,
+      });
+    };
+
+    window.addEventListener(DEBUG_EVENT_NAME, handleDebugEvent);
+
+    return () => {
+      window.removeEventListener(DEBUG_EVENT_NAME, handleDebugEvent);
+    };
+  }, [enabled, pushEvent]);
+
+  useEffect(() => {
     if (!enabled || typeof PerformanceObserver === "undefined") {
       return;
     }
@@ -1213,10 +2401,15 @@ function PerfDebugOverlay() {
       const longTaskObserver = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
           longTaskCountRef.current += 1;
+          const recentMarks = recentMarksRef.current
+            .filter((mark) => Math.abs(mark.at - entry.startTime) <= 1200)
+            .slice(0, 4)
+            .map((mark) => `${mark.label}${mark.detail ? ` (${mark.detail})` : ""}`)
+            .join(" -> ");
           pushEvent({
             kind: "longtask",
             label: `Long task ${entry.duration.toFixed(1)}ms`,
-            detail: entry.name || "Main thread task",
+            detail: recentMarks ? `${entry.name || "Main thread task"} | near ${recentMarks}` : entry.name || "Main thread task",
             at: entry.startTime,
             duration: entry.duration,
           });
@@ -1231,7 +2424,19 @@ function PerfDebugOverlay() {
         for (const entry of list.getEntries()) {
           const layoutEntry = entry as LayoutShiftEntry;
 
-          if (layoutEntry.hadRecentInput || !layoutEntry.value || layoutEntry.value < 0.001) {
+          if (
+            layoutEntry.hadRecentInput ||
+            !layoutEntry.value ||
+            layoutEntry.value < DEBUG_LAYOUT_SHIFT_MIN_VALUE
+          ) {
+            continue;
+          }
+
+          if (
+            lastZoomInteractionAtRef.current > 0 &&
+            layoutEntry.startTime - lastZoomInteractionAtRef.current <
+              DEBUG_LAYOUT_SHIFT_SUPPRESSION_AFTER_ZOOM_MS
+          ) {
             continue;
           }
 
@@ -1255,26 +2460,192 @@ function PerfDebugOverlay() {
     };
   }, [enabled, pushEvent]);
 
+  useEffect(() => {
+    if (!enabled || !getSnapshot) {
+      return;
+    }
+
+    const sampleSnapshot = (): void => {
+      if (!recordingRef.current) {
+        return;
+      }
+
+      const snapshot = getSnapshot();
+
+      if (snapshot === null) {
+        return;
+      }
+
+      const signature = JSON.stringify(snapshot);
+      const signatureChanged = signature !== lastSnapshotSignatureRef.current;
+
+      if (signatureChanged) {
+        lastSnapshotSignatureRef.current = signature;
+        setLatestSnapshot(snapshot);
+      }
+
+      const now = performance.now();
+      const formattedSnapshot = formatSnapshotDetail(snapshot);
+
+      if (signatureChanged) {
+        pushEvent({
+          kind: "snapshot",
+          label: "World snapshot",
+          detail: formattedSnapshot,
+          at: now,
+        });
+      }
+
+      const previousSnapshot = previousSnapshotRef.current;
+
+      if (previousSnapshot !== null) {
+        if (
+          previousSnapshot.visual.loaded > 0 &&
+          snapshot.visual.active > 0 &&
+          snapshot.visual.loaded === 0
+        ) {
+          pushWarning(
+            "visual-drop",
+            "Visual layer dropped to 0 loaded tiles",
+            formattedSnapshot,
+          );
+        }
+
+        if (
+          previousSnapshot.paint.loaded > 0 &&
+          snapshot.paint.active > 0 &&
+          snapshot.paint.loaded === 0
+        ) {
+          pushWarning(
+            "paint-drop",
+            "Paint layer dropped to 0 loaded tiles",
+            formattedSnapshot,
+          );
+        }
+
+        if (
+          previousSnapshot.claims.loaded > 0 &&
+          snapshot.claims.active > 0 &&
+          snapshot.claims.loaded === 0
+        ) {
+          pushWarning(
+            "claim-drop",
+            "Claim layer dropped to 0 loaded tiles",
+            formattedSnapshot,
+          );
+        }
+
+        if (
+          previousSnapshot.visiblePixels > 0 &&
+          snapshot.visiblePixels === 0 &&
+          snapshot.renderedTiles > 0
+        ) {
+          pushWarning(
+            "pixel-drop",
+            "Visible pixel window dropped to 0 records",
+            formattedSnapshot,
+          );
+        }
+      }
+
+      previousSnapshotRef.current = snapshot;
+    };
+
+    sampleSnapshot();
+    const snapshotInterval = window.setInterval(sampleSnapshot, DEBUG_SNAPSHOT_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(snapshotInterval);
+    };
+  }, [enabled, formatSnapshotDetail, getSnapshot, pushEvent, pushWarning]);
+
   if (!enabled) {
     return null;
   }
 
   return (
-    <aside className="perf-debug-panel">
-      <div className="perf-debug-header">
-        <strong>Perf probe</strong>
-        <span>?perf=1</span>
+    <aside
+      className={`perf-debug-panel ${isDraggingPanel ? "is-dragging" : ""}`}
+      ref={panelRef}
+      style={panelPosition ? {
+        left: `${panelPosition.left}px`,
+        top: `${panelPosition.top}px`,
+        bottom: "auto",
+      } : undefined}
+    >
+      <div
+        className="perf-debug-header"
+        onPointerDown={handlePanelDragStart}
+      >
+        <strong>Debug probe</strong>
+        <span>?debug=1</span>
+      </div>
+      <div className="perf-debug-controls">
+        <button
+          className={`perf-debug-button ${recording ? "is-active" : ""}`}
+          onClick={() => setRecording((current) => !current)}
+          type="button"
+        >
+          {recording ? "Pause" : "Start"}
+        </button>
+        <button
+          className="perf-debug-button"
+          onClick={clearOverlayLog}
+          type="button"
+        >
+          Clear
+        </button>
       </div>
       <div className="perf-debug-stats">
+        <span>{recording ? "REC" : "PAUSED"}</span>
+        {latestSnapshot ? <span>Zoom: {latestSnapshot.zoom.toFixed(2)}x</span> : null}
+        {latestSnapshot ? <span>Layer: {formatDebugLayerLabel(latestSnapshot)}</span> : null}
         <span>Gaps: {gapCountRef.current}</span>
         <span>Max: {formatPerfTime(maxGapRef.current)}</span>
         <span>Long: {longTaskCountRef.current}</span>
         <span>CLS: {layoutShiftCountRef.current}</span>
+        <span>Net: {networkCountRef.current}</span>
+        <span>Tile: {tileCountRef.current}</span>
+        <span>Warn: {warningCountRef.current}</span>
+        <span>Snap: {snapshotCountRef.current}</span>
       </div>
-      <p className="perf-debug-command">Console: copy(window.__pixelPerfDump())</p>
+      <p className="perf-debug-command">
+        Console: copy(window.__pixelDebugDump()) | start: window.__pixelDebugStart() | stop: window.__pixelDebugStop()
+      </p>
+      {latestSnapshot ? (
+        <div className="perf-debug-snapshot">
+          <strong>Latest snapshot</strong>
+          <span>
+            Cam {Math.round(latestSnapshot.cameraX)} : {Math.round(latestSnapshot.cameraY)} @ {latestSnapshot.zoom.toFixed(2)}x
+          </span>
+          <span>
+            Layer {formatDebugLayerLabel(latestSnapshot)} | semantic ready from {GRID_THRESHOLD.toFixed(2)}x while build panel is open
+          </span>
+          {latestSnapshot.visual.active > 0 ? (
+            <span>
+              Visual {latestSnapshot.visual.loaded}/{latestSnapshot.visual.active} loaded, {latestSnapshot.visual.loading} loading, {latestSnapshot.visual.fallbackVisible} fallback
+            </span>
+          ) : (
+            <>
+              <span>
+                Paint {latestSnapshot.paint.loaded}/{latestSnapshot.paint.active} loaded, {latestSnapshot.paint.loading} loading, {latestSnapshot.paint.fallbackVisible} fallback
+              </span>
+              <span>
+                Claims {latestSnapshot.claims.loaded}/{latestSnapshot.claims.active} loaded, {latestSnapshot.claims.loading} loading, {latestSnapshot.claims.fallbackVisible} fallback
+              </span>
+            </>
+          )}
+          <span>
+            Pixels {latestSnapshot.visiblePixels}, outline {latestSnapshot.claimOutlineSegments}, pending {latestSnapshot.pendingClaims}/{latestSnapshot.pendingPaints}
+          </span>
+          <span>
+            Selected {latestSnapshot.selectedPixel ?? "--"} | Area {latestSnapshot.selectedAreaId ?? "--"} | Panels {latestSnapshot.buildPanelOpen ? "build" : "closed"} / {latestSnapshot.areaPanelBusy || latestSnapshot.areaDetailsBusy ? "busy" : "idle"}
+          </span>
+        </div>
+      ) : null}
       <div className="perf-debug-events">
         {events.length === 0 ? (
-          <p>No gaps yet. Move around until the lag happens. App marks are logged without repainting this panel.</p>
+          <p>No recorded events yet. Start recording, reproduce the glitch, then dump the log from the console.</p>
         ) : (
           events.map((event) => (
             <article className={`perf-debug-event is-${event.kind}`} key={event.id}>
@@ -1332,6 +2703,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const avatarFileInputRef = useRef<HTMLInputElement | null>(null);
   const dragState = useRef<DragState | null>(null);
   const buildPanelDragState = useRef<BuildPanelDragState | null>(null);
+  const cameraUpdateFrameRef = useRef<number | null>(null);
+  const pendingCameraUpdateRef = useRef<CameraState | null>(null);
   const pointerVisualFrameRef = useRef<number | null>(null);
   const spaceStrokeRef = useRef<SpaceStrokeState | null>(null);
   const spaceToolActiveRef = useRef(false);
@@ -1345,9 +2718,52 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const pendingClaimRectanglesRef = useRef<PendingClaimRectangle[]>([]);
   const pendingPaintsRef = useRef<PendingPaint[]>([]);
   const pendingPaintMapRef = useRef<Map<string, PendingPaint>>(new Map());
+  const claimOutlineSegmentsRef = useRef<ClaimOutlineSegment[]>([]);
+  const renderedWorldTilesRef = useRef<WorldTile[]>([]);
+  const selectedPixelSnapshotRef = useRef<PixelCoordinate | null>(null);
+  const selectedPixelFetchKeyRef = useRef<string | null>(null);
+  const selectedPixelFetchMissesRef = useRef<Map<string, number>>(new Map());
+  const semanticZoomModeRef = useRef(false);
+  const inspectedPixelSnapshotRef = useRef<PixelCoordinate | null>(null);
+  const selectedAreaSnapshotRef = useRef<ClaimAreaRecord | null>(null);
+  const buildPanelOpenRef = useRef(false);
+  const areaPanelBusyRef = useRef(false);
+  const areaDetailsBusyRef = useRef(false);
+  const lastWorldRenderMarkAtRef = useRef(0);
+  const lastWheelZoomMarkAtRef = useRef(0);
+  const debugTileStatesRef = useRef<Record<DebugTileLayer, Map<string, DebugTileState>>>({
+    visual: new Map(),
+    claims: new Map(),
+    paint: new Map(),
+  });
+  const debugActiveTilesRef = useRef<Record<DebugTileLayer, Map<string, {
+    detailScale: number;
+    hasFallback: boolean;
+  }>>>({
+    visual: new Map(),
+    claims: new Map(),
+    paint: new Map(),
+  });
+  const retainedTileSrcRef = useRef<Record<DebugTileLayer, Map<string, string>>>({
+    visual: new Map(),
+    claims: new Map(),
+    paint: new Map(),
+  });
   const activeBuildModeRef = useRef<BuildMode>("claim");
   const claimToolRef = useRef<ClaimTool>("brush");
   const rectangleAnchorRef = useRef<PixelCoordinate | null>(null);
+  const areaInspectionAbortRef = useRef<AbortController | null>(null);
+  const areaDetailsAbortRef = useRef<AbortController | null>(null);
+  const visibleAreaFetchAbortRef = useRef<AbortController | null>(null);
+  const visibleAreaFetchKeyRef = useRef<string | null>(null);
+  const visibleAreaLastSuccessRef = useRef<{ key: string; at: number } | null>(null);
+  const pixelFetchAbortRef = useRef<AbortController | null>(null);
+  const claimOutlineFetchAbortRef = useRef<AbortController | null>(null);
+  const syncSelectedPlacementStateRef = useRef<(pixel: PixelCoordinate | null) => void>(() => undefined);
+  const syncInspectedPixelRecordRef = useRef<() => void>(() => undefined);
+  const cameraFetchGenerationRef = useRef(0);
+  const claimAreaCacheRef = useRef<Map<string, ClaimAreaRecord>>(new Map());
+  const claimAreaDetailCacheRef = useRef<Map<string, ClaimAreaSummary>>(new Map());
   const knownPaintableAreaIdsRef = useRef<Set<string>>(new Set());
   const selectedColorIdRef = useRef(DEFAULT_COLOR_ID);
   const zoomRef = useRef(DEFAULT_ZOOM);
@@ -1364,6 +2780,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     y: 0,
     zoom: DEFAULT_ZOOM,
   });
+  const [fetchCamera, setFetchCamera] = useState<CameraState>({
+    x: 0,
+    y: 0,
+    zoom: DEFAULT_ZOOM,
+  });
+  const [semanticZoomMode, setSemanticZoomMode] = useState(false);
   const [world, setWorld] = useState<WorldOverview>(initialWorld);
   const [showGrid, setShowGrid] = useState(true);
   const [darkMode, setDarkMode] = useState(true);
@@ -1377,6 +2799,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [avatarBusy, setAvatarBusy] = useState(false);
   const [avatarMessage, setAvatarMessage] = useState<ProfileMessage | null>(null);
   const [selectedPixel, setSelectedPixel] = useState<PixelCoordinate | null>(null);
+  const [inspectedPixel, setInspectedPixel] = useState<PixelCoordinate | null>(null);
+  const [inspectedPixelRecord, setInspectedPixelRecord] = useState<WorldPixel | null>(null);
   const [selectedColorId, setSelectedColorId] = useState(DEFAULT_COLOR_ID);
   const [activeBuildMode, setActiveBuildMode] = useState<BuildMode>("claim");
   const [claimTool, setClaimTool] = useState<ClaimTool>("brush");
@@ -1388,15 +2812,17 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [pendingPaints, setPendingPaints] = useState<PendingPaint[]>([]);
   const [placementBusy, setPlacementBusy] = useState(false);
   const [placementMessage, setPlacementMessage] = useState<ProfileMessage | null>(null);
-  const [visiblePixels, setVisiblePixels] = useState<WorldPixel[]>([]);
+  const [selectedPlacementState, setSelectedPlacementState] = useState<PlacementState>(EMPTY_PLACEMENT_STATE);
   const [claimOutlineSegments, setClaimOutlineSegments] = useState<ClaimOutlineSegment[]>([]);
+  const [visualTileRevisions, setVisualTileRevisions] = useState<Record<string, number>>({});
   const [claimTileRevisions, setClaimTileRevisions] = useState<Record<string, number>>({});
   const [paintTileRevisions, setPaintTileRevisions] = useState<Record<string, number>>({});
   const [viewportSize, setViewportSize] = useState<ViewportSize>({ width: 0, height: 0 });
   const [isCentered, setIsCentered] = useState(false);
   const [spaceToolActive, setSpaceToolActive] = useState(false);
-  const [selectedArea, setSelectedArea] = useState<ClaimAreaSummary | null>(null);
+  const [selectedArea, setSelectedArea] = useState<ClaimAreaRecord | null>(null);
   const [areaPanelBusy, setAreaPanelBusy] = useState(false);
+  const [areaDetailsBusy, setAreaDetailsBusy] = useState(false);
   const [areaDraftName, setAreaDraftName] = useState("");
   const [areaDraftDescription, setAreaDraftDescription] = useState("");
   const [areaInvitePublicId, setAreaInvitePublicId] = useState("");
@@ -1404,7 +2830,49 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [ownedAreas, setOwnedAreas] = useState<ClaimAreaListItem[]>([]);
   const [ownedAreasLoading, setOwnedAreasLoading] = useState(false);
   const [ownedAreasMessage, setOwnedAreasMessage] = useState<ProfileMessage | null>(null);
-  worldRenderCountRef.current += 1;
+
+  const scheduleCameraUpdate = useCallback((nextCamera: CameraState): void => {
+    pendingCameraUpdateRef.current = nextCamera;
+    cameraRef.current = nextCamera;
+
+    if (cameraUpdateFrameRef.current !== null || typeof window === "undefined") {
+      return;
+    }
+
+    cameraUpdateFrameRef.current = window.requestAnimationFrame(() => {
+      cameraUpdateFrameRef.current = null;
+      const queuedCamera = pendingCameraUpdateRef.current;
+      pendingCameraUpdateRef.current = null;
+
+      if (queuedCamera === null) {
+        return;
+      }
+
+      setCamera((current) => (
+        current.x === queuedCamera.x &&
+        current.y === queuedCamera.y &&
+        current.zoom === queuedCamera.zoom
+          ? current
+          : queuedCamera
+      ));
+    });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (cameraUpdateFrameRef.current !== null) {
+        window.cancelAnimationFrame(cameraUpdateFrameRef.current);
+      }
+    };
+  }, []);
+
+  claimOutlineSegmentsRef.current = claimOutlineSegments;
+  selectedPixelSnapshotRef.current = selectedPixel;
+  inspectedPixelSnapshotRef.current = inspectedPixel;
+  selectedAreaSnapshotRef.current = selectedArea;
+  buildPanelOpenRef.current = buildPanelOpen;
+  areaPanelBusyRef.current = areaPanelBusy;
+  areaDetailsBusyRef.current = areaDetailsBusy;
   const worldOutsidePatternId = `${outsidePatternIdBase}-outside-pattern`;
   const worldOutsideMaskId = `${outsidePatternIdBase}-outside-mask`;
 
@@ -1415,7 +2883,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     const nextStatus = await fetchAuthSession();
-    setAuthStatus(nextStatus);
+    const nextSignature = getAuthStatusSignature(nextStatus);
+    setAuthStatus((current) => (
+      getAuthStatusSignature(current) === nextSignature ? current : nextStatus
+    ));
     setAuthLoading(false);
     markPerfEvent("auth refresh done", nextStatus.authenticated ? "authenticated" : "guest");
   }, []);
@@ -1440,6 +2911,19 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }, []);
 
   useEffect(() => {
+    worldRenderCountRef.current += 1;
+
+    if (!isPerfDebugEnabled()) {
+      return;
+    }
+
+    const now = performance.now();
+
+    if (now - lastWorldRenderMarkAtRef.current < DEBUG_WORLD_RENDER_MARK_MIN_INTERVAL_MS) {
+      return;
+    }
+
+    lastWorldRenderMarkAtRef.current = now;
     markPerfEvent("world render", `#${worldRenderCountRef.current}`);
   });
 
@@ -1488,12 +2972,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     const refreshInterval = window.setInterval(() => {
-      void refreshAuthStatus();
+      void refreshAuthStatus(false);
     }, AUTH_REFRESH_INTERVAL_MS);
 
     const handleVisibilityChange = (): void => {
       if (!document.hidden) {
-        void refreshAuthStatus();
+        void refreshAuthStatus(false);
       }
     };
 
@@ -1654,6 +3138,33 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     };
   }, [camera.x, camera.y, camera.zoom]);
 
+  const applyAreaSelection = useCallback((
+    area: ClaimAreaRecord | null,
+    options?: { syncDrafts?: boolean },
+  ): void => {
+    const syncDrafts = options?.syncDrafts ?? true;
+    setSelectedArea((current) => {
+      return buildAreaSelectionSignature(current) === buildAreaSelectionSignature(area) ? current : area;
+    });
+
+    if (area === null) {
+      setAreaInvitePublicId("");
+      if (syncDrafts) {
+        setAreaDraftName("");
+        setAreaDraftDescription("");
+      }
+      return;
+    }
+
+    if (!syncDrafts) {
+      return;
+    }
+
+    setAreaInvitePublicId("");
+    setAreaDraftName(area.name);
+    setAreaDraftDescription(area.description);
+  }, []);
+
   const clampCamera = useCallback((nextCamera: CameraState): CameraState => {
     const zoom = clampZoom(nextCamera.zoom, minZoom);
 
@@ -1732,7 +3243,14 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   const handleNativeWheel = useCallback((event: WheelEvent): void => {
     event.preventDefault();
-    markPerfEvent("wheel zoom");
+    if (isPerfDebugEnabled()) {
+      const now = performance.now();
+
+      if (now - lastWheelZoomMarkAtRef.current >= DEBUG_INTERACTION_MARK_MIN_INTERVAL_MS) {
+        lastWheelZoomMarkAtRef.current = now;
+        markPerfEvent("wheel zoom");
+      }
+    }
 
     const viewport = viewportRef.current;
 
@@ -1743,25 +3261,23 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     const rect = viewport.getBoundingClientRect();
     const anchorX = event.clientX - rect.left;
     const anchorY = event.clientY - rect.top;
+    const currentCamera = pendingCameraUpdateRef.current ?? cameraRef.current;
+    const zoomDirection = event.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
+    const nextZoom = clampZoom(currentCamera.zoom * zoomDirection, minZoom);
 
-    setCamera((current) => {
-      const zoomDirection = event.deltaY < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
-      const nextZoom = clampZoom(current.zoom * zoomDirection, minZoom);
+    if (nextZoom === currentCamera.zoom) {
+      return;
+    }
 
-      if (nextZoom === current.zoom) {
-        return current;
-      }
+    const worldX = (anchorX - currentCamera.x) / currentCamera.zoom;
+    const worldY = (anchorY - currentCamera.y) / currentCamera.zoom;
 
-      const worldX = (anchorX - current.x) / current.zoom;
-      const worldY = (anchorY - current.y) / current.zoom;
-
-      return clampCamera({
-        zoom: nextZoom,
-        x: anchorX - worldX * nextZoom,
-        y: anchorY - worldY * nextZoom,
-      });
-    });
-  }, [clampCamera, minZoom]);
+    scheduleCameraUpdate(clampCamera({
+      zoom: nextZoom,
+      x: anchorX - worldX * nextZoom,
+      y: anchorY - worldY * nextZoom,
+    }));
+  }, [clampCamera, minZoom, scheduleCameraUpdate]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -1789,10 +3305,50 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   claimToolRef.current = claimTool;
   rectangleAnchorRef.current = rectangleAnchor;
   selectedColorIdRef.current = selectedColorId;
-  zoomRef.current = camera.zoom;
-  cameraRef.current = camera;
+  const effectiveCameraRefState = pendingCameraUpdateRef.current ?? camera;
+  zoomRef.current = effectiveCameraRefState.zoom;
+  cameraRef.current = effectiveCameraRefState;
   activeModalRef.current = activeModal;
   spaceToolActiveRef.current = spaceToolActive;
+
+  useEffect(() => {
+    cameraFetchGenerationRef.current += 1;
+    pixelFetchAbortRef.current?.abort();
+    pixelFetchAbortRef.current = null;
+    claimOutlineFetchAbortRef.current?.abort();
+    claimOutlineFetchAbortRef.current = null;
+    visibleAreaFetchAbortRef.current?.abort();
+    visibleAreaFetchAbortRef.current = null;
+
+    const settleTimeout = window.setTimeout(() => {
+      setFetchCamera({
+        x: camera.x,
+        y: camera.y,
+        zoom: camera.zoom,
+      });
+    }, CAMERA_FETCH_SETTLE_MS);
+
+    return () => {
+      window.clearTimeout(settleTimeout);
+    };
+  }, [camera.x, camera.y, camera.zoom]);
+
+  useEffect(() => {
+    setSemanticZoomMode((current) => {
+      const next = buildPanelOpen && fetchCamera.zoom >= GRID_THRESHOLD;
+
+      if (current === next) {
+        return current;
+      }
+
+      markPerfEvent("semantic mode", next ? "semantic" : "visual");
+      return next;
+    });
+  }, [buildPanelOpen, fetchCamera.zoom]);
+
+  useEffect(() => {
+    semanticZoomModeRef.current = semanticZoomMode;
+  }, [semanticZoomMode]);
 
   const hasDisplayNameChange = useMemo(() => {
     if (!currentUser) {
@@ -1883,43 +3439,51 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     world.chunk_size,
   ]);
 
-  const canShowGrid = camera.zoom >= GRID_THRESHOLD;
+  const canShowGrid = semanticZoomMode;
   const gridVisible = showGrid && canShowGrid;
+  const useVisualTiles = !semanticZoomMode;
+
+  useEffect(() => {
+    markPerfEvent("tile mode", useVisualTiles ? "visual" : "semantic");
+  }, [useVisualTiles]);
+
   const gridLines = useMemo(() => {
-    if (!gridVisible || viewportSize.width === 0 || viewportSize.height === 0) {
+    return measureDebugWork("Compute grid lines", () => {
+      if (!gridVisible || viewportSize.width === 0 || viewportSize.height === 0) {
+        return {
+          horizontal: [] as GridLine[],
+          vertical: [] as GridLine[],
+        };
+      }
+
+      const startX = Math.floor(-camera.x / camera.zoom) - 1;
+      const endX = Math.ceil((viewportSize.width - camera.x) / camera.zoom) + 1;
+      const startY = Math.floor(-camera.y / camera.zoom) - 1;
+      const endY = Math.ceil((viewportSize.height - camera.y) / camera.zoom) + 1;
+      const vertical: GridLine[] = [];
+      const horizontal: GridLine[] = [];
+
+      for (let x = startX; x <= endX; x += 1) {
+        vertical.push({
+          key: `v-${x}`,
+          position: snapScreen(camera.x + x * camera.zoom),
+          major: x % GRID_MAJOR_STEP === 0,
+        });
+      }
+
+      for (let y = startY; y <= endY; y += 1) {
+        horizontal.push({
+          key: `h-${y}`,
+          position: snapScreen(camera.y + y * camera.zoom),
+          major: y % GRID_MAJOR_STEP === 0,
+        });
+      }
+
       return {
-        horizontal: [] as GridLine[],
-        vertical: [] as GridLine[],
+        horizontal,
+        vertical,
       };
-    }
-
-    const startX = Math.floor(-camera.x / camera.zoom) - 1;
-    const endX = Math.ceil((viewportSize.width - camera.x) / camera.zoom) + 1;
-    const startY = Math.floor(-camera.y / camera.zoom) - 1;
-    const endY = Math.ceil((viewportSize.height - camera.y) / camera.zoom) + 1;
-    const vertical: GridLine[] = [];
-    const horizontal: GridLine[] = [];
-
-    for (let x = startX; x <= endX; x += 1) {
-      vertical.push({
-        key: `v-${x}`,
-        position: snapScreen(camera.x + x * camera.zoom),
-        major: x % GRID_MAJOR_STEP === 0,
-      });
-    }
-
-    for (let y = startY; y <= endY; y += 1) {
-      horizontal.push({
-        key: `h-${y}`,
-        position: snapScreen(camera.y + y * camera.zoom),
-        major: y % GRID_MAJOR_STEP === 0,
-      });
-    }
-
-    return {
-      horizontal,
-      vertical,
-    };
+    }, (lines) => `${lines.vertical.length} vertical, ${lines.horizontal.length} horizontal @ ${camera.zoom.toFixed(2)}x`);
   }, [camera.x, camera.y, camera.zoom, gridVisible, viewportSize.height, viewportSize.width]);
 
   const activeChunkViewportRects = useMemo<ActiveChunkViewportRect[]>(() => {
@@ -2048,72 +3612,108 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return rects;
   }, [activeChunks, camera.x, camera.y, camera.zoom]);
 
+  const outsideArtPatternImages = useMemo(() => {
+    return outsideArtAssets.map((asset) => {
+      const centerX = asset.x + asset.size / 2;
+      const centerY = asset.y + asset.size / 2;
+
+      return (
+        <image
+          height={asset.size}
+          href={asset.src}
+          key={asset.key}
+          opacity={asset.opacity}
+          preserveAspectRatio="xMidYMid meet"
+          style={{ imageRendering: "pixelated" }}
+          transform={`rotate(${asset.rotation} ${centerX} ${centerY})`}
+          width={asset.size}
+          x={asset.x}
+          y={asset.y}
+        />
+      );
+    });
+  }, [outsideArtAssets]);
+
+  const visibleWorldTileDetailScale = WORLD_TILE_SIZE * camera.zoom < WORLD_DETAIL_TILE_MIN_SCREEN_SIZE
+    ? WORLD_LOW_TILE_DETAIL_SCALE
+    : 1;
+  const fetchWorldTileDetailScale = WORLD_TILE_SIZE * fetchCamera.zoom < WORLD_DETAIL_TILE_MIN_SCREEN_SIZE
+    ? WORLD_LOW_TILE_DETAIL_SCALE
+    : 1;
   const renderedWorldTiles = useMemo<WorldTile[]>(() => {
-    if (viewportSize.width === 0 || viewportSize.height === 0) {
-      return [];
-    }
-
-    const detailTileScreenSize = WORLD_TILE_SIZE * camera.zoom;
-    const detailScale = detailTileScreenSize < WORLD_DETAIL_TILE_MIN_SCREEN_SIZE
-      ? WORLD_LOW_TILE_DETAIL_SCALE
-      : 1;
-    const tileWorldSize = detailScale === 1 ? WORLD_TILE_SIZE : WORLD_LOW_TILE_SIZE;
-    const visibleMinX = Math.floor(-camera.x / camera.zoom);
-    const visibleMaxX = Math.ceil((viewportSize.width - camera.x) / camera.zoom);
-    const visibleMinY = Math.floor(-camera.y / camera.zoom);
-    const visibleMaxY = Math.ceil((viewportSize.height - camera.y) / camera.zoom);
-    const worldMinTileX = Math.floor(activeWorldBounds.minX / tileWorldSize);
-    const worldMaxTileX = Math.floor((activeWorldBounds.maxX - 1) / tileWorldSize);
-    const worldMinTileY = Math.floor(activeWorldBounds.minY / tileWorldSize);
-    const worldMaxTileY = Math.floor((activeWorldBounds.maxY - 1) / tileWorldSize);
-    const minTileX = Math.max(
-      worldMinTileX,
-      Math.floor(visibleMinX / tileWorldSize) - WORLD_TILE_MARGIN,
-    );
-    const maxTileX = Math.min(
-      worldMaxTileX,
-      Math.floor(visibleMaxX / tileWorldSize) + WORLD_TILE_MARGIN,
-    );
-    const minTileY = Math.max(
-      worldMinTileY,
-      Math.floor(visibleMinY / tileWorldSize) - WORLD_TILE_MARGIN,
-    );
-    const maxTileY = Math.min(
-      worldMaxTileY,
-      Math.floor(visibleMaxY / tileWorldSize) + WORLD_TILE_MARGIN,
-    );
-    const tiles: WorldTile[] = [];
-
-    for (let tileY = minTileY; tileY <= maxTileY; tileY += 1) {
-      for (let tileX = minTileX; tileX <= maxTileX; tileX += 1) {
-        const key = getWorldTileKey(tileX, tileY, detailScale);
-        const tileOriginX = tileX * tileWorldSize;
-        const tileOriginY = tileY * tileWorldSize;
-        const intersectsActiveChunk = activeChunks.some((chunk) => (
-          tileOriginX < chunk.origin_x + chunk.width &&
-          tileOriginX + tileWorldSize > chunk.origin_x &&
-          tileOriginY < chunk.origin_y + chunk.height &&
-          tileOriginY + tileWorldSize > chunk.origin_y
-        ));
-
-        if (!intersectsActiveChunk) {
-          continue;
-        }
-
-        tiles.push({
-          key,
-          detailScale,
-          tileX,
-          tileY,
-          left: snapScreen(camera.x + tileOriginX * camera.zoom),
-          top: snapScreen(camera.y + tileOriginY * camera.zoom),
-          size: Math.ceil(tileWorldSize * camera.zoom),
-          worldSize: tileWorldSize,
-        });
+    return measureDebugWork("Compute world tiles", () => {
+      if (viewportSize.width === 0 || viewportSize.height === 0) {
+        return [];
       }
-    }
 
-    return tiles;
+      const detailScale = visibleWorldTileDetailScale;
+      const tileWorldSize = detailScale === 1 ? WORLD_TILE_SIZE : WORLD_LOW_TILE_SIZE;
+      const tileMargin = detailScale === 1 ? WORLD_TILE_MARGIN : WORLD_LOW_TILE_MARGIN;
+      const tileOverscanFactor = detailScale === 1
+        ? WORLD_TILE_OVERSCAN_VIEWPORT_FACTOR
+        : WORLD_LOW_TILE_OVERSCAN_VIEWPORT_FACTOR;
+      const visibleMinX = Math.floor(-camera.x / camera.zoom);
+      const visibleMaxX = Math.ceil((viewportSize.width - camera.x) / camera.zoom);
+      const visibleMinY = Math.floor(-camera.y / camera.zoom);
+      const visibleMaxY = Math.ceil((viewportSize.height - camera.y) / camera.zoom);
+      const overscanWorldX = Math.ceil((viewportSize.width / camera.zoom) * tileOverscanFactor);
+      const overscanWorldY = Math.ceil((viewportSize.height / camera.zoom) * tileOverscanFactor);
+      const overscanMinX = visibleMinX - overscanWorldX;
+      const overscanMaxX = visibleMaxX + overscanWorldX;
+      const overscanMinY = visibleMinY - overscanWorldY;
+      const overscanMaxY = visibleMaxY + overscanWorldY;
+      const worldMinTileX = Math.floor(activeWorldBounds.minX / tileWorldSize);
+      const worldMaxTileX = Math.floor((activeWorldBounds.maxX - 1) / tileWorldSize);
+      const worldMinTileY = Math.floor(activeWorldBounds.minY / tileWorldSize);
+      const worldMaxTileY = Math.floor((activeWorldBounds.maxY - 1) / tileWorldSize);
+      const minTileX = Math.max(
+        worldMinTileX,
+        Math.floor(overscanMinX / tileWorldSize) - tileMargin,
+      );
+      const maxTileX = Math.min(
+        worldMaxTileX,
+        Math.floor(overscanMaxX / tileWorldSize) + tileMargin,
+      );
+      const minTileY = Math.max(
+        worldMinTileY,
+        Math.floor(overscanMinY / tileWorldSize) - tileMargin,
+      );
+      const maxTileY = Math.min(
+        worldMaxTileY,
+        Math.floor(overscanMaxY / tileWorldSize) + tileMargin,
+      );
+      const tiles: WorldTile[] = [];
+
+      for (let tileY = minTileY; tileY <= maxTileY; tileY += 1) {
+        for (let tileX = minTileX; tileX <= maxTileX; tileX += 1) {
+          const key = getWorldTileKey(tileX, tileY, detailScale);
+          const tileOriginX = tileX * tileWorldSize;
+          const tileOriginY = tileY * tileWorldSize;
+          const intersectsActiveChunk = activeChunks.some((chunk) => (
+            tileOriginX < chunk.origin_x + chunk.width &&
+            tileOriginX + tileWorldSize > chunk.origin_x &&
+            tileOriginY < chunk.origin_y + chunk.height &&
+            tileOriginY + tileWorldSize > chunk.origin_y
+          ));
+
+          if (!intersectsActiveChunk) {
+            continue;
+          }
+
+          tiles.push({
+            key,
+            detailScale,
+            tileX,
+            tileY,
+            left: snapScreen(camera.x + tileOriginX * camera.zoom),
+            top: snapScreen(camera.y + tileOriginY * camera.zoom),
+            size: Math.ceil(tileWorldSize * camera.zoom),
+          });
+        }
+      }
+
+      return tiles;
+    }, (tiles) => `${tiles.length} ${visibleWorldTileDetailScale === 1 ? "detail" : `low x${visibleWorldTileDetailScale}`} tiles @ ${camera.zoom.toFixed(2)}x`);
   }, [
     activeWorldBounds.maxX,
     activeWorldBounds.maxY,
@@ -2123,9 +3723,139 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     camera.x,
     camera.y,
     camera.zoom,
+    visibleWorldTileDetailScale,
     viewportSize.height,
     viewportSize.width,
   ]);
+  renderedWorldTilesRef.current = renderedWorldTiles;
+  const tileViewerKey = currentUser ? String(currentUser.public_id) : "guest";
+
+  useEffect(() => {
+    retainedTileSrcRef.current.claims.clear();
+  }, [tileViewerKey]);
+
+  const getVisualTileSrc = useCallback((tile: WorldTile): string => {
+    return getWorldTileUrl(
+      tile.detailScale === 1 ? "visual" : "visual-low",
+      tile.tileX,
+      tile.tileY,
+      visualTileRevisions[tile.key] ?? 0,
+    );
+  }, [visualTileRevisions]);
+  const getClaimTileSrc = useCallback((tile: WorldTile): string => {
+    return getWorldTileUrl(
+      tile.detailScale === 1 ? "claims" : "claims-low",
+      tile.tileX,
+      tile.tileY,
+      claimTileRevisions[tile.key] ?? 0,
+      tileViewerKey,
+    );
+  }, [claimTileRevisions, tileViewerKey]);
+  const getPaintTileSrc = useCallback((tile: WorldTile): string => {
+    return getWorldTileUrl(
+      tile.detailScale === 1 ? "paint" : "paint-low",
+      tile.tileX,
+      tile.tileY,
+      paintTileRevisions[tile.key] ?? 0,
+    );
+  }, [paintTileRevisions]);
+  const getClaimTileFallback = useCallback((tile: WorldTile): WorldTileFallback | null => {
+    if (tile.detailScale !== 1) {
+      return null;
+    }
+
+    const lowTileX = getLowWorldTileCoordinate(tile.tileX);
+    const lowTileY = getLowWorldTileCoordinate(tile.tileY);
+    const lowTileKey = getWorldTileKey(lowTileX, lowTileY, WORLD_LOW_TILE_DETAIL_SCALE);
+    return buildLowTileFallback(
+      tile,
+      getWorldTileUrl(
+        "claims-low",
+        lowTileX,
+        lowTileY,
+        claimTileRevisions[lowTileKey] ?? 0,
+        tileViewerKey,
+      ),
+    );
+  }, [claimTileRevisions, tileViewerKey]);
+  const getVisualTileFallback = useCallback((tile: WorldTile): WorldTileFallback | null => {
+    if (tile.detailScale !== 1) {
+      return null;
+    }
+
+    const lowTileX = getLowWorldTileCoordinate(tile.tileX);
+    const lowTileY = getLowWorldTileCoordinate(tile.tileY);
+    const lowTileKey = getWorldTileKey(lowTileX, lowTileY, WORLD_LOW_TILE_DETAIL_SCALE);
+    return buildLowTileFallback(
+      tile,
+      getWorldTileUrl(
+        "visual-low",
+        lowTileX,
+        lowTileY,
+        visualTileRevisions[lowTileKey] ?? 0,
+      ),
+    );
+  }, [visualTileRevisions]);
+  const getPaintTileFallback = useCallback((tile: WorldTile): WorldTileFallback | null => {
+    if (tile.detailScale !== 1) {
+      return null;
+    }
+
+    const lowTileX = getLowWorldTileCoordinate(tile.tileX);
+    const lowTileY = getLowWorldTileCoordinate(tile.tileY);
+    const lowTileKey = getWorldTileKey(lowTileX, lowTileY, WORLD_LOW_TILE_DETAIL_SCALE);
+    return buildLowTileFallback(
+      tile,
+      getWorldTileUrl(
+        "paint-low",
+        lowTileX,
+        lowTileY,
+        paintTileRevisions[lowTileKey] ?? 0,
+      ),
+    );
+  }, [paintTileRevisions]);
+
+  useEffect(() => {
+    const visualActiveTiles = new Map<string, { detailScale: number; hasFallback: boolean }>();
+    const claimsActiveTiles = new Map<string, { detailScale: number; hasFallback: boolean }>();
+    const paintActiveTiles = new Map<string, { detailScale: number; hasFallback: boolean }>();
+
+    for (const tile of renderedWorldTiles) {
+      const meta = {
+        detailScale: tile.detailScale,
+        hasFallback: tile.detailScale === 1,
+      };
+
+      if (useVisualTiles) {
+        visualActiveTiles.set(tile.key, meta);
+      } else {
+        claimsActiveTiles.set(tile.key, meta);
+        paintActiveTiles.set(tile.key, meta);
+      }
+    }
+
+    debugActiveTilesRef.current = {
+      visual: visualActiveTiles,
+      claims: claimsActiveTiles,
+      paint: paintActiveTiles,
+    };
+
+    for (const layer of ["visual", "claims", "paint"] as const) {
+      const stateMap = debugTileStatesRef.current[layer];
+      const activeTiles =
+        layer === "visual"
+          ? visualActiveTiles
+          : layer === "claims"
+            ? claimsActiveTiles
+            : paintActiveTiles;
+
+      for (const tileKey of [...stateMap.keys()]) {
+        if (!activeTiles.has(tileKey)) {
+          stateMap.delete(tileKey);
+        }
+      }
+    }
+  }, [renderedWorldTiles, useVisualTiles]);
 
   const pixelFetchBounds = useMemo(() => {
     if (!gridVisible || viewportSize.width === 0 || viewportSize.height === 0) {
@@ -2133,15 +3863,15 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     return {
-      minX: Math.max(activeWorldBounds.minX, Math.floor(-camera.x / camera.zoom) - PIXEL_FETCH_MARGIN),
+      minX: Math.max(activeWorldBounds.minX, Math.floor(-fetchCamera.x / fetchCamera.zoom) - PIXEL_FETCH_MARGIN),
       maxX: Math.min(
         activeWorldBounds.maxX - 1,
-        Math.ceil((viewportSize.width - camera.x) / camera.zoom) + PIXEL_FETCH_MARGIN,
+        Math.ceil((viewportSize.width - fetchCamera.x) / fetchCamera.zoom) + PIXEL_FETCH_MARGIN,
       ),
-      minY: Math.max(activeWorldBounds.minY, Math.floor(-camera.y / camera.zoom) - PIXEL_FETCH_MARGIN),
+      minY: Math.max(activeWorldBounds.minY, Math.floor(-fetchCamera.y / fetchCamera.zoom) - PIXEL_FETCH_MARGIN),
       maxY: Math.min(
         activeWorldBounds.maxY - 1,
-        Math.ceil((viewportSize.height - camera.y) / camera.zoom) + PIXEL_FETCH_MARGIN,
+        Math.ceil((viewportSize.height - fetchCamera.y) / fetchCamera.zoom) + PIXEL_FETCH_MARGIN,
       ),
     };
   }, [
@@ -2149,34 +3879,39 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     activeWorldBounds.maxY,
     activeWorldBounds.minX,
     activeWorldBounds.minY,
-    camera.x,
-    camera.y,
-    camera.zoom,
+    fetchCamera.x,
+    fetchCamera.y,
+    fetchCamera.zoom,
     gridVisible,
     viewportSize.height,
     viewportSize.width,
   ]);
 
   const claimOutlineFetchBounds = useMemo(() => {
-    if (renderedWorldTiles.length === 0 || renderedWorldTiles[0]?.detailScale !== 1) {
+    if (
+      fetchWorldTileDetailScale !== 1 ||
+      viewportSize.width === 0 ||
+      viewportSize.height === 0
+    ) {
       return null;
     }
 
-    const minTileX = Math.min(...renderedWorldTiles.map((tile) => tile.tileX));
-    const maxTileX = Math.max(...renderedWorldTiles.map((tile) => tile.tileX));
-    const minTileY = Math.min(...renderedWorldTiles.map((tile) => tile.tileY));
-    const maxTileY = Math.max(...renderedWorldTiles.map((tile) => tile.tileY));
-
     return {
-      minX: Math.max(activeWorldBounds.minX, minTileX * WORLD_TILE_SIZE - CLAIM_OUTLINE_FETCH_MARGIN),
+      minX: Math.max(
+        activeWorldBounds.minX,
+        Math.floor(-fetchCamera.x / fetchCamera.zoom) - CLAIM_OUTLINE_FETCH_MARGIN,
+      ),
       maxX: Math.min(
         activeWorldBounds.maxX - 1,
-        (maxTileX + 1) * WORLD_TILE_SIZE - 1 + CLAIM_OUTLINE_FETCH_MARGIN,
+        Math.ceil((viewportSize.width - fetchCamera.x) / fetchCamera.zoom) + CLAIM_OUTLINE_FETCH_MARGIN,
       ),
-      minY: Math.max(activeWorldBounds.minY, minTileY * WORLD_TILE_SIZE - CLAIM_OUTLINE_FETCH_MARGIN),
+      minY: Math.max(
+        activeWorldBounds.minY,
+        Math.floor(-fetchCamera.y / fetchCamera.zoom) - CLAIM_OUTLINE_FETCH_MARGIN,
+      ),
       maxY: Math.min(
         activeWorldBounds.maxY - 1,
-        (maxTileY + 1) * WORLD_TILE_SIZE - 1 + CLAIM_OUTLINE_FETCH_MARGIN,
+        Math.ceil((viewportSize.height - fetchCamera.y) / fetchCamera.zoom) + CLAIM_OUTLINE_FETCH_MARGIN,
       ),
     };
   }, [
@@ -2184,7 +3919,69 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     activeWorldBounds.maxY,
     activeWorldBounds.minX,
     activeWorldBounds.minY,
-    renderedWorldTiles,
+    fetchCamera.x,
+    fetchCamera.y,
+    fetchCamera.zoom,
+    fetchWorldTileDetailScale,
+    viewportSize.height,
+    viewportSize.width,
+  ]);
+
+  const visibleAreaPrefetchBounds = useMemo<VisibleAreaBounds | null>(() => {
+    if (
+      !semanticZoomMode ||
+      viewportSize.width === 0 ||
+      viewportSize.height === 0 ||
+      fetchWorldTileDetailScale !== 1
+    ) {
+      return null;
+    }
+
+    const overscanWorldX = Math.ceil(
+      (viewportSize.width / Math.max(fetchCamera.zoom, ABSOLUTE_MIN_ZOOM)) *
+        VISIBLE_AREA_PREFETCH_OVERSCAN_VIEWPORT_FACTOR,
+    );
+    const overscanWorldY = Math.ceil(
+      (viewportSize.height / Math.max(fetchCamera.zoom, ABSOLUTE_MIN_ZOOM)) *
+        VISIBLE_AREA_PREFETCH_OVERSCAN_VIEWPORT_FACTOR,
+    );
+    const minX = Math.max(
+      activeWorldBounds.minX,
+      snapVisibleAreaMin(Math.floor(-fetchCamera.x / fetchCamera.zoom) - overscanWorldX),
+    );
+    const maxX = Math.min(
+      activeWorldBounds.maxX - 1,
+      snapVisibleAreaMax(Math.ceil((viewportSize.width - fetchCamera.x) / fetchCamera.zoom) + overscanWorldX),
+    );
+    const minY = Math.max(
+      activeWorldBounds.minY,
+      snapVisibleAreaMin(Math.floor(-fetchCamera.y / fetchCamera.zoom) - overscanWorldY),
+    );
+    const maxY = Math.min(
+      activeWorldBounds.maxY - 1,
+      snapVisibleAreaMax(Math.ceil((viewportSize.height - fetchCamera.y) / fetchCamera.zoom) + overscanWorldY),
+    );
+
+    return {
+      minX,
+      maxX,
+      minY,
+      maxY,
+      key: `${minX}:${minY}:${maxX}:${maxY}:${currentUser?.id ?? "guest"}`,
+    };
+  }, [
+    activeWorldBounds.maxX,
+    activeWorldBounds.maxY,
+    activeWorldBounds.minX,
+    activeWorldBounds.minY,
+    currentUser?.id,
+    fetchCamera.x,
+    fetchCamera.y,
+    fetchCamera.zoom,
+    fetchWorldTileDetailScale,
+    semanticZoomMode,
+    viewportSize.height,
+    viewportSize.width,
   ]);
 
   const refreshVisiblePixelWindow = useCallback(async (): Promise<void> => {
@@ -2192,47 +3989,120 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return;
     }
 
+    pixelFetchAbortRef.current?.abort();
+    const abortController = new AbortController();
+    pixelFetchAbortRef.current = abortController;
+    const startedAt = performance.now();
     markPerfEvent("pixel fetch start");
+    emitDebugEvent(
+      "network",
+      "Pixel window fetch start",
+      `${pixelFetchBounds.minX}:${pixelFetchBounds.minY} -> ${pixelFetchBounds.maxX}:${pixelFetchBounds.maxY}`,
+    );
     const result = await fetchVisibleWorldPixels(
       pixelFetchBounds.minX,
       pixelFetchBounds.maxX,
       pixelFetchBounds.minY,
       pixelFetchBounds.maxY,
+      abortController.signal,
     );
 
-    visiblePixelsRef.current = result.pixels;
-    pixelIndexRef.current = new Map(result.pixels.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
-    setVisiblePixels(result.pixels);
+    if (abortController.signal.aborted) {
+      return;
+    }
+
+    if (pixelFetchAbortRef.current === abortController) {
+      pixelFetchAbortRef.current = null;
+    }
+
+    measureDebugWork("Apply pixel window", () => {
+      if (areWorldPixelsEqual(visiblePixelsRef.current, result.pixels)) {
+        return false;
+      }
+
+      visiblePixelsRef.current = result.pixels;
+      pixelIndexRef.current = new Map(result.pixels.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
+      syncSelectedPlacementStateRef.current(selectedPixelSnapshotRef.current);
+      syncInspectedPixelRecordRef.current();
+      return true;
+    }, (applied) => `${result.pixels.length} pixels${applied ? "" : " unchanged"}`);
     markPerfEvent("pixel fetch done", `${result.pixels.length} pixels`);
+    emitDebugEvent(
+      "network",
+      "Pixel window fetch done",
+      `${result.pixels.length} pixels`,
+      performance.now() - startedAt,
+    );
   }, [pixelFetchBounds]);
 
   const refreshClaimOutlineNow = useCallback(async (): Promise<void> => {
     if (claimOutlineFetchBounds === null) {
-      setClaimOutlineSegments([]);
+      claimOutlineFetchAbortRef.current?.abort();
+      claimOutlineFetchAbortRef.current = null;
+      claimOutlineSegmentsRef.current = [];
+      setClaimOutlineSegments((current) => current.length === 0 ? current : []);
       return;
     }
 
+    claimOutlineFetchAbortRef.current?.abort();
+    const abortController = new AbortController();
+    claimOutlineFetchAbortRef.current = abortController;
+    const startedAt = performance.now();
+    markPerfEvent("claim outline fetch start");
+    emitDebugEvent(
+      "network",
+      "Claim outline fetch start",
+      `${claimOutlineFetchBounds.minX}:${claimOutlineFetchBounds.minY} -> ${claimOutlineFetchBounds.maxX}:${claimOutlineFetchBounds.maxY}`,
+    );
     const result = await fetchClaimOutlinePixels(
       claimOutlineFetchBounds.minX,
       claimOutlineFetchBounds.maxX,
       claimOutlineFetchBounds.minY,
       claimOutlineFetchBounds.maxY,
+      abortController.signal,
     );
-    setClaimOutlineSegments(result.segments);
+
+    if (abortController.signal.aborted) {
+      return;
+    }
+
+    if (claimOutlineFetchAbortRef.current === abortController) {
+      claimOutlineFetchAbortRef.current = null;
+    }
+
+    measureDebugWork("Apply claim outline segments", () => {
+      if (areClaimOutlineSegmentsEqual(claimOutlineSegmentsRef.current, result.segments)) {
+        return false;
+      }
+
+      claimOutlineSegmentsRef.current = result.segments;
+      setClaimOutlineSegments(result.segments);
+      return true;
+    }, (applied) => `${result.segments.length} segments${applied ? "" : " unchanged"}`);
+    markPerfEvent("claim outline fetch done", `${result.segments.length} segments`);
+    emitDebugEvent(
+      "network",
+      "Claim outline fetch done",
+      `${result.segments.length} segments`,
+      performance.now() - startedAt,
+    );
   }, [claimOutlineFetchBounds]);
 
   useEffect(() => {
     if (pixelFetchBounds === null) {
+      pixelFetchAbortRef.current?.abort();
+      pixelFetchAbortRef.current = null;
       return;
     }
 
     let cancelled = false;
+    const fetchGeneration = cameraFetchGenerationRef.current;
     markPerfEvent(
       "pixel fetch scheduled",
       `${pixelFetchBounds.minX}:${pixelFetchBounds.minY} -> ${pixelFetchBounds.maxX}:${pixelFetchBounds.maxY}`,
     );
     const fetchTimeout = window.setTimeout(async () => {
-      if (!cancelled) {
+      if (!cancelled && fetchGeneration === cameraFetchGenerationRef.current) {
         await refreshVisiblePixelWindow();
       }
     }, PIXEL_FETCH_DEBOUNCE_MS);
@@ -2240,51 +4110,63 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return () => {
       cancelled = true;
       window.clearTimeout(fetchTimeout);
+      pixelFetchAbortRef.current?.abort();
+      pixelFetchAbortRef.current = null;
     };
   }, [pixelFetchBounds, refreshVisiblePixelWindow]);
 
   useEffect(() => {
     if (claimOutlineFetchBounds === null) {
-      setClaimOutlineSegments([]);
+      claimOutlineFetchAbortRef.current?.abort();
+      claimOutlineFetchAbortRef.current = null;
+      claimOutlineSegmentsRef.current = [];
+      setClaimOutlineSegments((current) => current.length === 0 ? current : []);
       return;
     }
 
     let cancelled = false;
+    const fetchGeneration = cameraFetchGenerationRef.current;
     markPerfEvent(
       "claim outline fetch scheduled",
       `${claimOutlineFetchBounds.minX}:${claimOutlineFetchBounds.minY} -> ${claimOutlineFetchBounds.maxX}:${claimOutlineFetchBounds.maxY}`,
     );
     const fetchTimeout = window.setTimeout(async () => {
-      markPerfEvent("claim outline fetch start");
-      const result = await fetchClaimOutlinePixels(
-        claimOutlineFetchBounds.minX,
-        claimOutlineFetchBounds.maxX,
-        claimOutlineFetchBounds.minY,
-        claimOutlineFetchBounds.maxY,
-      );
-
-      if (!cancelled) {
-        setClaimOutlineSegments(result.segments);
-        markPerfEvent("claim outline fetch done", `${result.segments.length} segments`);
+      if (!cancelled && fetchGeneration === cameraFetchGenerationRef.current) {
+        await refreshClaimOutlineNow();
       }
     }, CLAIM_OUTLINE_FETCH_DEBOUNCE_MS);
 
     return () => {
       cancelled = true;
       window.clearTimeout(fetchTimeout);
+      claimOutlineFetchAbortRef.current?.abort();
+      claimOutlineFetchAbortRef.current = null;
     };
-  }, [claimOutlineFetchBounds]);
+  }, [claimOutlineFetchBounds, refreshClaimOutlineNow]);
 
-  const pixelIndex = useMemo(() => {
-    return new Map(visiblePixels.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
-  }, [visiblePixels]);
+  useEffect(() => {
+    return () => {
+      pixelFetchAbortRef.current?.abort();
+      claimOutlineFetchAbortRef.current?.abort();
+    };
+  }, []);
+
   const pendingClaimPixelMap = useMemo(
-    () => buildPendingClaimPixelMap(pendingClaimPixels),
+    () => measureDebugWork(
+      "Build pending claim index",
+      () => buildPendingClaimPixelMap(pendingClaimPixels),
+      `${pendingClaimPixels.length} pixels`,
+    ),
     [pendingClaimPixels],
   );
-  const pendingPaintMap = useMemo(() => buildPendingPaintMap(pendingPaints), [pendingPaints]);
-  visiblePixelsRef.current = visiblePixels;
-  pixelIndexRef.current = pixelIndex;
+  const pendingPaintMap = useMemo(
+    () => measureDebugWork(
+      "Build pending paint index",
+      () => buildPendingPaintMap(pendingPaints),
+      `${pendingPaints.length} pixels`,
+    ),
+    [pendingPaints],
+  );
   pendingClaimPixelsRef.current = pendingClaimPixels;
   pendingClaimPixelMapRef.current = pendingClaimPixelMap;
   pendingClaimRectanglesRef.current = pendingClaimRectangles;
@@ -2296,7 +4178,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     nextRectangles: PendingClaimRectangle[],
   ): void => {
     pendingClaimPixelsRef.current = nextPixels;
-    pendingClaimPixelMapRef.current = buildPendingClaimPixelMap(nextPixels);
+    pendingClaimPixelMapRef.current = measureDebugWork(
+      "Sync pending claim index",
+      () => buildPendingClaimPixelMap(nextPixels),
+      `${nextPixels.length} pixels, ${nextRectangles.length} rectangles`,
+    );
     pendingClaimRectanglesRef.current = nextRectangles;
     setPendingClaimPixels(nextPixels);
     setPendingClaimRectangles(nextRectangles);
@@ -2304,19 +4190,172 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   const syncPendingPaints = useCallback((nextPaints: PendingPaint[]): void => {
     pendingPaintsRef.current = nextPaints;
-    pendingPaintMapRef.current = buildPendingPaintMap(nextPaints);
+    pendingPaintMapRef.current = measureDebugWork(
+      "Sync pending paint index",
+      () => buildPendingPaintMap(nextPaints),
+      `${nextPaints.length} pixels`,
+    );
     setPendingPaints(nextPaints);
   }, []);
 
+  const cacheClaimAreaPreview = useCallback((area: ClaimAreaPreview): ClaimAreaRecord => {
+    const cachedDetail = claimAreaDetailCacheRef.current.get(area.id) ?? null;
+    const nextArea: ClaimAreaRecord = cachedDetail
+      ? {
+        ...cachedDetail,
+        ...area,
+        contributors: cachedDetail.contributors,
+      }
+      : area;
+    const cache = claimAreaCacheRef.current;
+    cache.delete(area.id);
+    cache.set(area.id, nextArea);
+
+    if (cache.size > CLAIM_AREA_CACHE_LIMIT) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey) {
+        cache.delete(oldestKey);
+      }
+    }
+
+    if (nextArea.viewer_can_paint) {
+      knownPaintableAreaIdsRef.current.add(nextArea.id);
+    } else {
+      knownPaintableAreaIdsRef.current.delete(nextArea.id);
+    }
+
+    return nextArea;
+  }, []);
+
+  const cacheClaimAreaSummary = useCallback((area: ClaimAreaSummary): ClaimAreaSummary => {
+    claimAreaDetailCacheRef.current.set(area.id, area);
+    return cacheClaimAreaPreview(area) as ClaimAreaSummary;
+  }, [cacheClaimAreaPreview]);
+
+  const getCachedClaimArea = useCallback((areaId: string): ClaimAreaRecord | null => {
+    return claimAreaDetailCacheRef.current.get(areaId) ?? claimAreaCacheRef.current.get(areaId) ?? null;
+  }, []);
+
+  const handleTileLoaded = useCallback((layer: DebugTileLayer, tileKey: string, nextSrc: string): void => {
+    retainedTileSrcRef.current[layer].set(tileKey, nextSrc);
+  }, []);
+
+  const handleTileDebugSignal = useCallback((signal: DebugTileSignal): void => {
+    const tileStateMap = debugTileStatesRef.current[signal.layer];
+    const existingState = tileStateMap.get(signal.tileKey) ?? null;
+    const nextState: DebugTileState = {
+      loaded: signal.phase === "load" || (
+        signal.phase === "src" &&
+        existingState?.loaded === true &&
+        existingState.src === signal.src
+      ),
+      failed: signal.phase === "error",
+      detailScale: signal.detailScale,
+      hasFallback: signal.hasFallback,
+      src: signal.src,
+      updatedAt: performance.now(),
+    };
+
+    tileStateMap.set(signal.tileKey, nextState);
+
+    if (signal.phase === "src") {
+      emitDebugEvent(
+        "tile",
+        `${signal.layer} tile request`,
+        `${signal.tileKey} (${signal.detailScale === 1 ? "detail" : `low x${signal.detailScale}`})${signal.hasFallback ? " with fallback" : ""}`,
+      );
+      return;
+    }
+
+    emitDebugEvent(
+      signal.phase === "load" ? "tile" : "warning",
+      signal.phase === "load" ? `${signal.layer} tile loaded` : `${signal.layer} tile failed`,
+      `${signal.tileKey}${signal.duration ? ` in ${formatPerfTime(signal.duration)}` : ""}`,
+      signal.duration,
+    );
+  }, []);
+
+  const buildDebugTileLayerSnapshot = useCallback((layer: DebugTileLayer): DebugTileLayerSnapshot => {
+    const activeTiles = debugActiveTilesRef.current[layer];
+    const tileStateMap = debugTileStatesRef.current[layer];
+    let loaded = 0;
+    let failed = 0;
+    let fallbackVisible = 0;
+
+    for (const [tileKey, meta] of activeTiles) {
+      const state = tileStateMap.get(tileKey);
+
+      if (state?.failed) {
+        failed += 1;
+      }
+
+      if (state?.loaded) {
+        loaded += 1;
+      } else if (state?.hasFallback ?? meta.hasFallback) {
+        fallbackVisible += 1;
+      }
+    }
+
+    return {
+      active: activeTiles.size,
+      loaded,
+      loading: Math.max(0, activeTiles.size - loaded - failed),
+      failed,
+      fallbackVisible,
+    };
+  }, []);
+
+  const getDebugWorldSnapshot = useCallback((): DebugWorldSnapshot => {
+    const selectedPixelSnapshot = selectedPixelSnapshotRef.current;
+    const inspectedPixelSnapshot = inspectedPixelSnapshotRef.current;
+    const primaryRenderedTile = renderedWorldTilesRef.current[0] ?? null;
+
+    return {
+      zoom: zoomRef.current,
+      cameraX: cameraRef.current.x,
+      cameraY: cameraRef.current.y,
+      layerMode: semanticZoomModeRef.current ? "semantic" : "visual",
+      tileDetailScale: primaryRenderedTile?.detailScale ?? null,
+      renderedTiles: renderedWorldTilesRef.current.length,
+      visiblePixels: visiblePixelsRef.current.length,
+      claimOutlineSegments: claimOutlineSegmentsRef.current.length,
+      pendingClaims: getPendingClaimCount(
+        pendingClaimPixelsRef.current,
+        pendingClaimRectanglesRef.current,
+      ),
+      pendingPaints: pendingPaintsRef.current.length,
+      selectedPixel: selectedPixelSnapshot ? getPixelKey(selectedPixelSnapshot) : null,
+      inspectedPixel: inspectedPixelSnapshot ? getPixelKey(inspectedPixelSnapshot) : null,
+      selectedAreaId: selectedAreaSnapshotRef.current?.id ?? null,
+      buildPanelOpen: buildPanelOpenRef.current,
+      areaPanelBusy: areaPanelBusyRef.current,
+      areaDetailsBusy: areaDetailsBusyRef.current,
+      visual: buildDebugTileLayerSnapshot("visual"),
+      claims: buildDebugTileLayerSnapshot("claims"),
+      paint: buildDebugTileLayerSnapshot("paint"),
+    };
+  }, [buildDebugTileLayerSnapshot]);
+
   const markWorldTilesDirty = useCallback((
-    layer: "claims" | "paint",
+    layer: "visual" | "claims" | "paint",
     tiles: Array<{ tile_x: number; tile_y: number }>,
   ): void => {
     if (tiles.length === 0) {
       return;
     }
 
-    const setRevisions = layer === "claims" ? setClaimTileRevisions : setPaintTileRevisions;
+    emitDebugEvent(
+      "action",
+      `${layer} tile revisions bumped`,
+      `${tiles.length} dirty tile coordinate${tiles.length === 1 ? "" : "s"}`,
+    );
+
+    const setRevisions =
+      layer === "visual"
+        ? setVisualTileRevisions
+        : layer === "claims"
+          ? setClaimTileRevisions
+          : setPaintTileRevisions;
     setRevisions((current) => {
       const next = { ...current };
       const dirtyKeys = new Set<string>();
@@ -2338,6 +4377,123 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     });
   }, []);
 
+  const syncVisibleAreaPreviewWindow = useCallback((
+    areas: ClaimAreaPreview[],
+  ): void => {
+    const nextAreaMap = new Map<string, ClaimAreaRecord>();
+
+    for (const area of areas) {
+      const cachedArea = cacheClaimAreaPreview(area);
+      nextAreaMap.set(cachedArea.id, cachedArea);
+    }
+
+    const currentSelectedArea = selectedAreaSnapshotRef.current;
+
+    if (currentSelectedArea !== null) {
+      const nextSelectedArea = nextAreaMap.get(currentSelectedArea.id) ?? null;
+
+      if (
+        nextSelectedArea !== null &&
+        buildAreaSelectionSignature(nextSelectedArea) !== buildAreaSelectionSignature(currentSelectedArea)
+      ) {
+        applyAreaSelection(nextSelectedArea, { syncDrafts: false });
+      }
+    }
+  }, [
+    applyAreaSelection,
+    cacheClaimAreaPreview,
+  ]);
+
+  const fetchVisibleAreaPreviewWindow = useCallback(async (
+    bounds: VisibleAreaBounds,
+    triggerLiveRefresh: boolean,
+  ): Promise<void> => {
+    const startedAt = performance.now();
+    const existingRequestKey = visibleAreaFetchKeyRef.current;
+    const cacheHit = visibleAreaLastSuccessRef.current;
+    const requestKey = `${triggerLiveRefresh ? "poll" : "prefetch"}:${bounds.key}`;
+
+    if (existingRequestKey === requestKey) {
+      return;
+    }
+
+    if (
+      !triggerLiveRefresh &&
+      cacheHit !== null &&
+      cacheHit.key === bounds.key &&
+      startedAt - cacheHit.at < VISIBLE_AREA_PREFETCH_CACHE_MS
+    ) {
+      return;
+    }
+
+    visibleAreaFetchAbortRef.current?.abort();
+    const abortController = new AbortController();
+    visibleAreaFetchAbortRef.current = abortController;
+    visibleAreaFetchKeyRef.current = requestKey;
+    markPerfEvent(
+      triggerLiveRefresh ? "visible area poll start" : "visible area prefetch start",
+      bounds.key,
+    );
+    emitDebugEvent(
+      "network",
+      triggerLiveRefresh ? "Visible area poll start" : "Visible area prefetch start",
+      bounds.key,
+    );
+
+    const result = await fetchVisibleClaimAreaPreviews(
+      bounds.minX,
+      bounds.maxX,
+      bounds.minY,
+      bounds.maxY,
+      abortController.signal,
+    );
+
+    if (abortController.signal.aborted) {
+      if (visibleAreaFetchKeyRef.current === requestKey) {
+        visibleAreaFetchKeyRef.current = null;
+      }
+      return;
+    }
+
+    visibleAreaFetchAbortRef.current = null;
+    if (visibleAreaFetchKeyRef.current === requestKey) {
+      visibleAreaFetchKeyRef.current = null;
+    }
+
+    if (!result.ok) {
+      if (result.error !== "Visible area preview request aborted.") {
+        markPerfEvent("visible area prefetch failed", result.error ?? bounds.key);
+        emitDebugEvent(
+          "warning",
+          "Visible area request failed",
+          result.error ?? bounds.key,
+          performance.now() - startedAt,
+        );
+      }
+      return;
+    }
+
+    measureDebugWork(
+      "Apply visible area previews",
+      () => syncVisibleAreaPreviewWindow(result.window.areas),
+      `${result.window.areas.length} areas`,
+    );
+    visibleAreaLastSuccessRef.current = {
+      key: bounds.key,
+      at: performance.now(),
+    };
+    markPerfEvent(
+      triggerLiveRefresh ? "visible area poll done" : "visible area prefetch done",
+      `${bounds.key} -> ${result.window.areas.length}`,
+    );
+    emitDebugEvent(
+      "network",
+      triggerLiveRefresh ? "Visible area poll done" : "Visible area prefetch done",
+      `${result.window.areas.length} areas`,
+      performance.now() - startedAt,
+    );
+  }, [syncVisibleAreaPreviewWindow]);
+
   const getPlacementState = useCallback((pixel: PixelCoordinate | null): PlacementState => {
     if (pixel === null) {
       return {
@@ -2356,7 +4512,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     const pendingClaimPixelMap = pendingClaimPixelMapRef.current;
     const pendingClaimRectangles = pendingClaimRectanglesRef.current;
     const pendingPaintsMap = pendingPaintMapRef.current;
-    const zoom = zoomRef.current;
     const nextUser = currentUserRef.current;
     const pixelKey = getPixelKey(pixel);
 
@@ -2388,7 +4543,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     if (
       nextUser === null ||
-      zoom < GRID_THRESHOLD ||
+      !semanticZoomModeRef.current ||
       !isInsideWorld
     ) {
       return {
@@ -2440,10 +4595,48 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     };
   }, []);
 
-  const selectedPlacementState = getPlacementState(selectedPixel);
+  const syncSelectedPlacementState = useCallback((pixel: PixelCoordinate | null): void => {
+    const nextState = getPlacementState(pixel);
+
+    setSelectedPlacementState((current) => (
+      arePlacementStatesEqual(current, nextState) ? current : nextState
+    ));
+  }, [getPlacementState]);
+
+  const syncInspectedPixelRecord = useCallback((): void => {
+    const inspectedPixelValue = inspectedPixelSnapshotRef.current;
+    const nextPixelRecord = inspectedPixelValue === null
+      ? null
+      : pixelIndexRef.current.get(getPixelKey(inspectedPixelValue)) ?? null;
+
+    setInspectedPixelRecord((current) => (
+      areWorldPixelRecordsEqual(current, nextPixelRecord) ? current : nextPixelRecord
+    ));
+  }, []);
+
+  syncSelectedPlacementStateRef.current = syncSelectedPlacementState;
+  syncInspectedPixelRecordRef.current = syncInspectedPixelRecord;
+
+  useEffect(() => {
+    syncSelectedPlacementState(selectedPixel);
+  }, [
+    activeChunks,
+    activeWorldBounds.maxX,
+    activeWorldBounds.maxY,
+    activeWorldBounds.minX,
+    activeWorldBounds.minY,
+    pendingClaimPixels,
+    pendingClaimRectangles,
+    pendingPaints,
+    selectedPixel,
+    semanticZoomMode,
+    syncSelectedPlacementState,
+    currentUser?.id,
+  ]);
 
   const selectedPixelRecord = selectedPlacementState.pixelRecord;
   const selectedPendingPaint = selectedPlacementState.pendingPaint;
+  const canFetchSelectedPixelRecord = semanticZoomMode;
 
   useEffect(() => {
     if (selectedPendingPaint) {
@@ -2457,63 +4650,271 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }, [selectedPendingPaint, selectedPixelRecord]);
 
   useEffect(() => {
-    const areaId = selectedPixelRecord?.area_id ?? null;
+    if (selectedArea !== null) {
+      if (isClaimAreaSummary(selectedArea)) {
+        cacheClaimAreaSummary(selectedArea);
+      } else {
+        cacheClaimAreaPreview(selectedArea);
+      }
+    }
+  }, [cacheClaimAreaPreview, cacheClaimAreaSummary, selectedArea]);
 
-    if (areaId === null) {
-      setSelectedArea(null);
-      setAreaPanelBusy(false);
-      setAreaMessage(null);
+  useEffect(() => {
+    return () => {
+      areaInspectionAbortRef.current?.abort();
+      areaDetailsAbortRef.current?.abort();
+      visibleAreaFetchAbortRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (visibleAreaPrefetchBounds === null) {
       return;
     }
 
     let cancelled = false;
-    setAreaPanelBusy(true);
-    setAreaMessage(null);
+    const bounds = visibleAreaPrefetchBounds;
+    const fetchGeneration = cameraFetchGenerationRef.current;
+    const fetchTimeout = window.setTimeout(() => {
+      if (!cancelled && fetchGeneration === cameraFetchGenerationRef.current) {
+        void fetchVisibleAreaPreviewWindow(bounds, false);
+      }
+    }, VISIBLE_AREA_PREFETCH_DEBOUNCE_MS);
 
-    void fetchClaimArea(areaId).then((result) => {
-      if (cancelled) {
+    return () => {
+      cancelled = true;
+      window.clearTimeout(fetchTimeout);
+    };
+  }, [fetchVisibleAreaPreviewWindow, visibleAreaPrefetchBounds]);
+
+  useEffect(() => {
+    if (visibleAreaPrefetchBounds === null) {
+      return;
+    }
+
+    const bounds = visibleAreaPrefetchBounds;
+    const fetchGeneration = cameraFetchGenerationRef.current;
+    const pollVisibleAreas = (): void => {
+      if (!document.hidden && fetchGeneration === cameraFetchGenerationRef.current) {
+        void fetchVisibleAreaPreviewWindow(bounds, true);
+      }
+    };
+
+    const intervalId = window.setInterval(pollVisibleAreas, VISIBLE_AREA_POLL_INTERVAL_MS);
+    const handleVisibilityChange = (): void => {
+      if (!document.hidden && fetchGeneration === cameraFetchGenerationRef.current) {
+        void fetchVisibleAreaPreviewWindow(bounds, true);
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [fetchVisibleAreaPreviewWindow, visibleAreaPrefetchBounds]);
+
+  useEffect(() => {
+    if (selectedArea === null || !selectedArea.viewer_can_edit || isClaimAreaSummary(selectedArea)) {
+      areaDetailsAbortRef.current?.abort();
+      areaDetailsAbortRef.current = null;
+      setAreaDetailsBusy(false);
+      return;
+    }
+
+    const cachedArea = claimAreaDetailCacheRef.current.get(selectedArea.id) ?? null;
+
+    if (cachedArea !== null) {
+      applyAreaSelection(cachedArea, { syncDrafts: false });
+      setAreaDetailsBusy(false);
+      return;
+    }
+
+    const abortController = new AbortController();
+    areaDetailsAbortRef.current?.abort();
+    areaDetailsAbortRef.current = abortController;
+    setAreaDetailsBusy(true);
+    markPerfEvent("area detail hydrate start", selectedArea.id);
+
+    void fetchClaimArea(selectedArea.id, abortController.signal).then((result) => {
+      if (abortController.signal.aborted) {
         return;
       }
 
-      setAreaPanelBusy(false);
+      areaDetailsAbortRef.current = null;
+      setAreaDetailsBusy(false);
 
       if (!result.ok || result.area === null) {
-        setSelectedArea(null);
-        setAreaMessage({
+        if (result.error === "Area request aborted.") {
+          return;
+        }
+
+        setAreaMessage((currentMessage) => currentMessage ?? {
           tone: "error",
           text: result.error ?? "Area details could not be loaded.",
         });
         return;
       }
 
-      setSelectedArea(result.area);
-      setAreaDraftName(result.area.name);
-      setAreaDraftDescription(result.area.description);
-      setAreaInvitePublicId("");
+      const cachedSummary = cacheClaimAreaSummary(result.area);
 
-      if (result.area.viewer_can_paint) {
-        knownPaintableAreaIdsRef.current.add(result.area.id);
+      if (selectedArea.id === cachedSummary.id) {
+        applyAreaSelection(cachedSummary, { syncDrafts: false });
       }
+
+      markPerfEvent("area detail hydrate done", cachedSummary.id);
     });
 
     return () => {
-      cancelled = true;
+      abortController.abort();
     };
-  }, [selectedPixelRecord?.area_id]);
+  }, [
+    applyAreaSelection,
+    cacheClaimAreaSummary,
+    selectedArea,
+  ]);
+
+  useEffect(() => {
+    if (selectedPixel === null || !canFetchSelectedPixelRecord || selectedPixelRecord !== null) {
+      return;
+    }
+
+    const isInsideWorld = activeChunks.length === 0
+      ? selectedPixel.x >= activeWorldBounds.minX &&
+        selectedPixel.x < activeWorldBounds.maxX &&
+        selectedPixel.y >= activeWorldBounds.minY &&
+        selectedPixel.y < activeWorldBounds.maxY
+      : activeChunks.some((chunk) => (
+        selectedPixel.x >= chunk.origin_x &&
+        selectedPixel.x < chunk.origin_x + chunk.width &&
+        selectedPixel.y >= chunk.origin_y &&
+        selectedPixel.y < chunk.origin_y + chunk.height
+      ));
+
+    if (!isInsideWorld) {
+      return;
+    }
+
+    let cancelled = false;
+    const pixelKey = getPixelKey(selectedPixel);
+    const now = performance.now();
+
+    for (const [missedPixelKey, missedAt] of selectedPixelFetchMissesRef.current.entries()) {
+      if (now - missedAt >= SELECTED_PIXEL_FETCH_MISS_COOLDOWN_MS) {
+        selectedPixelFetchMissesRef.current.delete(missedPixelKey);
+      }
+    }
+
+    const missedAt = selectedPixelFetchMissesRef.current.get(pixelKey);
+
+    if (
+      selectedPixelFetchKeyRef.current === pixelKey ||
+      (missedAt !== undefined &&
+        performance.now() - missedAt < SELECTED_PIXEL_FETCH_MISS_COOLDOWN_MS)
+    ) {
+      return;
+    }
+
+    selectedPixelFetchKeyRef.current = pixelKey;
+    const timeoutId = window.setTimeout(() => {
+      if (cancelled) {
+        return;
+      }
+
+      markPerfEvent("selected pixel fetch start", pixelKey);
+
+      void fetchVisibleWorldPixels(
+        selectedPixel.x,
+        selectedPixel.x,
+        selectedPixel.y,
+        selectedPixel.y,
+      ).then((result) => {
+        if (selectedPixelFetchKeyRef.current === pixelKey) {
+          selectedPixelFetchKeyRef.current = null;
+        }
+
+        if (cancelled) {
+          return;
+        }
+
+        if (result.pixels.length === 0) {
+          selectedPixelFetchMissesRef.current.set(pixelKey, performance.now());
+          markPerfEvent("selected pixel fetch empty", pixelKey);
+          return;
+        }
+
+        selectedPixelFetchMissesRef.current.delete(pixelKey);
+        markPerfEvent("selected pixel fetch done", pixelKey);
+        measureDebugWork("Apply selected pixel fetch", () => {
+          const next = [...visiblePixelsRef.current];
+          const index = new Map(next.map((pixel, currentIndex) => [getPixelKey(pixel), currentIndex]));
+
+          for (const pixel of result.pixels) {
+            const pixelKeyValue = getPixelKey(pixel);
+            const existingIndex = index.get(pixelKeyValue);
+
+            if (existingIndex === undefined) {
+              index.set(pixelKeyValue, next.length);
+              next.push(pixel);
+            } else {
+              next[existingIndex] = pixel;
+            }
+          }
+
+          visiblePixelsRef.current = next;
+          pixelIndexRef.current = new Map(next.map((pixel) => [getPixelKey(pixel), pixel]));
+          syncSelectedPlacementState(selectedPixelSnapshotRef.current);
+          syncInspectedPixelRecord();
+        }, `${result.pixels.length} fetched, ${visiblePixelsRef.current.length} current`);
+      });
+    }, SELECTED_PIXEL_FETCH_DEBOUNCE_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+      if (selectedPixelFetchKeyRef.current === pixelKey) {
+        selectedPixelFetchKeyRef.current = null;
+      }
+    };
+  }, [
+    activeChunks,
+    activeWorldBounds.maxX,
+    activeWorldBounds.maxY,
+    activeWorldBounds.minX,
+    activeWorldBounds.minY,
+    canFetchSelectedPixelRecord,
+    selectedPixel,
+    selectedPixelRecord,
+    syncInspectedPixelRecord,
+    syncSelectedPlacementState,
+  ]);
 
   const renderedPendingClaims = useMemo(() => {
-    return buildPendingClaimSegments(pendingClaimPixels, pendingClaimRectangles, camera);
+    return measureDebugWork(
+      "Compute pending claim overlay",
+      () => buildPendingClaimSegments(pendingClaimPixels, pendingClaimRectangles, camera),
+      (segments) => `${segments.length} segments from ${pendingClaimPixels.length} pixels, ${pendingClaimRectangles.length} rectangles`,
+    );
   }, [camera, pendingClaimPixels, pendingClaimRectangles]);
 
   const claimOutlinePaths = useMemo(() => {
-    return buildClaimOutlinePaths(
-      claimOutlineSegments,
-      camera,
+    return measureDebugWork(
+      "Compute claim outline paths",
+      () => buildClaimOutlinePaths(
+        claimOutlineSegments,
+        camera,
+      ),
+      (paths) => `${paths.length} paths from ${claimOutlineSegments.length} segments`,
     );
   }, [camera, claimOutlineSegments]);
 
   const renderedPendingPaints = useMemo(() => {
-    return buildPendingPaintSegments(pendingPaints, camera);
+    return measureDebugWork(
+      "Compute pending paint overlay",
+      () => buildPendingPaintSegments(pendingPaints, camera),
+      (segments) => `${segments.length} segments from ${pendingPaints.length} pixels`,
+    );
   }, [camera, pendingPaints]);
 
   const selectedPixelOverlay = useMemo(() => {
@@ -2581,19 +4982,19 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return selectedPendingPaint ? "Pending paint change" : "Your claimed territory";
     }
 
-    if (selectedArea?.viewer_can_paint) {
+    if (selectedPixelRecord.viewer_relation === "contributor") {
       return "Contributor access";
     }
 
     return `Claimed by #${selectedPixelRecord.owner_public_id}`;
-  }, [currentUser, selectedArea?.viewer_can_paint, selectedPendingPaint, selectedPixel, selectedPixelRecord, selectedPlacementState.isPendingClaim]);
+  }, [currentUser, selectedPendingPaint, selectedPixel, selectedPixelRecord, selectedPlacementState.isPendingClaim]);
 
   const placementHelpText = useMemo(() => {
     if (currentUser === null) {
       return "Login required to use the build tools.";
     }
 
-    if (camera.zoom < GRID_THRESHOLD) {
+    if (!semanticZoomMode) {
       return "Zoom in until the pixel grid is visible before staging changes.";
     }
 
@@ -2642,12 +5043,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return "You can only paint inside territory you own or were invited into.";
   }, [
     activeBuildMode,
-    camera.zoom,
     canClaimSelectedPixel,
     canPaintSelectedPixel,
     claimTool,
     currentUser,
     rectangleAnchor,
+    semanticZoomMode,
     selectedPendingPaint,
     selectedPixel,
     selectedPixelRecord,
@@ -2706,8 +5107,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     targetPixel: PixelCoordinate,
     options?: { quiet?: boolean },
   ): boolean => {
-    setSelectedPixel(targetPixel);
-    setBuildPanelOpen(true);
+    setSelectedPixel((current) => (
+      current !== null && current.x === targetPixel.x && current.y === targetPixel.y
+        ? current
+        : targetPixel
+    ));
 
     const nextUser = currentUserRef.current;
     if (nextUser === null) {
@@ -2810,7 +5214,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   const stageClaimRectangle = useCallback((start: PixelCoordinate, end: PixelCoordinate): boolean => {
     setSelectedPixel(end);
-    setBuildPanelOpen(true);
 
     const nextUser = currentUserRef.current;
     if (nextUser === null) {
@@ -3048,6 +5451,79 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return screenToWorldPixel(event.clientX - rect.left, event.clientY - rect.top);
   }
 
+  function getMouseEventPixel(event: React.MouseEvent<HTMLDivElement>): PixelCoordinate {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return screenToWorldPixel(event.clientX - rect.left, event.clientY - rect.top);
+  }
+
+  function handleViewportContextMenu(event: React.MouseEvent<HTMLDivElement>): void {
+    event.preventDefault();
+    const targetPixel = getMouseEventPixel(event);
+    const pixelKey = getPixelKey(targetPixel);
+    const immediatePlacementState = getPlacementState(targetPixel);
+    const immediatePixelRecord = immediatePlacementState.pixelRecord;
+    const immediateAreaId = immediatePixelRecord?.is_starter ? null : immediatePixelRecord?.area_id ?? null;
+    const cachedArea = immediateAreaId === null
+      ? null
+      : getCachedClaimArea(immediateAreaId);
+
+    areaInspectionAbortRef.current?.abort();
+    setInspectedPixel(targetPixel);
+    setInspectedPixelRecord(immediatePixelRecord);
+    setAreaMessage(null);
+
+    if (cachedArea !== null) {
+      areaInspectionAbortRef.current = null;
+      applyAreaSelection(cachedArea);
+      setAreaPanelBusy(false);
+      markPerfEvent("area inspect cache hit", `${pixelKey} -> ${cachedArea.id}`);
+      return;
+    }
+
+    if (immediatePixelRecord?.is_starter || immediateAreaId === null) {
+      applyAreaSelection(null);
+    } else {
+      setSelectedArea(null);
+    }
+
+    const abortController = new AbortController();
+    areaInspectionAbortRef.current = abortController;
+    setAreaPanelBusy(true);
+    markPerfEvent("area inspect start", pixelKey);
+
+    void fetchClaimAreaAtPixel(targetPixel.x, targetPixel.y, abortController.signal).then((result) => {
+      if (abortController.signal.aborted) {
+        return;
+      }
+
+      areaInspectionAbortRef.current = null;
+      setAreaPanelBusy(false);
+
+      if (!result.ok || result.inspection === null) {
+        if (result.error === "Area inspection request aborted.") {
+          return;
+        }
+
+        setInspectedPixelRecord(null);
+        applyAreaSelection(null);
+        setAreaMessage({
+          tone: "error",
+          text: result.error ?? "Area details could not be loaded.",
+        });
+        return;
+      }
+
+      markPerfEvent("area inspect done", pixelKey);
+      setInspectedPixelRecord(result.inspection.pixel);
+
+      if (result.inspection.area !== null) {
+        cacheClaimAreaPreview(result.inspection.area);
+      }
+
+      applyAreaSelection(result.inspection.area);
+    });
+  }
+
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>): void {
     if (event.button !== 0) {
       return;
@@ -3061,12 +5537,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return;
     }
 
+    const originCamera = pendingCameraUpdateRef.current ?? cameraRef.current;
     dragState.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      originX: camera.x,
-      originY: camera.y,
+      originX: originCamera.x,
+      originY: originCamera.y,
       mode: "pan",
     };
 
@@ -3089,13 +5566,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     if (drag.mode === "pan") {
-      setCamera((current) =>
-        clampCamera({
-          ...current,
-          x: drag.originX + event.clientX - drag.startX,
-          y: drag.originY + event.clientY - drag.startY,
-        }),
-      );
+      const currentCamera = pendingCameraUpdateRef.current ?? cameraRef.current;
+      scheduleCameraUpdate(clampCamera({
+        ...currentCamera,
+        x: drag.originX + event.clientX - drag.startX,
+        y: drag.originY + event.clientY - drag.startY,
+      }));
       return;
     }
   }
@@ -3116,10 +5592,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) <= CLICK_DISTANCE) {
       const clickedPixel = getEventPixel(event);
       setSelectedPixel(clickedPixel);
-      setBuildPanelOpen(true);
       setPlacementMessage(null);
 
-      if (activeBuildModeRef.current === "claim" && claimToolRef.current === "rectangle") {
+      if (
+        buildPanelOpen &&
+        activeBuildModeRef.current === "claim" &&
+        claimToolRef.current === "rectangle"
+      ) {
         const anchor = rectangleAnchorRef.current;
 
         if (anchor === null) {
@@ -3264,7 +5743,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     visiblePixelsRef.current = nextPixels;
     pixelIndexRef.current = new Map(nextPixels.map((pixel) => [getPixelKey(pixel), pixel]));
-    setVisiblePixels(nextPixels);
+    syncSelectedPlacementState(selectedPixelSnapshotRef.current);
+    syncInspectedPixelRecord();
     currentUserRef.current = nextUser;
     setAuthStatus((current) => ({
       ...current,
@@ -3283,13 +5763,18 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         };
       });
     }
-  }, [selectedArea]);
+  }, [selectedArea, syncInspectedPixelRecord, syncSelectedPlacementState]);
 
   async function handlePlacementAction(): Promise<void> {
     if (currentUser === null || placementBusy || activePendingCount === 0) {
       return;
     }
 
+    emitDebugEvent(
+      "action",
+      "Placement submit requested",
+      `${activeBuildMode} with ${activePendingCount} pending item${activePendingCount === 1 ? "" : "s"}`,
+    );
     setPlacementBusy(true);
     setPlacementMessage(null);
 
@@ -3335,6 +5820,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     claimPixelsToSubmit: PixelCoordinate[],
     claimRectanglesToSubmit: PendingClaimRectangle[],
   ): Promise<number> {
+    const startedAt = performance.now();
+    const pendingClaimCount = getPendingClaimCount(claimPixelsToSubmit, claimRectanglesToSubmit);
+    emitDebugEvent(
+      "network",
+      "Claim submit start",
+      `${pendingClaimCount} claim pixel${pendingClaimCount === 1 ? "" : "s"}`,
+    );
     const result = await claimWorldPixels({
       pixels: claimPixelsToSubmit,
       rectangles: claimRectanglesToSubmit.map((rectangle) => ({
@@ -3350,6 +5842,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         tone: "error",
         text: result.error ?? "Claim submission failed. Pending claims stayed local.",
       });
+      emitDebugEvent(
+        "warning",
+        "Claim submit failed",
+        result.error ?? "Unknown claim submit failure",
+        performance.now() - startedAt,
+      );
       return 0;
     }
 
@@ -3357,19 +5855,31 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       ...current,
       user: result.user,
     }));
+    markWorldTilesDirty("visual", result.claim_tiles);
     markWorldTilesDirty("claims", result.claim_tiles);
     await refreshVisiblePixelWindow();
     await refreshClaimOutlineNow();
 
-    setSelectedArea(result.area);
-    setAreaDraftName(result.area.name);
-    setAreaDraftDescription(result.area.description);
-    knownPaintableAreaIdsRef.current.add(result.area.id);
+    applyAreaSelection(cacheClaimAreaSummary(result.area));
+    emitDebugEvent("network", "World overview refresh start", "after claim submit");
     setWorld(await fetchWorldOverview());
+    emitDebugEvent("network", "World overview refresh done", "after claim submit");
+    emitDebugEvent(
+      "network",
+      "Claim submit done",
+      `area ${result.area.id} with ${result.claim_tiles.length} claim tiles`,
+      performance.now() - startedAt,
+    );
     return -1;
   }
 
   async function submitPendingPaints(paintsToSubmit: PendingPaint[]): Promise<number> {
+    const startedAt = performance.now();
+    emitDebugEvent(
+      "network",
+      "Paint submit start",
+      `${paintsToSubmit.length} pixel${paintsToSubmit.length === 1 ? "" : "s"}`,
+    );
     const result = await paintWorldPixels(buildPaintTilePayload(paintsToSubmit));
 
     if (!result.ok || result.user === null) {
@@ -3377,6 +5887,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         tone: "error",
         text: result.error ?? "Pixel submission failed. Pending pixels stayed local.",
       });
+      emitDebugEvent(
+        "warning",
+        "Paint submit failed",
+        result.error ?? "Unknown paint submit failure",
+        performance.now() - startedAt,
+      );
       return 0;
     }
 
@@ -3384,10 +5900,17 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       ...current,
       user: result.user,
     }));
+    markWorldTilesDirty("visual", result.paint_tiles);
     markWorldTilesDirty("paint", result.paint_tiles);
     markWorldTilesDirty("claims", result.claim_tiles);
     applySavedPaints(paintsToSubmit, result.user);
     await refreshClaimOutlineNow();
+    emitDebugEvent(
+      "network",
+      "Paint submit done",
+      `${result.paint_tiles.length} paint tiles, ${result.claim_tiles.length} claim tiles`,
+      performance.now() - startedAt,
+    );
 
     return -1;
   }
@@ -3411,9 +5934,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return;
     }
 
-    setSelectedArea(result.area);
-    setAreaDraftName(result.area.name);
-    setAreaDraftDescription(result.area.description);
+    applyAreaSelection(cacheClaimAreaSummary(result.area));
     setAreaMessage({
       tone: "success",
       text: "Area info saved.",
@@ -3450,7 +5971,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return;
     }
 
-    setSelectedArea(result.area);
+    applyAreaSelection(cacheClaimAreaSummary(result.area), { syncDrafts: false });
     setAreaInvitePublicId("");
     setAreaMessage({
       tone: "success",
@@ -3472,7 +5993,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   function handleClaimToolChange(nextTool: ClaimTool): void {
     setClaimTool(nextTool);
-    setBuildPanelOpen(true);
     setPlacementMessage(null);
 
     if (nextTool !== "rectangle") {
@@ -3483,6 +6003,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   function handleCloseBuildPanel(): void {
     setBuildPanelOpen(false);
     setPlacementMessage(null);
+    setRectangleAnchor(null);
     buildPanelDragState.current = null;
   }
 
@@ -3641,7 +6162,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   return (
     <main className={`world-shell ${darkMode ? "theme-dark" : "theme-light"}`}>
-      <PerfDebugOverlay />
+      <PerfDebugOverlay getSnapshot={getDebugWorldSnapshot} />
       <div className="world-hud world-hud-left">
         <div className="hud-stack">
           <button
@@ -3687,11 +6208,20 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         </button>
       </div>
 
-      {selectedPixelRecord && !selectedPixelRecord.is_starter ? (
+      {inspectedPixel ? (
         <aside className="world-area-panel" aria-label="Selected area information">
           <div className="area-panel-header">
             <span className="coordinate-label">Selected area</span>
-            <strong>{areaPanelBusy && selectedArea === null ? "Loading..." : selectedArea?.name ?? "Unassigned claim"}</strong>
+            <strong>
+              {areaPanelBusy && selectedArea === null
+                ? "Loading..."
+                : selectedArea?.name
+                  ?? (inspectedPixelRecord?.is_starter
+                    ? "Starter frontier"
+                    : inspectedPixelRecord?.area_id
+                      ? "Selected claim"
+                      : "No claim area")}
+            </strong>
           </div>
           {selectedArea ? (
             <>
@@ -3764,7 +6294,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                   {selectedArea.description || "No area info yet."}
                 </p>
               )}
-              {selectedArea.contributors.length > 0 ? (
+              {selectedArea.viewer_can_edit && areaDetailsBusy ? (
+                <p className="area-description">Loading contributor access...</p>
+              ) : null}
+              {isClaimAreaSummary(selectedArea) && selectedArea.contributors.length > 0 ? (
                 <div className="area-contributor-list">
                   <span className="account-label">Can pixel here</span>
                   {selectedArea.contributors.map((contributor) => (
@@ -3773,8 +6306,16 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                 </div>
               ) : null}
             </>
-          ) : (
+          ) : areaPanelBusy ? (
+            <p className="area-description">Loading area details...</p>
+          ) : inspectedPixelRecord?.is_starter ? (
+            <p className="area-description">
+              Starter frontier cells are reserved and do not belong to a claim area.
+            </p>
+          ) : inspectedPixelRecord?.area_id ? (
             <p className="area-description">This older claim is not assigned to an area yet.</p>
+          ) : (
+            <p className="area-description">No claim area is assigned to this cell.</p>
           )}
           {areaMessage ? (
             <p className={`account-feedback is-${areaMessage.tone}`}>{areaMessage.text}</p>
@@ -3822,7 +6363,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       <div className="world-hud world-hud-bottom-center">
         <div className="build-taskbar" aria-label="Build tools">
           <button
-            className={`build-tool-button ${activeBuildMode === "claim" ? "is-active" : ""}`}
+            className={`build-tool-button ${buildPanelOpen && activeBuildMode === "claim" ? "is-active" : ""}`}
             onClick={() => handleBuildModeChange("claim")}
             type="button"
           >
@@ -3831,7 +6372,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
             {pendingClaimCount > 0 ? <strong>{pendingClaimCount}</strong> : null}
           </button>
           <button
-            className={`build-tool-button ${activeBuildMode === "paint" ? "is-active" : ""}`}
+            className={`build-tool-button ${buildPanelOpen && activeBuildMode === "paint" ? "is-active" : ""}`}
             onClick={() => handleBuildModeChange("paint")}
             type="button"
           >
@@ -3969,7 +6510,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         <button
           aria-label="Open build panel"
           className="build-panel-launcher"
-          onClick={() => setBuildPanelOpen(true)}
+          onClick={() => {
+            setBuildPanelOpen(true);
+            setPlacementMessage(null);
+          }}
           type="button"
         >
           <span>{BUILD_MODE_LABEL[activeBuildMode]}</span>
@@ -3979,6 +6523,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
       <div
         className={`world-viewport immersive ${gridVisible ? "grid-visible" : "grid-hidden"}`}
+        onContextMenu={handleViewportContextMenu}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
@@ -3986,241 +6531,34 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         onPointerLeave={handlePointerLeave}
         ref={viewportRef}
       >
-        <div className="world-backdrop-glow" aria-hidden="true" />
-        <div
-          aria-hidden="true"
-          className="world-pixel-grid"
-        >
-          {gridLines.vertical.map((line) => (
-            <span
-              className={`world-grid-line world-grid-line-vertical ${line.major ? "is-major" : ""}`}
-              key={line.key}
-              style={{ left: `${line.position}px` }}
-            />
-          ))}
-          {gridLines.horizontal.map((line) => (
-            <span
-              className={`world-grid-line world-grid-line-horizontal ${line.major ? "is-major" : ""}`}
-              key={line.key}
-              style={{ top: `${line.position}px` }}
-            />
-          ))}
-        </div>
-        <svg
-          aria-hidden="true"
-          className="world-outside-pattern"
-          height={viewportSize.height}
-          shapeRendering="crispEdges"
-          width={viewportSize.width}
-        >
-          <defs>
-            <pattern
-              height={OUTSIDE_ART_PATTERN_SIZE}
-              id={worldOutsidePatternId}
-              patternUnits="userSpaceOnUse"
-              width={OUTSIDE_ART_PATTERN_SIZE}
-            >
-              <rect
-                className="world-outside-pattern-base"
-                height={OUTSIDE_ART_PATTERN_SIZE}
-                width={OUTSIDE_ART_PATTERN_SIZE}
-              />
-              <path
-                d="M-22 56 L 70 -36 M 18 224 L 152 90 M 140 174 L 248 66"
-                fill="none"
-                opacity="0.6"
-                stroke="var(--world-outside-hatch)"
-                strokeWidth="10"
-              />
-              <path
-                d="M-10 144 L 92 42 M 112 244 L 244 112"
-                fill="none"
-                opacity="0.45"
-                stroke="var(--world-outside-hatch)"
-                strokeWidth="6"
-              />
-              <rect fill="var(--world-outside-hatch)" height="4" opacity="0.6" width="4" x="108" y="30" />
-              <rect fill="var(--world-outside-hatch)" height="4" opacity="0.45" width="4" x="192" y="100" />
-              <rect fill="var(--world-outside-hatch)" height="4" opacity="0.45" width="4" x="26" y="190" />
-              {outsideArtAssets.map((asset) => {
-                const centerX = asset.x + asset.size / 2;
-                const centerY = asset.y + asset.size / 2;
-
-                return (
-                  <image
-                    height={asset.size}
-                    href={asset.src}
-                    key={asset.key}
-                    opacity={asset.opacity}
-                    preserveAspectRatio="xMidYMid meet"
-                    style={{ imageRendering: "pixelated" }}
-                    transform={`rotate(${asset.rotation} ${centerX} ${centerY})`}
-                    width={asset.size}
-                    x={asset.x}
-                    y={asset.y}
-                  />
-                );
-              })}
-            </pattern>
-            <mask id={worldOutsideMaskId}>
-              <rect fill="white" height={viewportSize.height} width={viewportSize.width} x="0" y="0" />
-              {activeChunkViewportRects.map((rect) => (
-                <rect
-                  fill="black"
-                  height={rect.height}
-                  key={rect.key}
-                  width={rect.width}
-                  x={rect.left}
-                  y={rect.top}
-                />
-              ))}
-            </mask>
-          </defs>
-          <rect
-            fill="var(--world-outside-shade)"
-            height={viewportSize.height}
-            mask={`url(#${worldOutsideMaskId})`}
-            width={viewportSize.width}
-            x="0"
-            y="0"
-          />
-          <rect
-            fill={`url(#${worldOutsidePatternId})`}
-            height={viewportSize.height}
-            mask={`url(#${worldOutsideMaskId})`}
-            width={viewportSize.width}
-            x="0"
-            y="0"
-          />
-        </svg>
-        <div className="world-claim-layer" aria-hidden="true">
-          <div className="world-claim-tile-layer">
-            {renderedWorldTiles.map((tile) => (
-              <span
-                className="world-tile"
-                key={`claim-${tile.key}`}
-                style={{
-                  left: `${tile.left}px`,
-                  top: `${tile.top}px`,
-                  width: `${tile.size}px`,
-                height: `${tile.size}px`,
-                  backgroundImage: `url("${getWorldTileUrl(
-                    tile.detailScale === 1 ? "claims" : "claims-low",
-                    tile.tileX,
-                    tile.tileY,
-                    claimTileRevisions[tile.key] ?? 0,
-                    currentUser ? String(currentUser.public_id) : "guest",
-                  )}")`,
-                }}
-              />
-            ))}
-          </div>
-          {claimOutlinePaths.length > 0 ? (
-            <svg
-              aria-hidden="true"
-              className="world-claim-outline-layer"
-              height={viewportSize.height}
-              shapeRendering="crispEdges"
-              width={viewportSize.width}
-            >
-              {claimOutlinePaths.map((path) => (
-                <path
-                  d={path.d}
-                  fill="none"
-                  key={path.key}
-                  stroke={CLAIM_OUTLINE_COLORS[path.status]}
-                  strokeWidth="1"
-                  vectorEffect="non-scaling-stroke"
-                />
-              ))}
-            </svg>
-          ) : null}
-          {renderedPendingClaims.map((pixel) => (
-            <span
-              className={`world-pending-claim ${bulkPendingClaimOverlay || pixel.isBulk ? "is-bulk" : ""}`}
-              key={pixel.key}
-              style={{
-                left: `${pixel.left}px`,
-                top: `${pixel.top}px`,
-                width: `${pixel.width}px`,
-                height: `${pixel.height}px`,
-              }}
-            />
-          ))}
-        </div>
-        <div className="world-pixel-layer" aria-hidden="true">
-          {renderedWorldTiles.map((tile) => (
-            <span
-              className="world-tile"
-              key={`paint-${tile.key}`}
-              style={{
-                left: `${tile.left}px`,
-                top: `${tile.top}px`,
-                width: `${tile.size}px`,
-                height: `${tile.size}px`,
-                backgroundImage: `url("${getWorldTileUrl(
-                  tile.detailScale === 1 ? "paint" : "paint-low",
-                  tile.tileX,
-                  tile.tileY,
-                  paintTileRevisions[tile.key] ?? 0,
-                )}")`,
-              }}
-            />
-          ))}
-          {renderedPendingPaints.map((pixel) => (
-            <span
-              className={`world-pending-paint ${pixel.isTransparent ? "is-transparent" : ""}`}
-              key={pixel.key}
-              style={{
-                left: `${pixel.left}px`,
-                top: `${pixel.top}px`,
-                width: `${pixel.width}px`,
-                height: `${pixel.height}px`,
-                ...(pixel.isTransparent ? {} : { backgroundColor: pixel.color }),
-              }}
-            />
-          ))}
-        </div>
-        {selectedPixelOverlay ? (
-          <div
-            aria-hidden="true"
-            className="world-selected-pixel"
-            style={{
-              left: `${selectedPixelOverlay.left}px`,
-              top: `${selectedPixelOverlay.top}px`,
-              width: `${selectedPixelOverlay.size}px`,
-              height: `${selectedPixelOverlay.size}px`,
-            }}
-          />
-        ) : null}
-        <svg
-          aria-hidden="true"
-          className="world-limit-outline"
-          height={viewportSize.height}
-          shapeRendering="crispEdges"
-          width={viewportSize.width}
-        >
-          {activeChunkBoundaryRects.map((rect) => (
-            <rect
-              fill="currentColor"
-              height={rect.height}
-              key={rect.key}
-              width={rect.width}
-              x={rect.left}
-              y={rect.top}
-            />
-          ))}
-        </svg>
-
-        <div
-          aria-hidden="true"
-          className="world-crosshair-line world-crosshair-horizontal"
-          ref={crosshairHorizontalRef}
-        />
-        <div
-          aria-hidden="true"
-          className="world-crosshair-line world-crosshair-vertical"
-          ref={crosshairVerticalRef}
+        <WorldViewportCanvas
+          activeChunkBoundaryRects={activeChunkBoundaryRects}
+          activeChunkViewportRects={activeChunkViewportRects}
+          bulkPendingClaimOverlay={bulkPendingClaimOverlay}
+          claimOutlinePaths={claimOutlinePaths}
+          crosshairHorizontalRef={crosshairHorizontalRef}
+          crosshairVerticalRef={crosshairVerticalRef}
+          getClaimTileFallback={getClaimTileFallback}
+          getClaimTileSrc={getClaimTileSrc}
+          getPaintTileFallback={getPaintTileFallback}
+          getPaintTileSrc={getPaintTileSrc}
+          getVisualTileFallback={getVisualTileFallback}
+          getVisualTileSrc={getVisualTileSrc}
+          gridLines={gridLines}
+          onTileDebugSignal={handleTileDebugSignal}
+          onTileLoaded={handleTileLoaded}
+          outsideArtPatternImages={outsideArtPatternImages}
+          renderedPendingClaims={renderedPendingClaims}
+          renderedPendingPaints={renderedPendingPaints}
+          renderedWorldTiles={renderedWorldTiles}
+          retainedClaimTileSrcs={retainedTileSrcRef.current.claims}
+          retainedPaintTileSrcs={retainedTileSrcRef.current.paint}
+          retainedVisualTileSrcs={retainedTileSrcRef.current.visual}
+          selectedPixelOverlay={selectedPixelOverlay}
+          useVisualTiles={useVisualTiles}
+          viewportSize={viewportSize}
+          worldOutsideMaskId={worldOutsideMaskId}
+          worldOutsidePatternId={worldOutsidePatternId}
         />
       </div>
 

@@ -72,8 +72,6 @@ export type AvatarHistoryEntry = {
 export type AuthUser = {
   id: string;
   public_id: number;
-  google_subject: string;
-  email: string;
   display_name: string;
   display_name_changed_at: string | null;
   avatar_key: string;
@@ -155,13 +153,21 @@ export type ClaimOutlineWindow = {
   segments: ClaimOutlineSegment[];
 };
 
-export type WorldTileLayer = "claims" | "claims-low" | "paint" | "paint-low";
+export type WorldTileLayer =
+  | "claims"
+  | "claims-low"
+  | "paint"
+  | "paint-low"
+  | "visual"
+  | "visual-low";
 
 const WORLD_TILE_STYLE_VERSION: Record<WorldTileLayer, string> = {
   claims: "access-v3",
-  "claims-low": "access-v3-lod8",
+  "claims-low": "access-v3-lod4",
   paint: "v2",
-  "paint-low": "v2-lod8",
+  "paint-low": "v2-lod4",
+  visual: "visual-neutral-v1",
+  "visual-low": "visual-neutral-v1-lod4",
 };
 
 const apiBaseUrl =
@@ -243,6 +249,14 @@ const fallbackClaimOutline: ClaimOutlineWindow = {
   segments: [],
 };
 
+const fallbackClaimAreaPreviewWindow: ClaimAreaPreviewWindow = {
+  min_x: 0,
+  max_x: 0,
+  min_y: 0,
+  max_y: 0,
+  areas: [],
+};
+
 export type UpdateDisplayNameResult = {
   ok: boolean;
   user: AuthUser | null;
@@ -308,7 +322,7 @@ export type AreaContributorSummary = {
   display_name: string;
 };
 
-export type ClaimAreaSummary = {
+export type ClaimAreaPreview = {
   id: string;
   name: string;
   description: string;
@@ -316,13 +330,18 @@ export type ClaimAreaSummary = {
   claimed_pixels_count: number;
   painted_pixels_count: number;
   contributor_count: number;
-  contributors: AreaContributorSummary[];
   viewer_can_edit: boolean;
   viewer_can_paint: boolean;
   created_at: string;
   updated_at: string;
   last_activity_at: string;
 };
+
+export type ClaimAreaSummary = ClaimAreaPreview & {
+  contributors: AreaContributorSummary[];
+};
+
+export type ClaimAreaRecord = ClaimAreaPreview | ClaimAreaSummary;
 
 export type ClaimAreaBounds = {
   min_x: number;
@@ -355,6 +374,21 @@ export type ClaimAreaListResult = {
   error: string | null;
 };
 
+export type ClaimAreaPreviewWindow = {
+  min_x: number;
+  max_x: number;
+  min_y: number;
+  max_y: number;
+  areas: ClaimAreaPreview[];
+};
+
+export type ClaimAreaPreviewWindowResult = {
+  ok: boolean;
+  window: ClaimAreaPreviewWindow;
+  status: number | null;
+  error: string | null;
+};
+
 export type ClaimRectangleInput = {
   minX: number;
   maxX: number;
@@ -382,6 +416,18 @@ export type PixelBatchClaimResult = {
 export type ClaimAreaResult = {
   ok: boolean;
   area: ClaimAreaSummary | null;
+  status: number | null;
+  error: string | null;
+};
+
+export type ClaimAreaInspection = {
+  pixel: WorldPixel | null;
+  area: ClaimAreaPreview | null;
+};
+
+export type ClaimAreaInspectionResult = {
+  ok: boolean;
+  inspection: ClaimAreaInspection | null;
   status: number | null;
   error: string | null;
 };
@@ -601,6 +647,7 @@ export async function fetchVisibleWorldPixels(
   maxX: number,
   minY: number,
   maxY: number,
+  signal?: AbortSignal,
 ): Promise<WorldPixelWindow> {
   try {
     const params = new URLSearchParams({
@@ -612,6 +659,7 @@ export async function fetchVisibleWorldPixels(
     const response = await fetch(`${clientApiBaseUrl}/world/pixels?${params.toString()}`, {
       cache: "no-store",
       credentials: "include",
+      signal,
     });
 
     if (!response.ok) {
@@ -629,6 +677,7 @@ export async function fetchClaimOutlinePixels(
   maxX: number,
   minY: number,
   maxY: number,
+  signal?: AbortSignal,
 ): Promise<ClaimOutlineWindow> {
   try {
     const params = new URLSearchParams({
@@ -640,6 +689,7 @@ export async function fetchClaimOutlinePixels(
     const response = await fetch(`${clientApiBaseUrl}/world/claims/outline?${params.toString()}`, {
       cache: "no-store",
       credentials: "include",
+      signal,
     });
 
     if (!response.ok) {
@@ -649,6 +699,60 @@ export async function fetchClaimOutlinePixels(
     return (await response.json()) as ClaimOutlineWindow;
   } catch {
     return fallbackClaimOutline;
+  }
+}
+
+export async function fetchVisibleClaimAreaPreviews(
+  minX: number,
+  maxX: number,
+  minY: number,
+  maxY: number,
+  signal?: AbortSignal,
+): Promise<ClaimAreaPreviewWindowResult> {
+  try {
+    const params = new URLSearchParams({
+      min_x: String(minX),
+      max_x: String(maxX),
+      min_y: String(minY),
+      max_y: String(maxY),
+    });
+    const response = await fetch(`${clientApiBaseUrl}/world/areas/visible?${params.toString()}`, {
+      cache: "no-store",
+      credentials: "include",
+      signal,
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        window: fallbackClaimAreaPreviewWindow,
+        status: response.status,
+        error: await readApiError(response, "Visible area preview request failed."),
+      };
+    }
+
+    return {
+      ok: true,
+      window: (await response.json()) as ClaimAreaPreviewWindow,
+      status: response.status,
+      error: null,
+    };
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return {
+        ok: false,
+        window: fallbackClaimAreaPreviewWindow,
+        status: null,
+        error: "Visible area preview request aborted.",
+      };
+    }
+
+    return {
+      ok: false,
+      window: fallbackClaimAreaPreviewWindow,
+      status: null,
+      error: "Visible area preview request failed.",
+    };
   }
 }
 
@@ -864,11 +968,12 @@ export async function paintWorldPixels(tiles: PaintTileInput[]): Promise<PixelBa
   }
 }
 
-export async function fetchClaimArea(areaId: string): Promise<ClaimAreaResult> {
+export async function fetchClaimArea(areaId: string, signal?: AbortSignal): Promise<ClaimAreaResult> {
   try {
     const response = await fetch(`${clientApiBaseUrl}/world/areas/${areaId}`, {
       cache: "no-store",
       credentials: "include",
+      signal,
     });
 
     if (!response.ok) {
@@ -886,12 +991,71 @@ export async function fetchClaimArea(areaId: string): Promise<ClaimAreaResult> {
       status: response.status,
       error: null,
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return {
+        ok: false,
+        area: null,
+        status: null,
+        error: "Area request aborted.",
+      };
+    }
+
     return {
       ok: false,
       area: null,
       status: null,
       error: "Area request failed.",
+    };
+  }
+}
+
+export async function fetchClaimAreaAtPixel(
+  x: number,
+  y: number,
+  signal?: AbortSignal,
+): Promise<ClaimAreaInspectionResult> {
+  try {
+    const params = new URLSearchParams({
+      x: String(x),
+      y: String(y),
+    });
+    const response = await fetch(`${clientApiBaseUrl}/world/areas/by-pixel?${params.toString()}`, {
+      cache: "no-store",
+      credentials: "include",
+      signal,
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        inspection: null,
+        status: response.status,
+        error: await readApiError(response, "Area inspection request failed."),
+      };
+    }
+
+    return {
+      ok: true,
+      inspection: (await response.json()) as ClaimAreaInspection,
+      status: response.status,
+      error: null,
+    };
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return {
+        ok: false,
+        inspection: null,
+        status: null,
+        error: "Area inspection request aborted.",
+      };
+    }
+
+    return {
+      ok: false,
+      inspection: null,
+      status: null,
+      error: "Area inspection request failed.",
     };
   }
 }

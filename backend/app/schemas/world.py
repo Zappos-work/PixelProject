@@ -174,7 +174,7 @@ class AreaContributorSummary(BaseModel):
     display_name: str
 
 
-class ClaimAreaSummary(BaseModel):
+class ClaimAreaPreview(BaseModel):
     id: UUID
     name: str
     description: str
@@ -182,12 +182,28 @@ class ClaimAreaSummary(BaseModel):
     claimed_pixels_count: int
     painted_pixels_count: int
     contributor_count: int
-    contributors: list[AreaContributorSummary]
     viewer_can_edit: bool
     viewer_can_paint: bool
     created_at: datetime
     updated_at: datetime
     last_activity_at: datetime
+
+
+class ClaimAreaSummary(ClaimAreaPreview):
+    contributors: list[AreaContributorSummary]
+
+
+class ClaimAreaInspection(BaseModel):
+    pixel: WorldPixelSummary | None
+    area: ClaimAreaPreview | None
+
+
+class ClaimAreaPreviewWindow(BaseModel):
+    min_x: int
+    max_x: int
+    min_y: int
+    max_y: int
+    areas: list[ClaimAreaPreview]
 
 
 class ClaimAreaBounds(BaseModel):

@@ -8,7 +8,9 @@ from app.db.session import get_db
 from app.modules.auth.service import peek_authenticated_user, resolve_authenticated_user
 from app.schemas.world import (
     AreaContributorInviteRequest,
+    ClaimAreaInspection,
     ClaimAreaListResponse,
+    ClaimAreaPreviewWindow,
     ClaimOutlineWindow,
     ClaimAreaSummary,
     ClaimAreaUpdateRequest,
@@ -31,8 +33,10 @@ from app.services.pixels import (
     claim_world_pixel,
     claim_world_pixels,
     ensure_world_tile_png,
+    get_claim_area_at_pixel,
     get_claim_area_details,
     get_claim_outline_pixels,
+    get_visible_claim_area_previews,
     get_visible_world_pixels,
     is_claim_world_tile_layer,
     invite_area_contributor,
@@ -217,6 +221,32 @@ async def my_areas(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
 
     return await list_owned_claim_areas(session, user)
+
+
+@router.get("/areas/by-pixel", response_model=ClaimAreaInspection)
+async def get_area_by_pixel(
+    request: Request,
+    x: int = Query(...),
+    y: int = Query(...),
+    session: AsyncSession = Depends(get_db),
+) -> ClaimAreaInspection:
+    settings = get_settings()
+    viewer = await peek_authenticated_user(request, session, settings)
+    return await get_claim_area_at_pixel(session, x, y, viewer)
+
+
+@router.get("/areas/visible", response_model=ClaimAreaPreviewWindow)
+async def get_visible_areas(
+    request: Request,
+    min_x: int = Query(...),
+    max_x: int = Query(...),
+    min_y: int = Query(...),
+    max_y: int = Query(...),
+    session: AsyncSession = Depends(get_db),
+) -> ClaimAreaPreviewWindow:
+    settings = get_settings()
+    viewer = await peek_authenticated_user(request, session, settings)
+    return await get_visible_claim_area_previews(session, min_x, max_x, min_y, max_y, viewer)
 
 
 @router.get("/areas/{area_id}", response_model=ClaimAreaSummary)

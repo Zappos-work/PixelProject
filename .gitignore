@@ -18,3 +18,4 @@ backend/.mypy_cache/
 backend/**/__pycache__/
 backend/*.pyc
 backend/.tile-cache/
+.codex-temp/

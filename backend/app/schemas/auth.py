@@ -13,8 +13,6 @@ class AvatarHistoryEntry(BaseModel):
 class AuthUserSummary(BaseModel):
     id: UUID
     public_id: int
-    google_subject: str
-    email: str
     display_name: str
     display_name_changed_at: datetime | None = None
     avatar_key: str

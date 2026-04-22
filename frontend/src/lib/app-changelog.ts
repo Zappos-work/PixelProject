@@ -11,6 +11,46 @@ export type ChangelogEntry = {
 
 export const APP_CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.1.8",
+    date: "Apr 22, 2026",
+    sections: [
+      {
+        title: "New Features",
+        items: [
+          "The zoomed-out world now uses a combined visual overview layer, so claimed land and painted artwork stay visible together before the build view is needed.",
+          "The in-game debug overlay now shows the live zoom level and the active render layer.",
+          "Lightweight area preview and area-by-pixel lookups were added to support smoother territory inspection.",
+        ],
+      },
+      {
+        title: "Improvements",
+        items: [
+          "Visual low-detail tiles are now much softer at x2 instead of x4, and full visual detail arrives earlier at 0.3x zoom.",
+          "Semantic detail now activates only while the build panel is open at high zoom, making browsing and building feel more clearly separated.",
+          "Claim borders remain visible inside visual detail mode, so territory edges stay readable before entering build mode.",
+          "Initial backend tile warmup now targets the visual overview layer that the game actually uses on first load.",
+          "Auth payloads no longer expose Google subject ids or email addresses to the frontend.",
+        ],
+      },
+      {
+        title: "Developer & Tooling",
+        items: [
+          "A new browser-driven world performance runner was added through `npm run perf:world`.",
+          "A backend benchmark script was added for area list, area preview, area inspection and detail-query timings.",
+          "The local `/me` debug route now includes owned claim areas and summarized avatar payload metadata for inspection.",
+        ],
+      },
+      {
+        title: "Bug Fixes",
+        items: [
+          "Selected-pixel fetches are now debounced and repeated empty lookups cool down instead of spamming requests.",
+          "Zooming around the old layer threshold no longer flickers between visual and semantic rendering.",
+          "Visual tiles, claim outlines, grid visibility, placement gating and area prefetching now switch together more consistently.",
+        ],
+      },
+    ],
+  },
+  {
     version: "0.1.7",
     date: "Apr 21, 2026",
     sections: [
