@@ -86,6 +86,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ALPHA_THRESHOLD,
         help="Minimum alpha value that counts as a claimed/painted pixel.",
     )
+    parser.add_argument(
+        "--target-width",
+        type=int,
+        help="Optional visible artwork width after scaling.",
+    )
+    parser.add_argument(
+        "--target-height",
+        type=int,
+        help="Optional visible artwork height after scaling.",
+    )
     return parser.parse_args()
 
 
@@ -116,6 +126,8 @@ def load_seed_pixels(
     center_x: int,
     center_y: int,
     alpha_threshold: int,
+    target_width: int | None = None,
+    target_height: int | None = None,
 ) -> tuple[list[SeedPixel], int, int]:
     image = Image.open(image_path).convert("RGBA")
     source_width, source_height = image.size
@@ -129,28 +141,41 @@ def load_seed_pixels(
     if not visible_points:
         raise ValueError(f"No visible pixels found in {image_path}.")
 
+    if (target_width is None) != (target_height is None):
+        raise ValueError("Both --target-width and --target-height must be set together.")
+
     min_source_x = min(x for x, _y in visible_points)
     max_source_x = max(x for x, _y in visible_points)
     min_source_y = min(y for _x, y in visible_points)
     max_source_y = max(y for _x, y in visible_points)
-    cropped_width = max_source_x - min_source_x + 1
-    cropped_height = max_source_y - min_source_y + 1
+    cropped_image = image.crop((min_source_x, min_source_y, max_source_x + 1, max_source_y + 1))
+
+    if target_width is not None and target_height is not None:
+        if target_width <= 0 or target_height <= 0:
+            raise ValueError("Scaled artwork dimensions must be positive.")
+        cropped_image = cropped_image.resize((target_width, target_height), Image.Resampling.NEAREST)
+
+    cropped_width, cropped_height = cropped_image.size
 
     world_min_x = center_x - cropped_width // 2
     world_top_y = center_y + cropped_height // 2 - 1
     seed_pixels: list[SeedPixel] = []
 
-    for source_x, source_y in visible_points:
-        red, green, blue, _alpha = image.getpixel((source_x, source_y))
-        world_x = world_min_x + (source_x - min_source_x)
-        world_y = world_top_y - (source_y - min_source_y)
-        seed_pixels.append(
-            SeedPixel(
-                x=world_x,
-                y=world_y,
-                color_id=get_nearest_palette_color_id(red, green, blue),
+    for source_y in range(cropped_height):
+        for source_x in range(cropped_width):
+            red, green, blue, alpha = cropped_image.getpixel((source_x, source_y))
+            if alpha < alpha_threshold:
+                continue
+
+            world_x = world_min_x + source_x
+            world_y = world_top_y - source_y
+            seed_pixels.append(
+                SeedPixel(
+                    x=world_x,
+                    y=world_y,
+                    color_id=get_nearest_palette_color_id(red, green, blue),
+                )
             )
-        )
 
     return seed_pixels, cropped_width, cropped_height
 
@@ -165,6 +190,8 @@ async def main() -> None:
         args.center_x,
         args.center_y,
         args.alpha_threshold,
+        args.target_width,
+        args.target_height,
     )
 
     settings = get_settings()
