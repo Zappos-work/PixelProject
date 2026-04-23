@@ -104,6 +104,11 @@ jobs:
 
           asyncio.run(main())
           PY
+
+          LAST_COMMIT_SUBJECT="$(git log -1 --pretty=%s)"
+          if printf '%s' "$LAST_COMMIT_SUBJECT" | grep -Fq "[run-production-heart-reset-20260423-1]"; then
+            docker compose -f compose.prod.yml exec -T backend python -m app.cli.reset_seed_production_world
+          fi
           REMOTE
 
           STATUS=${PIPESTATUS[0]}

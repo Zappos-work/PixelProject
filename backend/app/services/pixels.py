@@ -617,6 +617,14 @@ async def ensure_starter_claim_frontier(
     for x, y in STARTER_FRONTIER_COORDINATES:
         existing = await session.scalar(select(WorldPixel).where(WorldPixel.x == x, WorldPixel.y == y))
         if existing is not None:
+            # Keep real claimed or painted pixels intact if the origin is already occupied.
+            if (
+                existing.owner_user_id is not None
+                or existing.area_id is not None
+                or existing.color_id is not None
+            ):
+                continue
+
             if not existing.is_starter:
                 existing.is_starter = True
                 existing.owner_user_id = None
