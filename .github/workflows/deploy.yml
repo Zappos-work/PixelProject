@@ -110,6 +110,8 @@ jobs:
             docker compose -f compose.prod.yml exec -T backend python -m app.cli.reset_seed_production_world
           elif printf '%s' "$LAST_COMMIT_SUBJECT" | grep -Fq "[run-production-heart-reset-20260423-2]"; then
             docker compose -f compose.prod.yml exec -T backend python -m app.cli.reset_seed_production_world --target-width 22 --target-height 26
+          elif printf '%s' "$LAST_COMMIT_SUBJECT" | grep -Fq "[run-production-heart-reset-20260423-3]"; then
+            docker compose -f compose.prod.yml exec -T backend python -m app.cli.reset_seed_production_world --image-path /app/app/assets/heart-manual.png
           fi
           REMOTE
 
