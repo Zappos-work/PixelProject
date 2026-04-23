@@ -761,6 +761,45 @@ async def get_claim_outline_pixels(
 ) -> ClaimOutlineWindow:
     low_x, high_x = sorted((min_x, max_x))
     low_y, high_y = sorted((min_y, max_y))
+    visible_area_ids = [
+        area_id
+        for area_id in (
+            await session.scalars(
+                select(WorldPixel.area_id)
+                .where(
+                    WorldPixel.area_id.is_not(None),
+                    WorldPixel.is_starter.is_(False),
+                    WorldPixel.x >= low_x,
+                    WorldPixel.x <= high_x,
+                    WorldPixel.y >= low_y,
+                    WorldPixel.y <= high_y,
+                )
+                .distinct()
+            )
+        ).all()
+        if area_id is not None
+    ]
+    viewport_claim_filter = and_(
+        WorldPixel.x >= low_x,
+        WorldPixel.x <= high_x,
+        WorldPixel.y >= low_y,
+        WorldPixel.y <= high_y,
+        or_(
+            WorldPixel.is_starter.is_(True),
+            and_(
+                WorldPixel.area_id.is_(None),
+                WorldPixel.owner_user_id.is_not(None),
+            ),
+        ),
+    )
+    outline_scope_filter = (
+        or_(
+            viewport_claim_filter,
+            WorldPixel.area_id.in_(visible_area_ids),
+        )
+        if visible_area_ids
+        else viewport_claim_filter
+    )
     rows = (
         await session.execute(
             select(
@@ -769,15 +808,8 @@ async def get_claim_outline_pixels(
                 WorldPixel.owner_user_id,
                 WorldPixel.area_id,
                 WorldPixel.is_starter,
-                WorldPixel.color_id,
             )
-            .where(
-                WorldPixel.x >= low_x,
-                WorldPixel.x <= high_x,
-                WorldPixel.y >= low_y,
-                WorldPixel.y <= high_y,
-                or_(WorldPixel.owner_user_id.is_not(None), WorldPixel.is_starter.is_(True)),
-            )
+            .where(outline_scope_filter)
             .order_by(WorldPixel.y, WorldPixel.x)
             .limit(MAX_CLAIM_OUTLINE_PIXELS + 1)
         )
@@ -789,13 +821,13 @@ async def get_claim_outline_pixels(
         viewer,
         {
             area_id
-            for _x, _y, _owner_user_id, area_id, is_starter, _color_id in visible_rows
+            for _x, _y, _owner_user_id, area_id, is_starter in visible_rows
             if area_id is not None and not is_starter
         },
     )
     outline_pixels: dict[tuple[int, int], dict[str, object]] = {}
 
-    for x, y, owner_user_id, area_id, is_starter, color_id in visible_rows:
+    for x, y, owner_user_id, area_id, is_starter in visible_rows:
         region_key = _get_claim_region_key(owner_user_id, area_id, bool(is_starter))
 
         if region_key is None:
@@ -811,7 +843,6 @@ async def get_claim_outline_pixels(
         status = relation if relation in {"owner", "contributor", "blocked", "starter"} else "blocked"
         outline_pixels[(x, y)] = {
             "region_key": region_key,
-            "claim_visible": color_id is None,
             "status": status,
         }
 
@@ -828,9 +859,6 @@ async def get_claim_outline_pixels(
         target.setdefault((status, line), []).append((start, end, status))
 
     for (x, y), state in outline_pixels.items():
-        if not state["claim_visible"]:
-            continue
-
         region_key = state["region_key"]
         status = str(state["status"])
         neighbors = (
@@ -895,11 +923,16 @@ async def get_claim_outline_pixels(
 
         return segments
 
+    resolved_min_x = min((x for x, _y, _owner_user_id, _area_id, _is_starter in visible_rows), default=low_x)
+    resolved_max_x = max((x for x, _y, _owner_user_id, _area_id, _is_starter in visible_rows), default=high_x)
+    resolved_min_y = min((y for _x, y, _owner_user_id, _area_id, _is_starter in visible_rows), default=low_y)
+    resolved_max_y = max((y for _x, y, _owner_user_id, _area_id, _is_starter in visible_rows), default=high_y)
+
     return ClaimOutlineWindow(
-        min_x=low_x,
-        max_x=high_x,
-        min_y=low_y,
-        max_y=high_y,
+        min_x=resolved_min_x,
+        max_x=resolved_max_x,
+        min_y=resolved_min_y,
+        max_y=resolved_max_y,
         truncated=truncated,
         segments=[
             *build_segments("horizontal", horizontal_edges),

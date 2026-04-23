@@ -70,7 +70,7 @@ type DragState = PanDragState;
 type BuildMode = "claim" | "paint";
 
 type ClaimTool = "brush" | "rectangle";
-type PaintTool = "brush" | "eraser";
+type PaintTool = "brush" | "eraser" | "picker";
 
 type ActiveModal = "info" | "changelog" | "login" | "shop" | "avatar" | "areas";
 
@@ -376,10 +376,6 @@ type WorldViewportCanvasProps = {
   claimOutlinePaths: ClaimOutlinePath[];
   crosshairHorizontalRef: RefObject<HTMLDivElement | null>;
   crosshairVerticalRef: RefObject<HTMLDivElement | null>;
-  getClaimTileFallback: (tile: WorldTile) => WorldTileFallback | null;
-  getClaimTileSrc: (tile: WorldTile) => string;
-  getPaintTileFallback: (tile: WorldTile) => WorldTileFallback | null;
-  getPaintTileSrc: (tile: WorldTile) => string;
   getVisualTileFallback: (tile: WorldTile) => WorldTileFallback | null;
   getVisualTileSrc: (tile: WorldTile) => string;
   gridLines: GridLineSet;
@@ -389,12 +385,9 @@ type WorldViewportCanvasProps = {
   renderedPendingClaims: PendingClaimSegment[];
   renderedPendingPaints: PendingPaintSegment[];
   renderedWorldTiles: WorldTile[];
-  retainedClaimTileSrcs: Map<string, string>;
-  retainedPaintTileSrcs: Map<string, string>;
   retainedVisualTileSrcs: Map<string, string>;
   hoverPixelOverlay: HoverPixelOverlay | null;
   selectedPixelOverlay: SelectedPixelOverlay | null;
-  useVisualTiles: boolean;
   viewportSize: ViewportSize;
   worldOutsideMaskId: string;
   worldOutsidePatternId: string;
@@ -422,6 +415,7 @@ const CAMERA_FETCH_SETTLE_MS = 180;
 const PIXEL_FETCH_MARGIN = 2;
 const CLAIM_OUTLINE_FETCH_DEBOUNCE_MS = 40;
 const CLAIM_OUTLINE_FETCH_MARGIN = 2;
+const CLAIM_OUTLINE_FETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
 const VISIBLE_AREA_PREFETCH_DEBOUNCE_MS = 180;
 const VISIBLE_AREA_POLL_INTERVAL_MS = 5000;
 const VISIBLE_AREA_PREFETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
@@ -451,6 +445,7 @@ const WORLD_TILE_OVERSCAN_VIEWPORT_FACTOR = 0.35;
 const WORLD_LOW_TILE_MARGIN = 0;
 const WORLD_LOW_TILE_OVERSCAN_VIEWPORT_FACTOR = 0.08;
 const TRANSPARENT_COLOR_ID = 31;
+const PIXEL_PALETTE_NAME_BY_ID = new Map<number, string>(PIXEL_PALETTE.map((color) => [color.id, color.name]));
 const BUILD_MODE_LABEL: Record<BuildMode, string> = {
   claim: "Claim Area",
   paint: "Color Pixel",
@@ -1595,10 +1590,6 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
   claimOutlinePaths,
   crosshairHorizontalRef,
   crosshairVerticalRef,
-  getClaimTileFallback,
-  getClaimTileSrc,
-  getPaintTileFallback,
-  getPaintTileSrc,
   getVisualTileFallback,
   getVisualTileSrc,
   gridLines,
@@ -1608,12 +1599,9 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
   renderedPendingClaims,
   renderedPendingPaints,
   renderedWorldTiles,
-  retainedClaimTileSrcs,
-  retainedPaintTileSrcs,
   retainedVisualTileSrcs,
   hoverPixelOverlay,
   selectedPixelOverlay,
-  useVisualTiles,
   viewportSize,
   worldOutsideMaskId,
   worldOutsidePatternId,
@@ -1709,39 +1697,22 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
           y="0"
         />
       </svg>
-      {useVisualTiles ? (
-        <div className="world-visual-layer" aria-hidden="true">
-          {renderedWorldTiles.map((tile) => (
-            <WorldTileRaster
-              fallback={getVisualTileFallback(tile)}
-              key={`visual-${tile.key}`}
-              layer="visual"
-              onDebugSignal={onTileDebugSignal}
-              onTileLoaded={onTileLoaded}
-              retainedSrc={retainedVisualTileSrcs.get(tile.key) ?? null}
-              src={getVisualTileSrc(tile)}
-              tile={tile}
-            />
-          ))}
-        </div>
-      ) : null}
+      {/* Keep the visual raster mounted in build mode; semantic tools ride on top of it. */}
+      <div className="world-visual-layer" aria-hidden="true">
+        {renderedWorldTiles.map((tile) => (
+          <WorldTileRaster
+            fallback={getVisualTileFallback(tile)}
+            key={`visual-${tile.key}`}
+            layer="visual"
+            onDebugSignal={onTileDebugSignal}
+            onTileLoaded={onTileLoaded}
+            retainedSrc={retainedVisualTileSrcs.get(tile.key) ?? null}
+            src={getVisualTileSrc(tile)}
+            tile={tile}
+          />
+        ))}
+      </div>
       <div className="world-claim-layer" aria-hidden="true">
-        {!useVisualTiles ? (
-          <div className="world-claim-tile-layer">
-            {renderedWorldTiles.map((tile) => (
-              <WorldTileRaster
-                fallback={getClaimTileFallback(tile)}
-                key={`claim-${tile.key}`}
-                layer="claims"
-                onDebugSignal={onTileDebugSignal}
-                onTileLoaded={onTileLoaded}
-                retainedSrc={retainedClaimTileSrcs.get(tile.key) ?? null}
-                src={getClaimTileSrc(tile)}
-                tile={tile}
-              />
-            ))}
-          </div>
-        ) : null}
         {claimOutlinePaths.length > 0 ? (
           <svg
             aria-hidden="true"
@@ -1776,18 +1747,6 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
         ))}
       </div>
       <div className="world-pixel-layer" aria-hidden="true">
-        {!useVisualTiles ? renderedWorldTiles.map((tile) => (
-          <WorldTileRaster
-            fallback={getPaintTileFallback(tile)}
-            key={`paint-${tile.key}`}
-            layer="paint"
-            onDebugSignal={onTileDebugSignal}
-            onTileLoaded={onTileLoaded}
-            retainedSrc={retainedPaintTileSrcs.get(tile.key) ?? null}
-            src={getPaintTileSrc(tile)}
-            tile={tile}
-          />
-        )) : null}
         {renderedPendingPaints.map((pixel) => (
           <span
             className={`world-pending-paint ${pixel.isTransparent ? "is-transparent" : ""}`}
@@ -2817,8 +2776,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [selectedPlacementState, setSelectedPlacementState] = useState<PlacementState>(EMPTY_PLACEMENT_STATE);
   const [claimOutlineSegments, setClaimOutlineSegments] = useState<ClaimOutlineSegment[]>([]);
   const [visualTileRevisions, setVisualTileRevisions] = useState<Record<string, number>>({});
-  const [claimTileRevisions, setClaimTileRevisions] = useState<Record<string, number>>({});
-  const [paintTileRevisions, setPaintTileRevisions] = useState<Record<string, number>>({});
   const [viewportSize, setViewportSize] = useState<ViewportSize>({ width: 0, height: 0 });
   const [isCentered, setIsCentered] = useState(false);
   const [spaceToolActive, setSpaceToolActive] = useState(false);
@@ -3647,11 +3604,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   const canShowGrid = semanticZoomMode;
   const gridVisible = showGrid && canShowGrid;
-  const useVisualTiles = !semanticZoomMode;
 
   useEffect(() => {
-    markPerfEvent("tile mode", useVisualTiles ? "visual" : "semantic");
-  }, [useVisualTiles]);
+    markPerfEvent("tile mode", semanticZoomMode ? "visual+semantic" : "visual");
+  }, [semanticZoomMode]);
 
   const gridLines = useMemo(() => {
     return measureDebugWork("Compute grid lines", () => {
@@ -3934,12 +3890,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     viewportSize.width,
   ]);
   renderedWorldTilesRef.current = renderedWorldTiles;
-  const tileViewerKey = currentUser ? String(currentUser.public_id) : "guest";
-
-  useEffect(() => {
-    retainedTileSrcRef.current.claims.clear();
-  }, [tileViewerKey]);
-
   const getVisualTileSrc = useCallback((tile: WorldTile): string => {
     return getWorldTileUrl(
       tile.detailScale === 1 ? "visual" : "visual-low",
@@ -3948,42 +3898,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       visualTileRevisions[tile.key] ?? 0,
     );
   }, [visualTileRevisions]);
-  const getClaimTileSrc = useCallback((tile: WorldTile): string => {
-    return getWorldTileUrl(
-      tile.detailScale === 1 ? "claims" : "claims-low",
-      tile.tileX,
-      tile.tileY,
-      claimTileRevisions[tile.key] ?? 0,
-      tileViewerKey,
-    );
-  }, [claimTileRevisions, tileViewerKey]);
-  const getPaintTileSrc = useCallback((tile: WorldTile): string => {
-    return getWorldTileUrl(
-      tile.detailScale === 1 ? "paint" : "paint-low",
-      tile.tileX,
-      tile.tileY,
-      paintTileRevisions[tile.key] ?? 0,
-    );
-  }, [paintTileRevisions]);
-  const getClaimTileFallback = useCallback((tile: WorldTile): WorldTileFallback | null => {
-    if (tile.detailScale !== 1) {
-      return null;
-    }
-
-    const lowTileX = getLowWorldTileCoordinate(tile.tileX);
-    const lowTileY = getLowWorldTileCoordinate(tile.tileY);
-    const lowTileKey = getWorldTileKey(lowTileX, lowTileY, WORLD_LOW_TILE_DETAIL_SCALE);
-    return buildLowTileFallback(
-      tile,
-      getWorldTileUrl(
-        "claims-low",
-        lowTileX,
-        lowTileY,
-        claimTileRevisions[lowTileKey] ?? 0,
-        tileViewerKey,
-      ),
-    );
-  }, [claimTileRevisions, tileViewerKey]);
   const getVisualTileFallback = useCallback((tile: WorldTile): WorldTileFallback | null => {
     if (tile.detailScale !== 1) {
       return null;
@@ -4002,24 +3916,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       ),
     );
   }, [visualTileRevisions]);
-  const getPaintTileFallback = useCallback((tile: WorldTile): WorldTileFallback | null => {
-    if (tile.detailScale !== 1) {
-      return null;
-    }
-
-    const lowTileX = getLowWorldTileCoordinate(tile.tileX);
-    const lowTileY = getLowWorldTileCoordinate(tile.tileY);
-    const lowTileKey = getWorldTileKey(lowTileX, lowTileY, WORLD_LOW_TILE_DETAIL_SCALE);
-    return buildLowTileFallback(
-      tile,
-      getWorldTileUrl(
-        "paint-low",
-        lowTileX,
-        lowTileY,
-        paintTileRevisions[lowTileKey] ?? 0,
-      ),
-    );
-  }, [paintTileRevisions]);
 
   useEffect(() => {
     const visualActiveTiles = new Map<string, { detailScale: number; hasFallback: boolean }>();
@@ -4032,12 +3928,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         hasFallback: tile.detailScale === 1,
       };
 
-      if (useVisualTiles) {
-        visualActiveTiles.set(tile.key, meta);
-      } else {
-        claimsActiveTiles.set(tile.key, meta);
-        paintActiveTiles.set(tile.key, meta);
-      }
+      visualActiveTiles.set(tile.key, meta);
     }
 
     debugActiveTilesRef.current = {
@@ -4061,7 +3952,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         }
       }
     }
-  }, [renderedWorldTiles, useVisualTiles]);
+  }, [renderedWorldTiles]);
 
   const pixelFetchBounds = useMemo(() => {
     if (!gridVisible || viewportSize.width === 0 || viewportSize.height === 0) {
@@ -4105,22 +3996,43 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return null;
     }
 
+    const overscanWorldX = Math.ceil(
+      (viewportSize.width / Math.max(fetchCamera.zoom, ABSOLUTE_MIN_ZOOM)) *
+        CLAIM_OUTLINE_FETCH_OVERSCAN_VIEWPORT_FACTOR,
+    );
+    const overscanWorldY = Math.ceil(
+      (viewportSize.height / Math.max(fetchCamera.zoom, ABSOLUTE_MIN_ZOOM)) *
+        CLAIM_OUTLINE_FETCH_OVERSCAN_VIEWPORT_FACTOR,
+    );
+
     return {
       minX: Math.max(
         activeWorldBounds.minX,
-        Math.floor(-fetchCamera.x / fetchCamera.zoom) - CLAIM_OUTLINE_FETCH_MARGIN,
+        snapVisibleAreaMin(
+          Math.floor(-fetchCamera.x / fetchCamera.zoom) - CLAIM_OUTLINE_FETCH_MARGIN - overscanWorldX,
+        ),
       ),
       maxX: Math.min(
         activeWorldBounds.maxX - 1,
-        Math.ceil((viewportSize.width - fetchCamera.x) / fetchCamera.zoom) + CLAIM_OUTLINE_FETCH_MARGIN,
+        snapVisibleAreaMax(
+          Math.ceil((viewportSize.width - fetchCamera.x) / fetchCamera.zoom) +
+            CLAIM_OUTLINE_FETCH_MARGIN +
+            overscanWorldX,
+        ),
       ),
       minY: Math.max(
         activeWorldBounds.minY,
-        Math.floor((fetchCamera.y - viewportSize.height) / fetchCamera.zoom) - CLAIM_OUTLINE_FETCH_MARGIN,
+        snapVisibleAreaMin(
+          Math.floor((fetchCamera.y - viewportSize.height) / fetchCamera.zoom) -
+            CLAIM_OUTLINE_FETCH_MARGIN -
+            overscanWorldY,
+        ),
       ),
       maxY: Math.min(
         activeWorldBounds.maxY - 1,
-        Math.ceil(fetchCamera.y / fetchCamera.zoom) + CLAIM_OUTLINE_FETCH_MARGIN,
+        snapVisibleAreaMax(
+          Math.ceil(fetchCamera.y / fetchCamera.zoom) + CLAIM_OUTLINE_FETCH_MARGIN + overscanWorldY,
+        ),
       ),
     };
   }, [
@@ -4585,7 +4497,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }, [buildDebugTileLayerSnapshot, world.growth]);
 
   const markWorldTilesDirty = useCallback((
-    layer: "visual" | "claims" | "paint",
     tiles: Array<{ tile_x: number; tile_y: number }>,
   ): void => {
     if (tiles.length === 0) {
@@ -4594,17 +4505,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     emitDebugEvent(
       "action",
-      `${layer} tile revisions bumped`,
+      "visual tile revisions bumped",
       `${tiles.length} dirty tile coordinate${tiles.length === 1 ? "" : "s"}`,
     );
 
-    const setRevisions =
-      layer === "visual"
-        ? setVisualTileRevisions
-        : layer === "claims"
-          ? setClaimTileRevisions
-          : setPaintTileRevisions;
-    setRevisions((current) => {
+    setVisualTileRevisions((current) => {
       const next = { ...current };
       const dirtyKeys = new Set<string>();
 
@@ -5351,6 +5256,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         : "Claim Area only starts new active areas on empty cells connected to the starter frontier or existing claimed territory.";
     }
 
+    if (paintTool === "picker") {
+      return "Picker copies a painted color from the canvas. Click a painted cell with the picker, or press the middle mouse button for a quick pick.";
+    }
+
     if (paintTool === "eraser") {
       return selectedPendingPaint
         ? "Left-click this cell, hold Space, or right-click-drag staged Color Pixels to erase only local pending changes. Nothing transparent is submitted."
@@ -5449,6 +5358,59 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     };
   }, []);
 
+  const pickPaintColorAtPixel = useCallback((
+    targetPixel: PixelCoordinate,
+    options?: { activateBrush?: boolean; quiet?: boolean },
+  ): boolean => {
+    setSelectedPixel((current) => (
+      current !== null && current.x === targetPixel.x && current.y === targetPixel.y
+        ? current
+        : targetPixel
+    ));
+
+    const targetState = getPlacementState(targetPixel);
+
+    if (!targetState.isInsideWorld) {
+      if (!options?.quiet) {
+        setPlacementMessage({
+          tone: "error",
+          text: "This cell is outside the active world.",
+        });
+      }
+      return false;
+    }
+
+    const pickedColorId = targetState.pendingPaint?.colorId ?? targetState.pixelRecord?.color_id ?? null;
+
+    if (pickedColorId === null) {
+      if (!options?.quiet) {
+        setPlacementMessage({
+          tone: "error",
+          text: "This cell has no painted color to pick.",
+        });
+      }
+      return false;
+    }
+
+    setSelectedColorId(pickedColorId);
+
+    if (options?.activateBrush) {
+      setPaintTool("brush");
+    }
+
+    if (!options?.quiet) {
+      const pickedColorName = PIXEL_PALETTE_NAME_BY_ID.get(pickedColorId) ?? `Color #${pickedColorId}`;
+      setPlacementMessage({
+        tone: "info",
+        text: options?.activateBrush
+          ? `${pickedColorName} picked from the canvas. Brush is ready.`
+          : `${pickedColorName} picked from the canvas.`,
+      });
+    }
+
+    return true;
+  }, [getPlacementState]);
+
   const stageActiveToolPixel = useCallback((
     targetPixel: PixelCoordinate,
     options?: { quiet?: boolean },
@@ -5460,6 +5422,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     ));
 
     const activeMode = activeBuildModeRef.current;
+
+    if (activeMode === "paint" && paintToolRef.current === "picker") {
+      return pickPaintColorAtPixel(targetPixel, {
+        activateBrush: true,
+        quiet: options?.quiet,
+      });
+    }
 
     if (activeMode === "paint" && paintToolRef.current === "eraser") {
       return removePendingPaintAtPixel(targetPixel, options);
@@ -5587,7 +5556,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       text: `${updatedPaints.length} pixel${updatedPaints.length === 1 ? "" : "s"} staged locally.`,
     });
     return true;
-  }, [getPlacementState, removePendingPaintAtPixel, syncPendingClaims, syncPendingPaints]);
+  }, [getPlacementState, pickPaintColorAtPixel, removePendingPaintAtPixel, syncPendingClaims, syncPendingPaints]);
 
   const stageClaimRectangle = useCallback((start: PixelCoordinate, end: PixelCoordinate): boolean => {
     setSelectedPixel(end);
@@ -5760,6 +5729,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }, [syncPendingClaims]);
 
   const stageSpaceStroke = useCallback((targetPixel: PixelCoordinate): void => {
+    if (activeBuildModeRef.current === "paint" && paintToolRef.current === "picker") {
+      return;
+    }
+
     let stroke = spaceStrokeRef.current;
 
     if (stroke === null) {
@@ -5964,6 +5937,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     });
   }
 
+  function handleViewportAuxClick(event: React.MouseEvent<HTMLDivElement>): void {
+    if (event.button === 1 && buildPanelOpenRef.current && activeBuildModeRef.current === "paint") {
+      event.preventDefault();
+    }
+  }
+
   function handleCloseAreaPanel(): void {
     areaInspectionAbortRef.current?.abort();
     areaInspectionAbortRef.current = null;
@@ -5978,6 +5957,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }
 
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>): void {
+    if (event.button === 1 && buildPanelOpenRef.current && activeBuildModeRef.current === "paint") {
+      updatePointer(event);
+      pickPaintColorAtPixel(getEventPixel(event));
+      event.preventDefault();
+      return;
+    }
+
     if (event.button === 2 && buildPanelOpenRef.current && activeBuildModeRef.current === "paint") {
       updatePointer(event);
       const targetPixel = getEventPixel(event);
@@ -6083,6 +6069,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       if (buildPanelOpen && activeBuildModeRef.current === "paint") {
         if (paintToolRef.current === "eraser") {
           removePendingPaintAtPixel(clickedPixel);
+          return;
+        }
+
+        if (paintToolRef.current === "picker") {
+          pickPaintColorAtPixel(clickedPixel, { activateBrush: true });
           return;
         }
 
@@ -6361,8 +6352,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       ...current,
       user: result.user,
     }));
-    markWorldTilesDirty("visual", result.claim_tiles);
-    markWorldTilesDirty("claims", result.claim_tiles);
+    markWorldTilesDirty(result.claim_tiles);
     await refreshVisiblePixelWindow();
     await refreshClaimOutlineNow();
     await refreshOwnedAreas();
@@ -6407,9 +6397,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       ...current,
       user: result.user,
     }));
-    markWorldTilesDirty("visual", result.paint_tiles);
-    markWorldTilesDirty("paint", result.paint_tiles);
-    markWorldTilesDirty("claims", result.claim_tiles);
+    markWorldTilesDirty(result.paint_tiles);
     applySavedPaints(paintsToSubmit, result.user);
     await refreshClaimOutlineNow();
     await refreshOwnedAreas();
@@ -7208,19 +7196,44 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               <div className="pixel-palette-grid">
                 <div className="paint-tool-row" aria-label="Color Pixel tools">
                   <button
-                    className={`claim-tool-button ${paintTool === "brush" ? "is-active" : ""}`}
+                    className={`claim-tool-button paint-tool-button ${paintTool === "brush" ? "is-active" : ""}`}
                     onClick={() => handlePaintToolChange("brush")}
                     type="button"
                   >
                     Brush
                   </button>
                   <button
-                    className={`claim-tool-button ${paintTool === "eraser" ? "is-active" : ""}`}
+                    className={`claim-tool-button paint-tool-button ${paintTool === "eraser" ? "is-active" : ""}`}
                     onClick={() => handlePaintToolChange("eraser")}
                     title="Only removes locally staged Color Pixels. It does not submit transparent pixels."
                     type="button"
                   >
                     Eraser
+                  </button>
+                  <button
+                    className={`claim-tool-button paint-tool-button ${paintTool === "picker" ? "is-active" : ""}`}
+                    onClick={() => handlePaintToolChange("picker")}
+                    title="Pick a painted color from the canvas, then return to Brush."
+                    type="button"
+                  >
+                    <svg aria-hidden="true" className="paint-tool-button-icon" viewBox="0 0 24 24">
+                      <path
+                        d="M4 20l4.5-1 8.2-8.2-3.5-3.5L5 15.5 4 20z"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="1.8"
+                      />
+                      <path
+                        d="M12 5.5l3.5 3.5"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeWidth="1.8"
+                      />
+                    </svg>
+                    <span>Pick</span>
                   </button>
                 </div>
                 {PIXEL_PALETTE_DISPLAY_ROWS.map((row, rowIndex) => (
@@ -7296,6 +7309,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
       <div
         className={`world-viewport immersive ${gridVisible ? "grid-visible" : "grid-hidden"}`}
+        onAuxClick={handleViewportAuxClick}
         onContextMenu={handleViewportContextMenu}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -7311,10 +7325,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           claimOutlinePaths={claimOutlinePaths}
           crosshairHorizontalRef={crosshairHorizontalRef}
           crosshairVerticalRef={crosshairVerticalRef}
-          getClaimTileFallback={getClaimTileFallback}
-          getClaimTileSrc={getClaimTileSrc}
-          getPaintTileFallback={getPaintTileFallback}
-          getPaintTileSrc={getPaintTileSrc}
           getVisualTileFallback={getVisualTileFallback}
           getVisualTileSrc={getVisualTileSrc}
           gridLines={gridLines}
@@ -7324,12 +7334,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           renderedPendingClaims={renderedPendingClaims}
           renderedPendingPaints={renderedPendingPaints}
           renderedWorldTiles={renderedWorldTiles}
-          retainedClaimTileSrcs={retainedTileSrcRef.current.claims}
-          retainedPaintTileSrcs={retainedTileSrcRef.current.paint}
           retainedVisualTileSrcs={retainedTileSrcRef.current.visual}
           hoverPixelOverlay={hoverPixelOverlay}
           selectedPixelOverlay={selectedPixelOverlay}
-          useVisualTiles={useVisualTiles}
           viewportSize={viewportSize}
           worldOutsideMaskId={worldOutsideMaskId}
           worldOutsidePatternId={worldOutsidePatternId}

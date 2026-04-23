@@ -1011,7 +1011,7 @@ select {
 
 .paint-tool-row {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.5rem;
   align-items: center;
 }
@@ -1026,12 +1026,22 @@ select {
 
 .claim-tool-button {
   min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.42rem;
   border: 1px solid var(--hud-border);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.045);
   color: var(--hud-text);
   cursor: pointer;
   font-weight: 800;
+}
+
+.paint-tool-button-icon {
+  width: 0.9rem;
+  height: 0.9rem;
+  flex-shrink: 0;
 }
 
 .claim-tool-button.is-active {
