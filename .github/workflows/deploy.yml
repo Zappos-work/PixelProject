@@ -48,10 +48,14 @@ jobs:
           }
 
           set_env_value WORLD_CHUNK_SIZE 4000
+          set_env_value WORLD_ORIGIN_X -2000
+          set_env_value WORLD_ORIGIN_Y -2000
           set_env_value WORLD_EXPANSION_BUFFER 0
           set_env_value WORLD_EXPANSION_CLAIM_FILL_RATIO 0.7
 
           export WORLD_CHUNK_SIZE=4000
+          export WORLD_ORIGIN_X=-2000
+          export WORLD_ORIGIN_Y=-2000
           export WORLD_EXPANSION_BUFFER=0
           export WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7
 
@@ -60,7 +64,46 @@ jobs:
 
           docker compose -f compose.prod.yml ps
 
-          curl -fsS https://pixel.zappos-dev.work/api/v1/health
+          for attempt in $(seq 1 30); do
+            if curl -fsS https://pixel.zappos-dev.work/api/v1/health > /dev/null; then
+              break
+            fi
+
+            if [ "$attempt" -eq 30 ]; then
+              echo "Backend health check did not recover in time." >&2
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          docker compose -f compose.prod.yml exec -T backend python - <<'PY'
+          import asyncio
+
+          from app.db.session import AsyncSessionLocal
+          from app.services.world import get_world_overview
+
+
+          async def main() -> None:
+              async with AsyncSessionLocal() as session:
+                  world = await get_world_overview(session)
+
+              assert (world.origin.x, world.origin.y) == (-2000, -2000), world.origin
+              assert (world.bounds.min_world_x, world.bounds.max_world_x) == (-2000, 2000), world.bounds
+              assert (world.bounds.min_world_y, world.bounds.max_world_y) == (-2000, 2000), world.bounds
+              print(
+                  "Verified centered world origin:",
+                  world.origin.x,
+                  world.origin.y,
+                  world.bounds.min_world_x,
+                  world.bounds.max_world_x,
+                  world.bounds.min_world_y,
+                  world.bounds.max_world_y,
+              )
+
+
+          asyncio.run(main())
+          PY
           REMOTE
 
           STATUS=${PIPESTATUS[0]}

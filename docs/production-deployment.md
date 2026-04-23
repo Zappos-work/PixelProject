@@ -1,6 +1,6 @@
 # Production Deployment Runbook
 
-Last updated: 2026-04-20
+Last updated: 2026-04-23
 
 This document captures the first production server setup for PixelProject.
 
@@ -170,6 +170,8 @@ FRONTEND_APP_URL=https://pixel.zappos-dev.work
 GOOGLE_REDIRECT_URI=https://pixel.zappos-dev.work/api/v1/auth/google/callback
 NEXT_PUBLIC_API_BASE_URL=https://pixel.zappos-dev.work/api/v1
 WORLD_CHUNK_SIZE=4000
+WORLD_ORIGIN_X=-2000
+WORLD_ORIGIN_Y=-2000
 WORLD_EXPANSION_BUFFER=0
 WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7
 POSTGRES_PASSWORD=<server secret>
@@ -180,6 +182,7 @@ DATABASE_URL=postgresql+asyncpg://pixelproject:<server secret>@db:5432/pixelproj
 World growth variables:
 
 - `WORLD_CHUNK_SIZE=4000`: each active gameplay chunk is `4,000 x 4,000`.
+- `WORLD_ORIGIN_X=-2000` and `WORLD_ORIGIN_Y=-2000`: keep the first chunk centered so world `0:0` stays in the middle of the starter canvas.
 - `WORLD_EXPANSION_BUFFER=0`: border-buffer growth is disabled.
 - `WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7`: the active field expands after `70%` claimed Holder coverage.
 
@@ -400,18 +403,53 @@ set_env_value() {
 }
 
 set_env_value WORLD_CHUNK_SIZE 4000
+set_env_value WORLD_ORIGIN_X -2000
+set_env_value WORLD_ORIGIN_Y -2000
 set_env_value WORLD_EXPANSION_BUFFER 0
 set_env_value WORLD_EXPANSION_CLAIM_FILL_RATIO 0.7
 export WORLD_CHUNK_SIZE=4000
+export WORLD_ORIGIN_X=-2000
+export WORLD_ORIGIN_Y=-2000
 export WORLD_EXPANSION_BUFFER=0
 export WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7
 docker compose -f compose.prod.yml up -d --build --remove-orphans
 docker image prune -f
 docker compose -f compose.prod.yml ps
-curl -fsS https://pixel.zappos-dev.work/api/v1/health
+for attempt in $(seq 1 30); do
+  if curl -fsS https://pixel.zappos-dev.work/api/v1/health > /dev/null; then
+    break
+  fi
+
+  if [ "$attempt" -eq 30 ]; then
+    echo "Backend health check did not recover in time." >&2
+    exit 1
+  fi
+
+  sleep 2
+done
+docker compose -f compose.prod.yml exec -T backend python - <<'PY'
+import asyncio
+
+from app.db.session import AsyncSessionLocal
+from app.services.world import get_world_overview
+
+
+async def main() -> None:
+    async with AsyncSessionLocal() as session:
+        world = await get_world_overview(session)
+
+    assert (world.origin.x, world.origin.y) == (-2000, -2000), world.origin
+    assert (world.bounds.min_world_x, world.bounds.max_world_x) == (-2000, 2000), world.bounds
+    assert (world.bounds.min_world_y, world.bounds.max_world_y) == (-2000, 2000), world.bounds
+
+
+asyncio.run(main())
+PY
 ```
 
-The workflow upserts the current world growth values into the server-local `.env` and exports them before `docker compose up`. This prevents older server-local Compose or `.env` defaults from keeping the backend on the previous `5,000 x 5,000` setup.
+The workflow upserts the current centered-world and growth values into the server-local `.env` and exports them before `docker compose up`. This prevents older server-local Compose or `.env` defaults from keeping the backend on the previous top-left origin or the earlier `5,000 x 5,000` setup.
+
+The deploy now also verifies the live database world overview inside the backend container after startup. If the centered-origin migration did not apply, the workflow fails instead of leaving production in a mixed coordinate state.
 
 The workflow uses `concurrency` group `pixelproject-production`, so only one production deployment should run at a time.
 

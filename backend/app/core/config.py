@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,6 +36,13 @@ class Settings(BaseSettings):
     world_chunk_size: int = 4000
     world_expansion_buffer: int = 0
     world_expansion_claim_fill_ratio: float = 0.7
+
+    @model_validator(mode="after")
+    def normalize_world_origin(self) -> "Settings":
+        centered_origin = -(self.world_chunk_size // 2)
+        self.world_origin_x = centered_origin
+        self.world_origin_y = centered_origin
+        return self
 
     @property
     def cors_origins(self) -> list[str]:
