@@ -41,6 +41,7 @@ select {
   --viewport-background: linear-gradient(180deg, #121a23, #0a1118);
   --viewport-grid: rgba(214, 228, 240, 0.14);
   --viewport-major-grid: rgba(214, 228, 240, 0.06);
+  --viewport-origin-axis: rgba(255, 243, 196, 0.52);
   --hud-background: rgba(10, 16, 24, 0.72);
   --hud-border: rgba(198, 214, 229, 0.15);
   --hud-text: #f7fbff;
@@ -60,6 +61,7 @@ select {
   --viewport-background: linear-gradient(180deg, #f8fafc, #e9eff6);
   --viewport-grid: rgba(15, 23, 42, 0.12);
   --viewport-major-grid: rgba(15, 23, 42, 0.05);
+  --viewport-origin-axis: rgba(127, 83, 15, 0.34);
   --hud-background: rgba(255, 255, 255, 0.78);
   --hud-border: rgba(15, 23, 42, 0.12);
   --hud-text: #13202d;
@@ -213,6 +215,7 @@ select {
 .world-painted-pixel,
 .world-pending-claim,
 .world-pending-paint,
+.world-hovered-pixel,
 .world-selected-pixel {
   position: absolute;
   pointer-events: none;
@@ -306,10 +309,52 @@ select {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.38);
 }
 
+.world-hovered-pixel,
 .world-selected-pixel {
-  z-index: 7;
-  border: 1px solid rgba(255, 255, 255, 0.9);
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+  --pixel-reticle: rgba(212, 221, 229, 0.72);
+  --pixel-reticle-shadow: rgba(0, 0, 0, 0.42);
+  z-index: 9;
+}
+
+.world-hovered-pixel {
+  --pixel-reticle: rgba(212, 221, 229, 0.36);
+}
+
+.world-selected-pixel {
+  --pixel-reticle: rgba(232, 238, 244, 0.92);
+}
+
+.world-hovered-pixel::before,
+.world-hovered-pixel::after,
+.world-selected-pixel::before,
+.world-selected-pixel::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+}
+
+.world-hovered-pixel::before,
+.world-selected-pixel::before {
+  inset: -18%;
+  background:
+    linear-gradient(var(--pixel-reticle), var(--pixel-reticle)) left top / 34% 2px no-repeat,
+    linear-gradient(var(--pixel-reticle), var(--pixel-reticle)) left top / 2px 34% no-repeat,
+    linear-gradient(var(--pixel-reticle), var(--pixel-reticle)) right top / 34% 2px no-repeat,
+    linear-gradient(var(--pixel-reticle), var(--pixel-reticle)) right top / 2px 34% no-repeat,
+    linear-gradient(var(--pixel-reticle), var(--pixel-reticle)) right bottom / 34% 2px no-repeat,
+    linear-gradient(var(--pixel-reticle), var(--pixel-reticle)) right bottom / 2px 34% no-repeat,
+    linear-gradient(var(--pixel-reticle), var(--pixel-reticle)) left bottom / 34% 2px no-repeat,
+    linear-gradient(var(--pixel-reticle), var(--pixel-reticle)) left bottom / 2px 34% no-repeat;
+  filter: drop-shadow(0 0 1px var(--pixel-reticle-shadow));
+}
+
+.world-hovered-pixel::after,
+.world-selected-pixel::after {
+  inset: 0;
+  border: 2px solid var(--pixel-reticle);
+  box-shadow:
+    0 0 0 1px var(--pixel-reticle-shadow),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.24);
 }
 
 @keyframes pending-claim-pulse {
@@ -340,16 +385,32 @@ select {
   background: var(--viewport-grid);
 }
 
+.world-grid-line.is-origin {
+  z-index: 1;
+  background: var(--viewport-origin-axis);
+  box-shadow: 0 0 14px rgba(255, 219, 126, 0.22);
+}
+
 .world-grid-line-vertical {
   top: 0;
   bottom: 0;
   width: 1px;
 }
 
+.world-grid-line-vertical.is-origin {
+  width: 2px;
+  transform: translateX(-0.5px);
+}
+
 .world-grid-line-horizontal {
   left: 0;
   right: 0;
   height: 1px;
+}
+
+.world-grid-line-horizontal.is-origin {
+  height: 2px;
+  transform: translateY(-0.5px);
 }
 
 .world-limit {
@@ -661,7 +722,7 @@ select {
 
 .build-tool-button {
   position: relative;
-  min-width: 112px;
+  min-width: 126px;
   min-height: 58px;
   display: grid;
   gap: 0.12rem;
@@ -674,12 +735,43 @@ select {
   color: var(--hud-text);
   cursor: pointer;
   text-align: left;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    color 160ms ease;
+}
+
+.build-tool-button:not(:disabled):hover,
+.build-tool-button:not(:disabled):focus-visible {
+  border-color: rgba(96, 247, 242, 0.42);
+  background: linear-gradient(180deg, rgba(56, 189, 248, 0.14), rgba(125, 211, 165, 0.1));
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 12px 28px rgba(56, 189, 248, 0.12);
+  outline: none;
 }
 
 .build-tool-button.is-active {
   border-color: rgba(125, 211, 165, 0.42);
   background: linear-gradient(180deg, rgba(125, 211, 165, 0.18), rgba(56, 189, 248, 0.1));
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.build-tool-button:disabled {
+  border-color: rgba(148, 163, 184, 0.16);
+  background:
+    repeating-linear-gradient(
+      135deg,
+      rgba(148, 163, 184, 0.09) 0,
+      rgba(148, 163, 184, 0.09) 5px,
+      rgba(15, 23, 42, 0.02) 5px,
+      rgba(15, 23, 42, 0.02) 10px
+    ),
+    rgba(255, 255, 255, 0.025);
+  color: rgba(148, 163, 184, 0.72);
+  cursor: not-allowed;
+  box-shadow: none;
 }
 
 .build-tool-button span {
@@ -691,6 +783,10 @@ select {
   color: var(--modal-copy);
   font-size: 0.74rem;
   font-weight: 700;
+}
+
+.build-tool-button:disabled small {
+  color: rgba(248, 113, 113, 0.82);
 }
 
 .build-tool-button strong {
@@ -706,19 +802,6 @@ select {
   background: #fbbf24;
   color: #101418;
   font-size: 0.72rem;
-}
-
-.build-taskbar-status {
-  min-width: 118px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0 0.72rem;
-  color: var(--modal-copy);
-  font-size: 0.78rem;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  text-align: center;
 }
 
 .world-area-panel {
@@ -740,12 +823,32 @@ select {
 }
 
 .area-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+
+.area-panel-title {
+  min-width: 0;
   display: grid;
   gap: 0.18rem;
 }
 
+.area-panel-close {
+  flex: 0 0 auto;
+}
+
+.area-panel-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+}
+
 .area-panel-header strong {
   font-size: 1.05rem;
+  overflow-wrap: anywhere;
 }
 
 .area-stat-grid {
@@ -779,6 +882,91 @@ select {
 
 .area-stat-grid strong {
   overflow-wrap: anywhere;
+}
+
+.area-id-code {
+  font-family: "Space Mono", "Courier New", monospace;
+  font-size: 0.92rem;
+}
+
+.area-id-copy {
+  width: fit-content;
+  border: 1px solid var(--hud-border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--hud-text);
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 900;
+}
+
+.area-id-copy {
+  padding: 0.38rem 0.58rem;
+}
+
+.area-options-button {
+  width: fit-content;
+  border: 1px solid var(--hud-border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.055);
+  color: var(--hud-text);
+  cursor: pointer;
+  font-size: 0.76rem;
+  font-weight: 900;
+  padding: 0.48rem 0.72rem;
+}
+
+.area-options-button:hover,
+.area-context-menu-item:hover {
+  border-color: rgba(125, 211, 165, 0.42);
+  background: rgba(125, 211, 165, 0.13);
+}
+
+.area-context-menu-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  background: transparent;
+}
+
+.area-context-menu {
+  position: fixed;
+  width: 220px;
+  display: grid;
+  gap: 0.42rem;
+  padding: 0.58rem;
+  border: 1px solid var(--hud-border);
+  border-radius: 16px;
+  background: rgba(8, 16, 24, 0.96);
+  color: var(--hud-text);
+  box-shadow: 0 22px 54px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(18px);
+}
+
+.area-context-menu-header {
+  display: grid;
+  gap: 0.1rem;
+  padding: 0.4rem 0.46rem 0.48rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.area-context-menu-header span {
+  color: var(--modal-copy);
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.area-context-menu-item {
+  min-height: 38px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--hud-text);
+  cursor: pointer;
+  font-weight: 900;
+  text-align: left;
 }
 
 .area-owner-tools,
@@ -819,6 +1007,13 @@ select {
   gap: 0.5rem;
   align-items: center;
   margin-top: 0.8rem;
+}
+
+.paint-tool-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+  align-items: center;
 }
 
 .claim-tool-row span {
@@ -1376,6 +1571,41 @@ select {
   gap: 0.75rem;
 }
 
+.owned-area-sections {
+  display: grid;
+  gap: 1rem;
+}
+
+.owned-area-section {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.owned-area-section + .owned-area-section {
+  padding-top: 0.9rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.owned-area-section-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+
+.owned-area-section-header strong {
+  color: var(--hud-text);
+  font-size: 0.9rem;
+}
+
+.owned-area-section-header span {
+  color: var(--modal-copy);
+  font-size: 0.76rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
 .owned-area-item {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -1414,6 +1644,11 @@ select {
 .owned-area-meta {
   min-width: 112px;
   text-align: right;
+}
+
+.owned-area-options-button {
+  justify-self: end;
+  padding: 0.36rem 0.58rem;
 }
 
 .owned-area-jump {
@@ -2046,12 +2281,6 @@ select {
     min-width: 0;
   }
 
-  .build-taskbar-status {
-    grid-column: 1 / -1;
-    min-width: 0;
-    min-height: 28px;
-  }
-
   .pixel-placement-panel {
     width: min(320px, calc(100vw - 1rem));
     max-height: calc(100vh - 12rem);
@@ -2073,6 +2302,16 @@ select {
   .owned-area-meta {
     min-width: 0;
     text-align: left;
+  }
+
+  .owned-area-section-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .owned-area-options-button {
+    justify-self: start;
   }
 
   .owned-area-jump {

@@ -49,11 +49,20 @@ type AuthMeResponse = {
 
 type ClaimAreaListItem = {
   id: string;
+  public_id: number;
   name: string;
   description: string;
+  status: "active" | "finished";
+  owner: {
+    id: string;
+    public_id: number;
+    display_name: string;
+  };
   claimed_pixels_count: number;
   painted_pixels_count: number;
   contributor_count: number;
+  viewer_can_edit: boolean;
+  viewer_can_paint: boolean;
   bounds: {
     min_x: number;
     max_x: number;

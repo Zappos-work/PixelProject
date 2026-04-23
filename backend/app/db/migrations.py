@@ -1,8 +1,12 @@
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from app.core.config import get_settings
+
 
 async def ensure_auth_schema(connection: AsyncConnection) -> None:
+    settings = get_settings()
+
     await connection.execute(
         text("CREATE SEQUENCE IF NOT EXISTS users_public_id_seq START WITH 1 INCREMENT BY 1")
     )
@@ -103,6 +107,7 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(
         text("ALTER TABLE world_chunks ADD COLUMN IF NOT EXISTS claimed_pixels_count INTEGER DEFAULT 0")
     )
+    await connection.execute(text("ALTER TABLE world_pixels ADD COLUMN IF NOT EXISTS is_starter BOOLEAN DEFAULT FALSE"))
     await connection.execute(
         text("UPDATE world_chunks SET claimed_pixels_count = 0 WHERE claimed_pixels_count IS NULL")
     )
@@ -146,6 +151,114 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     )
     await connection.execute(text("ALTER TABLE world_chunks ALTER COLUMN claimed_pixels_count SET DEFAULT 0"))
     await connection.execute(text("ALTER TABLE world_chunks ALTER COLUMN claimed_pixels_count SET NOT NULL"))
+    if (
+        settings.world_origin_x == -(settings.world_chunk_size // 2)
+        and settings.world_origin_y == -(settings.world_chunk_size // 2)
+    ):
+        is_legacy_origin = await connection.scalar(
+            text(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM world_chunks
+                    WHERE chunk_x = 0
+                      AND chunk_y = 0
+                      AND origin_x = 0
+                      AND origin_y = 0
+                )
+                """
+            )
+        )
+
+        if is_legacy_origin:
+            chunk_offset = 1000000
+            half_chunk = settings.world_chunk_size // 2
+
+            await connection.execute(text("SET LOCAL maintenance_work_mem = '512MB'"))
+            await connection.execute(text("ALTER TABLE world_pixels DROP CONSTRAINT IF EXISTS uq_world_pixels_xy"))
+            await connection.execute(text("DROP INDEX IF EXISTS ix_world_pixels_x"))
+            await connection.execute(text("DROP INDEX IF EXISTS ix_world_pixels_y"))
+            await connection.execute(text("DROP INDEX IF EXISTS ix_world_pixels_chunk_x"))
+            await connection.execute(text("DROP INDEX IF EXISTS ix_world_pixels_chunk_y"))
+            await connection.execute(text("DROP INDEX IF EXISTS ix_world_pixels_growth_claimed_chunk"))
+            await connection.execute(text("DROP INDEX IF EXISTS ix_world_pixels_tile_paint_xy"))
+            await connection.execute(text("DROP INDEX IF EXISTS ix_world_pixels_tile_claim_xy"))
+            await connection.execute(
+                text(
+                    """
+                    UPDATE world_pixels
+                    SET
+                        x = x - :half_chunk,
+                        y = (:half_chunk - 1) - y,
+                        chunk_x = FLOOR((((x - :half_chunk) - :origin_x)::numeric / :chunk_size))::integer,
+                        chunk_y = FLOOR(((((:half_chunk - 1) - y) - :origin_y)::numeric / :chunk_size))::integer
+                    """
+                ),
+                {
+                    "half_chunk": half_chunk,
+                    "origin_x": settings.world_origin_x,
+                    "origin_y": settings.world_origin_y,
+                    "chunk_size": settings.world_chunk_size,
+                },
+            )
+            await connection.execute(
+                text(
+                    """
+                    DELETE FROM world_pixels
+                    WHERE owner_user_id IS NULL
+                      AND color_id IS NULL
+                      AND is_starter IS TRUE
+                      AND (x <> 0 OR y <> 0)
+                    """
+                )
+            )
+            await connection.execute(text("ALTER TABLE world_pixels ADD CONSTRAINT uq_world_pixels_xy UNIQUE (x, y)"))
+            await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_world_pixels_x ON world_pixels (x)"))
+            await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_world_pixels_y ON world_pixels (y)"))
+            await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_world_pixels_chunk_x ON world_pixels (chunk_x)"))
+            await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_world_pixels_chunk_y ON world_pixels (chunk_y)"))
+            await connection.execute(
+                text("UPDATE world_chunks SET chunk_y = chunk_y + :chunk_offset"),
+                {"chunk_offset": chunk_offset},
+            )
+            await connection.execute(
+                text("UPDATE world_chunks SET chunk_y = -(chunk_y - :chunk_offset)"),
+                {"chunk_offset": chunk_offset},
+            )
+            await connection.execute(
+                text(
+                    """
+                    UPDATE world_chunks
+                    SET
+                        origin_x = :origin_x + chunk_x * :chunk_size,
+                        origin_y = :origin_y + chunk_y * :chunk_size
+                    """
+                ),
+                {
+                    "origin_x": settings.world_origin_x,
+                    "origin_y": settings.world_origin_y,
+                    "chunk_size": settings.world_chunk_size,
+                },
+            )
+            await connection.execute(text("UPDATE world_chunks SET claimed_pixels_count = 0"))
+            await connection.execute(
+                text(
+                    """
+                    WITH counts AS (
+                        SELECT chunk_x, chunk_y, COUNT(*)::integer AS claimed_count
+                        FROM world_pixels
+                        WHERE owner_user_id IS NOT NULL
+                          AND is_starter IS FALSE
+                        GROUP BY chunk_x, chunk_y
+                    )
+                    UPDATE world_chunks
+                    SET claimed_pixels_count = counts.claimed_count
+                    FROM counts
+                    WHERE world_chunks.chunk_x = counts.chunk_x
+                      AND world_chunks.chunk_y = counts.chunk_y
+                    """
+                )
+            )
     await connection.execute(
         text(
             """
@@ -159,8 +272,135 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
 
     await connection.execute(text("ALTER TABLE world_pixels ADD COLUMN IF NOT EXISTS is_starter BOOLEAN DEFAULT FALSE"))
     await connection.execute(text("ALTER TABLE world_pixels ADD COLUMN IF NOT EXISTS area_id UUID"))
+    await connection.execute(
+        text("CREATE SEQUENCE IF NOT EXISTS claim_areas_public_id_seq START WITH 1 INCREMENT BY 1")
+    )
+    await connection.execute(text("ALTER TABLE claim_areas ADD COLUMN IF NOT EXISTS public_id INTEGER"))
+    await connection.execute(
+        text("ALTER TABLE claim_areas ALTER COLUMN public_id SET DEFAULT nextval('claim_areas_public_id_seq')")
+    )
+    await connection.execute(
+        text(
+            """
+            WITH existing AS (
+                SELECT COALESCE(MAX(public_id), 0) AS base
+                FROM claim_areas
+                WHERE public_id IS NOT NULL
+            ),
+            numbered AS (
+                SELECT
+                    claim_areas.id,
+                    existing.base + ROW_NUMBER() OVER (ORDER BY claim_areas.created_at, claim_areas.id)::integer AS public_id
+                FROM claim_areas
+                CROSS JOIN existing
+                WHERE claim_areas.public_id IS NULL
+            )
+            UPDATE claim_areas
+            SET public_id = numbered.public_id
+            FROM numbered
+            WHERE claim_areas.id = numbered.id
+            """
+        )
+    )
+    await connection.execute(
+        text("CREATE UNIQUE INDEX IF NOT EXISTS ix_claim_areas_public_id ON claim_areas (public_id)")
+    )
+    await connection.execute(text("ALTER TABLE claim_areas ALTER COLUMN public_id SET NOT NULL"))
+    await connection.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM claim_areas WHERE public_id IS NOT NULL) THEN
+                    PERFORM setval('claim_areas_public_id_seq', (SELECT MAX(public_id) FROM claim_areas), true);
+                ELSE
+                    PERFORM setval('claim_areas_public_id_seq', 1, false);
+                END IF;
+            END
+            $$;
+            """
+        )
+    )
+    await connection.execute(text("ALTER TABLE claim_areas ADD COLUMN IF NOT EXISTS status VARCHAR(16)"))
     await connection.execute(text("ALTER TABLE world_pixels ALTER COLUMN owner_user_id DROP NOT NULL"))
     await connection.execute(text("ALTER TABLE world_pixels ALTER COLUMN color_id DROP NOT NULL"))
+    await connection.execute(text("UPDATE claim_areas SET status = 'active' WHERE status = 'draft'"))
+    await connection.execute(text("UPDATE claim_areas SET status = 'finished' WHERE status = 'final'"))
+    await connection.execute(text("UPDATE claim_areas SET status = 'finished' WHERE status IS NULL OR status NOT IN ('active', 'finished')"))
+    await connection.execute(text("ALTER TABLE claim_areas ALTER COLUMN status SET DEFAULT 'active'"))
+    await connection.execute(text("ALTER TABLE claim_areas ALTER COLUMN status SET NOT NULL"))
+    await connection.execute(
+        text(
+            """
+            DELETE FROM world_pixels AS pixel
+            USING claim_areas AS area
+            WHERE pixel.area_id = area.id
+              AND area.status = 'finished'
+              AND COALESCE(pixel.is_starter, FALSE) IS FALSE
+              AND pixel.color_id IS NULL
+            """
+        )
+    )
+    await connection.execute(text("UPDATE claim_areas SET claimed_pixels_count = 0, painted_pixels_count = 0"))
+    await connection.execute(
+        text(
+            """
+            WITH counts AS (
+                SELECT
+                    area_id,
+                    COUNT(*)::integer AS claimed_count,
+                    COUNT(*) FILTER (WHERE color_id IS NOT NULL)::integer AS painted_count
+                FROM world_pixels
+                WHERE area_id IS NOT NULL
+                  AND COALESCE(is_starter, FALSE) IS FALSE
+                GROUP BY area_id
+            )
+            UPDATE claim_areas
+            SET
+                claimed_pixels_count = counts.claimed_count,
+                painted_pixels_count = counts.painted_count
+            FROM counts
+            WHERE claim_areas.id = counts.area_id
+            """
+        )
+    )
+    await connection.execute(text("UPDATE users SET claimed_pixels_count = 0"))
+    await connection.execute(
+        text(
+            """
+            WITH counts AS (
+                SELECT owner_user_id, COUNT(*)::integer AS claimed_count
+                FROM world_pixels
+                WHERE owner_user_id IS NOT NULL
+                  AND COALESCE(is_starter, FALSE) IS FALSE
+                GROUP BY owner_user_id
+            )
+            UPDATE users
+            SET claimed_pixels_count = counts.claimed_count
+            FROM counts
+            WHERE users.id = counts.owner_user_id
+            """
+        )
+    )
+    await connection.execute(text("UPDATE world_chunks SET claimed_pixels_count = 0"))
+    await connection.execute(
+        text(
+            """
+            WITH counts AS (
+                SELECT chunk_x, chunk_y, COUNT(*)::integer AS claimed_count
+                FROM world_pixels
+                WHERE owner_user_id IS NOT NULL
+                  AND COALESCE(is_starter, FALSE) IS FALSE
+                GROUP BY chunk_x, chunk_y
+            )
+            UPDATE world_chunks
+            SET claimed_pixels_count = counts.claimed_count
+            FROM counts
+            WHERE world_chunks.chunk_x = counts.chunk_x
+              AND world_chunks.chunk_y = counts.chunk_y
+            """
+        )
+    )
     await connection.execute(text("UPDATE world_pixels SET is_starter = FALSE WHERE is_starter IS NULL"))
     await connection.execute(text("ALTER TABLE world_pixels ALTER COLUMN is_starter SET NOT NULL"))
     await connection.execute(

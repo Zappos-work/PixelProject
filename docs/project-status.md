@@ -1,10 +1,10 @@
 # Project Status
 
-Last updated: 2026-04-20
+Last updated: 2026-04-23
 
 ## Current Snapshot
 
-- Current frontend build marker: `0.1.5`.
+- Current frontend build marker: `0.1.9`.
 - Local development stack is running through Docker Compose.
 - Frontend is available on `http://localhost:3000`.
 - Backend API and docs are available on `http://localhost:8000`.

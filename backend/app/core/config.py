@@ -30,8 +30,8 @@ class Settings(BaseSettings):
     normal_pixel_start_limit: int = 64
     normal_pixel_regeneration_interval_seconds: int = 30
     level_up_holders_step: int = 256
-    world_origin_x: int = 0
-    world_origin_y: int = 0
+    world_origin_x: int = -2000
+    world_origin_y: int = -2000
     world_chunk_size: int = 4000
     world_expansion_buffer: int = 0
     world_expansion_claim_fill_ratio: float = 0.7

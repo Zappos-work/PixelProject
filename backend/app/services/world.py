@@ -1,10 +1,19 @@
+from math import ceil
+
 from sqlalchemy import func, select, text, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.models.world_chunk import WorldChunk
 from app.models.world_pixel import WorldPixel
-from app.schemas.world import Point, WorldBounds, WorldChunkSummary, WorldLandmark, WorldOverview
+from app.schemas.world import (
+    Point,
+    WorldBounds,
+    WorldChunkSummary,
+    WorldGrowthProgress,
+    WorldLandmark,
+    WorldOverview,
+)
 
 ORIGIN_CHUNK = (0, 0)
 MAX_GROWTH_STAGE_GUARD = 256
@@ -157,6 +166,84 @@ async def count_claimed_pixels_in_shape(
     ) or 0
 
 
+async def count_painted_pixels_in_shape(
+    session: AsyncSession,
+    coordinates: set[tuple[int, int]],
+) -> int:
+    if not coordinates:
+        return 0
+
+    return await session.scalar(
+        select(func.count(WorldPixel.id)).where(
+            tuple_(WorldPixel.chunk_x, WorldPixel.chunk_y).in_(sorted(coordinates)),
+            WorldPixel.owner_user_id.is_not(None),
+            WorldPixel.is_starter.is_(False),
+            WorldPixel.color_id.is_not(None),
+        )
+    ) or 0
+
+
+async def get_fill_growth_stage(session: AsyncSession, settings: Settings) -> int:
+    fill_ratio = max(
+        MIN_EXPANSION_CLAIM_FILL_RATIO,
+        min(1.0, settings.world_expansion_claim_fill_ratio),
+    )
+    stage = 0
+
+    while stage < MAX_GROWTH_STAGE_GUARD:
+        shape = get_growth_shape(stage)
+        painted_pixels = await count_painted_pixels_in_shape(session, shape)
+        capacity = len(shape) * settings.world_chunk_size * settings.world_chunk_size
+
+        if capacity <= 0 or painted_pixels / capacity < fill_ratio:
+            break
+
+        stage += 1
+
+    return stage
+
+
+async def build_growth_progress(
+    session: AsyncSession,
+    active_coordinates: set[tuple[int, int]],
+    settings: Settings,
+) -> WorldGrowthProgress:
+    active_internal_stage = get_required_growth_stage(active_coordinates)
+    fill_ratio = max(
+        MIN_EXPANSION_CLAIM_FILL_RATIO,
+        min(1.0, settings.world_expansion_claim_fill_ratio),
+    )
+    internal_stage = await get_fill_growth_stage(session, settings)
+    current_shape = get_growth_shape(internal_stage)
+    next_shape = get_growth_shape(internal_stage + 1)
+    capacity = len(current_shape) * settings.world_chunk_size * settings.world_chunk_size
+    required_pixels = ceil(capacity * fill_ratio)
+    painted_pixels = await count_painted_pixels_in_shape(session, current_shape)
+    remaining_pixels = max(0, required_pixels - painted_pixels)
+    filled_percent = 0.0 if capacity <= 0 else min(100.0, painted_pixels / capacity * 100)
+    progress_percent = filled_percent
+    remaining_percent = 0.0 if capacity <= 0 else max(0.0, fill_ratio * 100 - filled_percent)
+
+    return WorldGrowthProgress(
+        stage=internal_stage + 1,
+        next_stage=internal_stage + 2,
+        active_stage=active_internal_stage + 1,
+        active_chunks=len(active_coordinates),
+        current_chunks=len(current_shape),
+        next_stage_chunks=len(next_shape),
+        capacity_pixels=capacity,
+        painted_pixels=painted_pixels,
+        claimed_pixels=painted_pixels,
+        required_pixels=required_pixels,
+        remaining_pixels=remaining_pixels,
+        filled_percent=round(filled_percent, 2),
+        expansion_threshold_percent=round(fill_ratio * 100, 2),
+        progress_percent=round(progress_percent, 2),
+        remaining_percent=round(remaining_percent, 2),
+        fill_ratio=fill_ratio,
+    )
+
+
 async def refresh_world_chunk_claim_counts(session: AsyncSession) -> None:
     await session.execute(text("UPDATE world_chunks SET claimed_pixels_count = 0"))
     await session.execute(
@@ -187,27 +274,12 @@ async def sync_world_growth(
 ) -> int:
     resolved_settings = settings or get_settings()
     chunk_size = resolved_settings.world_chunk_size
-    fill_ratio = max(
-        MIN_EXPANSION_CLAIM_FILL_RATIO,
-        min(1.0, resolved_settings.world_expansion_claim_fill_ratio),
-    )
 
     if sync_pixels:
         await sync_pixel_chunk_coordinates(session, resolved_settings)
         await refresh_world_chunk_claim_counts(session)
 
-    claimed_coordinates = await get_claimed_chunk_coordinates(session)
-    stage = get_required_growth_stage(claimed_coordinates)
-
-    while stage < MAX_GROWTH_STAGE_GUARD:
-        shape = get_growth_shape(stage)
-        claimed_pixels = await count_claimed_pixels_in_shape(session, shape)
-        capacity = len(shape) * chunk_size * chunk_size
-
-        if capacity <= 0 or claimed_pixels / capacity < fill_ratio:
-            break
-
-        stage += 1
+    stage = await get_fill_growth_stage(session, resolved_settings)
 
     active_coordinates = get_growth_shape(stage)
     result = await session.scalars(select(WorldChunk))
@@ -264,6 +336,8 @@ async def get_world_overview(session: AsyncSession) -> WorldOverview:
     max_chunk_x = max(chunk.chunk_x for chunk in active_chunks)
     min_chunk_y = min(chunk.chunk_y for chunk in active_chunks)
     max_chunk_y = max(chunk.chunk_y for chunk in active_chunks)
+    active_coordinates = {(chunk.chunk_x, chunk.chunk_y) for chunk in active_chunks}
+    growth_progress = await build_growth_progress(session, active_coordinates, settings)
 
     chunk_summaries = [
         WorldChunkSummary(
@@ -299,6 +373,7 @@ async def get_world_overview(session: AsyncSession) -> WorldOverview:
             min_world_y=min(chunk.origin_y for chunk in active_chunks),
             max_world_y=max(chunk.origin_y + chunk.height for chunk in active_chunks),
         ),
+        growth=growth_progress,
         chunks=chunk_summaries,
         landmarks=landmarks,
     )

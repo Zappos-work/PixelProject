@@ -136,7 +136,15 @@ async def claim_pixel(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
 
     try:
-        return await claim_world_pixel(session, user, payload.x, payload.y, settings)
+        return await claim_world_pixel(
+            session,
+            user,
+            payload.x,
+            payload.y,
+            settings,
+            payload.claim_mode,
+            payload.target_area_id,
+        )
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 
@@ -163,6 +171,8 @@ async def claim_pixels(
                 (rectangle.min_x, rectangle.max_x, rectangle.min_y, rectangle.max_y)
                 for rectangle in payload.rectangles
             ],
+            claim_mode=payload.claim_mode,
+            target_area_id=payload.target_area_id,
         )
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
@@ -278,7 +288,14 @@ async def patch_area(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
 
     try:
-        return await update_claim_area_metadata(session, area_id, user, payload.name, payload.description)
+        return await update_claim_area_metadata(
+            session,
+            area_id,
+            user,
+            payload.name,
+            payload.description,
+            payload.status,
+        )
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 

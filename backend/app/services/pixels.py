@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import Integer, and_, case, func, insert, or_, select, tuple_, update
+from sqlalchemy import Integer, and_, case, delete, func, insert, or_, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from PIL import Image
@@ -42,7 +42,7 @@ from app.schemas.world import (
     WorldPixelSummary,
     WorldPixelWindow,
 )
-from app.services.world import sync_world_growth
+from app.services.world import refresh_world_chunk_claim_counts, sync_world_growth
 
 # Palette ids are persisted in world_pixels.color_id.
 # Reordering or replacing existing ids changes historic art unless the data is migrated first.
@@ -90,12 +90,12 @@ WORLD_LOW_TILE_SIZE = WORLD_TILE_SIZE * WORLD_LOW_TILE_DETAIL_SCALE
 WORLD_LOW_TILE_IMAGE_SIZE = WORLD_TILE_SIZE // 2
 WORLD_TILE_CACHE_DIR = Path(".tile-cache")
 WORLD_TILE_CACHE_LAYER_PATHS = {
-    "claims": Path("claims-access-v3"),
-    "claims-low": Path("claims-access-v3-lod4"),
-    "paint": Path("palette-v2") / "paint",
-    "paint-low": Path("palette-v2") / "paint-lod4",
-    "visual": Path("palette-v2") / "visual-neutral-v1",
-    "visual-low": Path("palette-v2") / "visual-neutral-v1-lod4",
+    "claims": Path("claims-access-v6-finished-cleanup"),
+    "claims-low": Path("claims-access-v6-finished-cleanup-lod4"),
+    "paint": Path("palette-v4-centered") / "paint",
+    "paint-low": Path("palette-v4-centered") / "paint-lod4",
+    "visual": Path("palette-v4-centered") / "visual-neutral-v2-finished-cleanup",
+    "visual-low": Path("palette-v4-centered") / "visual-neutral-v2-finished-cleanup-lod4",
 }
 WORLD_TILE_LAYERS = {"claims", "claims-low", "paint", "paint-low", "visual", "visual-low"}
 WORLD_TILE_RENDER_LOCKS: dict[tuple[str, int, int, str], asyncio.Lock] = {}
@@ -106,6 +106,10 @@ CLAIM_INSERT_BATCH_SIZE = 10_000
 PAINT_QUERY_BATCH_SIZE = 10_000
 AREA_NAME_MAX_LENGTH = 80
 AREA_DESCRIPTION_MAX_LENGTH = 1200
+CLAIM_AREA_STATUS_ACTIVE = "active"
+CLAIM_AREA_STATUS_FINISHED = "finished"
+CLAIM_AREA_MODE_NEW = "new"
+CLAIM_AREA_MODE_EXPAND = "expand"
 STARTER_FRONTIER_COORDINATES = [
     (0, 0),
 ]
@@ -256,7 +260,7 @@ def _render_low_world_tile_from_detail_cache(
     for offset_y in range(WORLD_LOW_TILE_DETAIL_SCALE):
         for offset_x in range(WORLD_LOW_TILE_DETAIL_SCALE):
             detail_tile_x = detail_origin_x + offset_x
-            detail_tile_y = detail_origin_y + offset_y
+            detail_tile_y = detail_origin_y + (WORLD_LOW_TILE_DETAIL_SCALE - 1 - offset_y)
             detail_path = get_world_tile_cache_path(detail_layer, detail_tile_x, detail_tile_y, viewer)
 
             if not detail_path.exists():
@@ -309,6 +313,10 @@ def get_world_tile_bounds(tile_x: int, tile_y: int, layer: str = "paint") -> tup
     min_x = tile_x * tile_size
     min_y = tile_y * tile_size
     return min_x, min_x + tile_size - 1, min_y, min_y + tile_size - 1
+
+
+def get_world_tile_image_y(y: int, max_y: int, pixel_scale: int = 1) -> int:
+    return (max_y - y) // pixel_scale
 
 
 def get_world_tile_range(start: int, length: int, layer: str = "paint") -> range:
@@ -511,12 +519,16 @@ def build_claim_area_preview(
 ) -> ClaimAreaPreview:
     resolved_viewer_contributor_area_ids = viewer_contributor_area_ids or set()
     viewer_can_edit = viewer is not None and viewer.id == area.owner_user_id
-    viewer_can_paint = viewer_can_edit or area.id in resolved_viewer_contributor_area_ids
+    viewer_can_paint = area.status == CLAIM_AREA_STATUS_ACTIVE and (
+        viewer_can_edit or area.id in resolved_viewer_contributor_area_ids
+    )
 
     return ClaimAreaPreview(
         id=area.id,
+        public_id=area.public_id,
         name=area.name,
         description=area.description,
+        status=area.status,
         owner=AreaOwnerSummary(
             id=owner.id,
             public_id=owner.public_id,
@@ -658,6 +670,7 @@ async def ensure_legacy_claim_areas(session: AsyncSession) -> None:
             owner_user_id=owner_id,
             name="Imported area",
             description="",
+            status=CLAIM_AREA_STATUS_FINISHED,
             claimed_pixels_count=len(pixels),
             painted_pixels_count=sum(1 for pixel in pixels if pixel.color_id is not None),
             last_activity_at=max((pixel.updated_at for pixel in pixels), default=now),
@@ -931,10 +944,13 @@ async def ensure_world_tile_png(
                     if color_id is None:
                         continue
 
-                    pixels[x - min_x, y - min_y] = PALETTE_RGBA.get(color_id, (255, 255, 255, 255))
+                    pixels[x - min_x, get_world_tile_image_y(y, max_y)] = PALETTE_RGBA.get(
+                        color_id,
+                        (255, 255, 255, 255),
+                    )
             else:
                 local_x = func.floor((WorldPixel.x - min_x) / pixel_scale).cast(Integer).label("local_x")
-                local_y = func.floor((WorldPixel.y - min_y) / pixel_scale).cast(Integer).label("local_y")
+                local_y = func.floor((max_y - WorldPixel.y) / pixel_scale).cast(Integer).label("local_y")
                 result = await session.execute(
                     select(local_x, local_y, func.max(WorldPixel.color_id))
                     .where(
@@ -990,7 +1006,7 @@ async def ensure_world_tile_png(
                     if owner_user_id is None and not is_starter:
                         continue
 
-                    pixels[x - min_x, y - min_y] = _get_claim_tile_rgba(
+                    pixels[x - min_x, get_world_tile_image_y(y, max_y)] = _get_claim_tile_rgba(
                         owner_user_id,
                         area_id,
                         bool(is_starter),
@@ -999,7 +1015,7 @@ async def ensure_world_tile_png(
                     )
             else:
                 local_x = func.floor((WorldPixel.x - min_x) / pixel_scale).cast(Integer).label("local_x")
-                local_y = func.floor((WorldPixel.y - min_y) / pixel_scale).cast(Integer).label("local_y")
+                local_y = func.floor((max_y - WorldPixel.y) / pixel_scale).cast(Integer).label("local_y")
                 result = await session.execute(
                     select(
                         local_x,
@@ -1068,14 +1084,14 @@ async def ensure_world_tile_png(
                 )
 
                 for x, y, color_id, owner_user_id, is_starter in result.all():
-                    pixels[x - min_x, y - min_y] = _get_visual_tile_rgba(
+                    pixels[x - min_x, get_world_tile_image_y(y, max_y)] = _get_visual_tile_rgba(
                         color_id,
                         owner_user_id is not None,
                         bool(is_starter),
                     )
             else:
                 local_x = func.floor((WorldPixel.x - min_x) / pixel_scale).cast(Integer).label("local_x")
-                local_y = func.floor((WorldPixel.y - min_y) / pixel_scale).cast(Integer).label("local_y")
+                local_y = func.floor((max_y - WorldPixel.y) / pixel_scale).cast(Integer).label("local_y")
                 painted_color_id = func.max(WorldPixel.color_id).label("painted_color_id")
                 has_claim = func.max(
                     case((WorldPixel.owner_user_id.is_not(None), 1), else_=0)
@@ -1152,7 +1168,7 @@ async def patch_cached_paint_tiles(
             if not tile_path.exists():
                 continue
 
-            min_x, _max_x, min_y, _max_y = get_world_tile_bounds(tile_x, tile_y, layer)
+            min_x, _max_x, _min_y, max_y = get_world_tile_bounds(tile_x, tile_y, layer)
             pixel_scale = get_world_tile_pixel_scale(layer)
             temp_path = tile_path.with_name(f"{tile_path.stem}.{uuid4().hex}.tmp.png")
 
@@ -1163,7 +1179,7 @@ async def patch_cached_paint_tiles(
                 pixels = image.load()
 
                 for x, y, color_id in tile_changes:
-                    pixels[(x - min_x) // pixel_scale, (y - min_y) // pixel_scale] = (
+                    pixels[(x - min_x) // pixel_scale, get_world_tile_image_y(y, max_y, pixel_scale)] = (
                         (0, 0, 0, 0)
                         if color_id is None
                         else PALETTE_RGBA.get(color_id, (255, 255, 255, 255))
@@ -1195,7 +1211,7 @@ async def patch_cached_claim_tiles_hidden(
 
     for (layer, tile_x, tile_y), coordinates in coordinates_by_tile.items():
         claim_cache_dir = get_world_tile_cache_dir(layer)
-        min_x, _max_x, min_y, _max_y = get_world_tile_bounds(tile_x, tile_y, layer)
+        min_x, _max_x, _min_y, max_y = get_world_tile_bounds(tile_x, tile_y, layer)
         pixel_scale = get_world_tile_pixel_scale(layer)
 
         for tile_path in claim_cache_dir.glob(f"*/{tile_x}_{tile_y}.png"):
@@ -1214,7 +1230,12 @@ async def patch_cached_claim_tiles_hidden(
                     pixels = image.load()
 
                     for x, y in coordinates:
-                        pixels[(x - min_x) // pixel_scale, (y - min_y) // pixel_scale] = (0, 0, 0, 0)
+                        pixels[(x - min_x) // pixel_scale, get_world_tile_image_y(y, max_y, pixel_scale)] = (
+                            0,
+                            0,
+                            0,
+                            0,
+                        )
 
                     image.save(temp_path, format="PNG", compress_level=1)
                     temp_path.replace(tile_path)
@@ -1555,29 +1576,56 @@ async def _resolve_target_area_for_claim(
     adjacent_pixels: list[WorldPixel],
     now: datetime,
     claim_area_limit: int,
+    claim_mode: str,
+    target_area_id: UUID | None,
 ) -> ClaimArea:
-    owned_area_ids = [
-        pixel.area_id
-        for pixel in adjacent_pixels
-        if pixel.owner_user_id == user.id and pixel.area_id is not None
-    ]
+    if claim_mode == CLAIM_AREA_MODE_EXPAND:
+        if target_area_id is None:
+            raise PixelPlacementError("Choose one of your areas before using extend mode.", 422)
 
-    if owned_area_ids:
-        area = await session.get(ClaimArea, owned_area_ids[0])
-        if area is not None:
-            return area
+        area = await session.scalar(
+            select(ClaimArea).where(
+                ClaimArea.id == target_area_id,
+                ClaimArea.owner_user_id == user.id,
+            )
+        )
 
-    owned_area_count = int(
+        if area is None:
+            raise PixelPlacementError("The selected area could not be found for expansion.", 404)
+
+        if area.status != CLAIM_AREA_STATUS_ACTIVE:
+            raise PixelPlacementError("Finished areas cannot be extended.", 409)
+
+        touches_target_area = any(
+            pixel.owner_user_id == user.id and pixel.area_id == target_area_id
+            for pixel in adjacent_pixels
+        )
+
+        if not touches_target_area:
+            raise PixelPlacementError("Extend mode must touch the selected area.", 422)
+
+        return area
+
+    if claim_mode != CLAIM_AREA_MODE_NEW:
+        raise PixelPlacementError("Unknown claim area mode.", 422)
+
+    if target_area_id is not None:
+        raise PixelPlacementError("New area mode cannot target an existing area.", 422)
+
+    active_area_count = int(
         await session.scalar(
-            select(func.count(ClaimArea.id)).where(ClaimArea.owner_user_id == user.id)
+            select(func.count(ClaimArea.id)).where(
+                ClaimArea.owner_user_id == user.id,
+                ClaimArea.status == CLAIM_AREA_STATUS_ACTIVE,
+            )
         )
         or 0
     )
-    effective_area_limit = max(1, claim_area_limit)
+    active_area_limit = max(1, claim_area_limit)
 
-    if owned_area_count >= effective_area_limit:
+    if active_area_count >= active_area_limit:
         raise PixelPlacementError(
-            "You have reached your current claim area limit. Expand your existing territory until more area slots unlock.",
+            "Finish your current active area before starting a new one.",
             409,
         )
 
@@ -1585,6 +1633,7 @@ async def _resolve_target_area_for_claim(
         owner_user_id=user.id,
         name="Untitled area",
         description="",
+        status=CLAIM_AREA_STATUS_ACTIVE,
         claimed_pixels_count=0,
         painted_pixels_count=0,
         last_activity_at=now,
@@ -1596,6 +1645,9 @@ async def _resolve_target_area_for_claim(
 
 async def _user_can_paint_area(session: AsyncSession, user: User, area: ClaimArea | None) -> bool:
     if area is None:
+        return False
+
+    if area.status != CLAIM_AREA_STATUS_ACTIVE:
         return False
 
     if area.owner_user_id == user.id:
@@ -1784,24 +1836,32 @@ async def list_owned_claim_areas(
     session: AsyncSession,
     user: User,
 ) -> ClaimAreaListResponse:
-    owned_areas = (
-        await session.execute(
-            select(ClaimArea)
-            .where(ClaimArea.owner_user_id == user.id)
-            .order_by(ClaimArea.last_activity_at.desc(), ClaimArea.created_at.desc())
-        )
-    ).scalars().all()
+    owned_area_ids = set(
+        (
+            await session.scalars(
+                select(ClaimArea.id).where(ClaimArea.owner_user_id == user.id)
+            )
+        ).all()
+    )
+    contributed_area_ids = set(
+        (
+            await session.scalars(
+                select(AreaContributor.area_id).where(AreaContributor.user_id == user.id)
+            )
+        ).all()
+    )
+    visible_area_ids = owned_area_ids | contributed_area_ids
 
-    if not owned_areas:
+    if not visible_area_ids:
         return ClaimAreaListResponse(areas=[])
 
-    owned_area_ids = [area.id for area in owned_areas]
+    visible_area_id_list = list(visible_area_ids)
     contributor_counts = (
         select(
             AreaContributor.area_id.label("area_id"),
             func.count(AreaContributor.id).label("contributor_count"),
         )
-        .where(AreaContributor.area_id.in_(owned_area_ids))
+        .where(AreaContributor.area_id.in_(visible_area_id_list))
         .group_by(AreaContributor.area_id)
         .subquery()
     )
@@ -1814,7 +1874,7 @@ async def list_owned_claim_areas(
             func.max(WorldPixel.y).label("max_y"),
         )
         .where(
-            WorldPixel.area_id.in_(owned_area_ids),
+            WorldPixel.area_id.in_(visible_area_id_list),
         )
         .group_by(WorldPixel.area_id)
         .subquery()
@@ -1822,35 +1882,50 @@ async def list_owned_claim_areas(
     rows = await session.execute(
         select(
             ClaimArea,
+            User,
             pixel_bounds.c.min_x,
             pixel_bounds.c.max_x,
             pixel_bounds.c.min_y,
             pixel_bounds.c.max_y,
             func.coalesce(contributor_counts.c.contributor_count, 0),
         )
+        .join(User, User.id == ClaimArea.owner_user_id)
         .join(pixel_bounds, pixel_bounds.c.area_id == ClaimArea.id)
         .outerjoin(contributor_counts, contributor_counts.c.area_id == ClaimArea.id)
-        .where(ClaimArea.id.in_(owned_area_ids))
+        .where(ClaimArea.id.in_(visible_area_id_list))
         .order_by(ClaimArea.last_activity_at.desc(), ClaimArea.created_at.desc())
     )
     areas: list[ClaimAreaListItem] = []
 
-    for area, min_x, max_x, min_y, max_y, contributor_count in rows.all():
+    for area, owner, min_x, max_x, min_y, max_y, contributor_count in rows.all():
         resolved_min_x = int(min_x)
         resolved_max_x = int(max_x)
         resolved_min_y = int(min_y)
         resolved_max_y = int(max_y)
         width = resolved_max_x - resolved_min_x + 1
         height = resolved_max_y - resolved_min_y + 1
+        viewer_can_edit = area.id in owned_area_ids
+        viewer_can_paint = area.status == CLAIM_AREA_STATUS_ACTIVE and (
+            viewer_can_edit or area.id in contributed_area_ids
+        )
 
         areas.append(
             ClaimAreaListItem(
                 id=area.id,
+                public_id=area.public_id,
                 name=area.name,
                 description=area.description,
+                status=area.status,
+                owner=AreaOwnerSummary(
+                    id=owner.id,
+                    public_id=owner.public_id,
+                    display_name=owner.display_name,
+                ),
                 claimed_pixels_count=area.claimed_pixels_count,
                 painted_pixels_count=area.painted_pixels_count,
                 contributor_count=int(contributor_count or 0),
+                viewer_can_edit=viewer_can_edit,
+                viewer_can_paint=viewer_can_paint,
                 bounds=ClaimAreaBounds(
                     min_x=resolved_min_x,
                     max_x=resolved_max_x,
@@ -1870,12 +1945,67 @@ async def list_owned_claim_areas(
     return ClaimAreaListResponse(areas=areas)
 
 
+async def _finish_claim_area(session: AsyncSession, area: ClaimArea, user: User) -> None:
+    if area.status != CLAIM_AREA_STATUS_ACTIVE:
+        raise PixelPlacementError("Only active areas can be finished.", 409)
+
+    now = datetime.now(timezone.utc)
+    painted_count = int(
+        await session.scalar(
+            select(func.count(WorldPixel.id)).where(
+                WorldPixel.area_id == area.id,
+                WorldPixel.is_starter.is_(False),
+                WorldPixel.color_id.is_not(None),
+            )
+        )
+        or 0
+    )
+
+    if painted_count <= 0:
+        raise PixelPlacementError("Paint at least one pixel before finishing this area.", 422)
+
+    released_rows = (
+        await session.execute(
+            select(WorldPixel.x, WorldPixel.y)
+            .where(
+                WorldPixel.area_id == area.id,
+                WorldPixel.is_starter.is_(False),
+                WorldPixel.color_id.is_(None),
+            )
+        )
+    ).all()
+    released_coordinates = [(int(x), int(y)) for x, y in released_rows]
+    released_count = len(released_coordinates)
+    released_tile_coordinates = _get_tile_coordinates_for_pixels(released_coordinates)
+
+    if released_count > 0:
+        await session.execute(
+            delete(WorldPixel).where(
+                WorldPixel.area_id == area.id,
+                WorldPixel.is_starter.is_(False),
+                WorldPixel.color_id.is_(None),
+            )
+        )
+
+    area.status = CLAIM_AREA_STATUS_FINISHED
+    area.claimed_pixels_count = painted_count
+    area.painted_pixels_count = painted_count
+    area.last_activity_at = now
+    user.claimed_pixels_count = max(0, user.claimed_pixels_count - released_count)
+
+    await refresh_world_chunk_claim_counts(session)
+
+    if released_tile_coordinates:
+        invalidate_world_tiles(released_tile_coordinates, {"claims", "visual"})
+
+
 async def update_claim_area_metadata(
     session: AsyncSession,
     area_id: UUID,
     user: User,
     name: str | None,
     description: str | None,
+    status: str | None,
 ) -> ClaimAreaSummary:
     row = await session.execute(
         select(ClaimArea, User)
@@ -1897,7 +2027,16 @@ async def update_claim_area_metadata(
     if description is not None:
         area.description = _normalize_area_description(description)
 
+    if status is not None and status != area.status:
+        if status == CLAIM_AREA_STATUS_FINISHED and area.status == CLAIM_AREA_STATUS_ACTIVE:
+            await _finish_claim_area(session, area, user)
+        elif status == CLAIM_AREA_STATUS_ACTIVE and area.status == CLAIM_AREA_STATUS_ACTIVE:
+            area.status = CLAIM_AREA_STATUS_ACTIVE
+        else:
+            raise PixelPlacementError("Finished areas cannot be reactivated.", 409)
+
     await session.commit()
+    await sync_world_growth(session)
     await session.refresh(area)
     return await build_claim_area_summary(session, area, owner, user)
 
@@ -1958,8 +2097,17 @@ async def claim_world_pixel(
     x: int,
     y: int,
     settings: Settings | None = None,
+    claim_mode: str = CLAIM_AREA_MODE_NEW,
+    target_area_id: UUID | None = None,
 ) -> PixelClaimResponse:
-    batch = await claim_world_pixels(session, user, [(x, y)], settings)
+    batch = await claim_world_pixels(
+        session,
+        user,
+        [(x, y)],
+        settings,
+        claim_mode=claim_mode,
+        target_area_id=target_area_id,
+    )
     pixel = await session.scalar(select(WorldPixel).where(WorldPixel.x == x, WorldPixel.y == y))
 
     if pixel is None:
@@ -1977,6 +2125,8 @@ async def claim_world_pixels(
     pixels: list[tuple[int, int]] | None,
     settings: Settings | None = None,
     rectangles: list[tuple[int, int, int, int]] | None = None,
+    claim_mode: str = CLAIM_AREA_MODE_NEW,
+    target_area_id: UUID | None = None,
 ) -> PixelBatchClaimResponse:
     resolved_settings = settings or get_settings()
     now = datetime.now(timezone.utc)
@@ -2009,6 +2159,8 @@ async def claim_world_pixels(
         adjacent_pixels,
         now,
         user.claim_area_limit,
+        claim_mode,
+        target_area_id,
     )
     claimed_count = len(normalized_pixels)
 
@@ -2091,6 +2243,11 @@ async def paint_world_pixels(
         if pixel.owner_user_id is None or pixel.is_starter:
             raise PixelPlacementError("This paint batch includes territory that is not claimed yet.", 422)
 
+        area = area_map.get(pixel.area_id) if pixel.area_id is not None else None
+
+        if area is None or area.status != CLAIM_AREA_STATUS_ACTIVE:
+            raise PixelPlacementError("You can only paint inside active areas.", 403)
+
         if (
             pixel.owner_user_id != user.id
             and (pixel.area_id is None or pixel.area_id not in contributor_area_ids)
@@ -2155,6 +2312,7 @@ async def paint_world_pixels(
         area.last_activity_at = now
 
     await session.commit()
+    await sync_world_growth(session, resolved_settings)
 
     if paint_cache_changes:
         await patch_cached_paint_tiles(session, paint_cache_changes)
@@ -2209,6 +2367,9 @@ async def paint_world_pixel(
     area = await session.get(ClaimArea, pixel.area_id) if pixel.area_id is not None else None
     owner = user if pixel.owner_user_id == user.id else await session.get(User, pixel.owner_user_id)
 
+    if area is None or area.status != CLAIM_AREA_STATUS_ACTIVE:
+        raise PixelPlacementError("You can only paint inside active areas.", 403)
+
     if pixel.owner_user_id != user.id and not await _user_can_paint_area(session, user, area):
         raise PixelPlacementError("You can only paint inside owned or contributed areas.", 403)
 
@@ -2238,6 +2399,7 @@ async def paint_world_pixel(
         area.last_activity_at = now
 
     await session.commit()
+    await sync_world_growth(session, resolved_settings)
 
     if previous_color_id is None and normalized_color_id is not None:
         await patch_cached_claim_tiles_hidden([(x, y)])

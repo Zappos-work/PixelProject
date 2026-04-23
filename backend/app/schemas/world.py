@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -36,6 +37,25 @@ class WorldBounds(BaseModel):
     max_world_y: int
 
 
+class WorldGrowthProgress(BaseModel):
+    stage: int
+    next_stage: int
+    active_stage: int
+    active_chunks: int
+    current_chunks: int
+    next_stage_chunks: int
+    capacity_pixels: int
+    painted_pixels: int
+    claimed_pixels: int
+    required_pixels: int
+    remaining_pixels: int
+    filled_percent: float
+    expansion_threshold_percent: float
+    progress_percent: float
+    remaining_percent: float
+    fill_ratio: float
+
+
 class WorldLandmark(BaseModel):
     id: str
     name: str
@@ -54,6 +74,7 @@ class WorldOverview(BaseModel):
     expansion_buffer: int
     chunk_count: int
     bounds: WorldBounds
+    growth: WorldGrowthProgress
     chunks: list[WorldChunkSummary]
     landmarks: list[WorldLandmark]
 
@@ -107,9 +128,15 @@ class ClaimOutlineWindow(BaseModel):
     segments: list[ClaimOutlineSegment]
 
 
+ClaimAreaClaimMode = Literal["new", "expand"]
+ClaimAreaStatus = Literal["active", "finished"]
+
+
 class PixelClaimRequest(BaseModel):
     x: int
     y: int
+    claim_mode: ClaimAreaClaimMode = "new"
+    target_area_id: UUID | None = None
 
 
 class ClaimRectangleRequest(BaseModel):
@@ -122,6 +149,8 @@ class ClaimRectangleRequest(BaseModel):
 class PixelBatchClaimRequest(BaseModel):
     pixels: list[Point] = Field(default_factory=list)
     rectangles: list[ClaimRectangleRequest] = Field(default_factory=list)
+    claim_mode: ClaimAreaClaimMode = "new"
+    target_area_id: UUID | None = None
 
 
 class PixelClaimResponse(BaseModel):
@@ -176,8 +205,10 @@ class AreaContributorSummary(BaseModel):
 
 class ClaimAreaPreview(BaseModel):
     id: UUID
+    public_id: int
     name: str
     description: str
+    status: ClaimAreaStatus
     owner: AreaOwnerSummary
     claimed_pixels_count: int
     painted_pixels_count: int
@@ -219,11 +250,16 @@ class ClaimAreaBounds(BaseModel):
 
 class ClaimAreaListItem(BaseModel):
     id: UUID
+    public_id: int
     name: str
     description: str
+    status: ClaimAreaStatus
+    owner: AreaOwnerSummary
     claimed_pixels_count: int
     painted_pixels_count: int
     contributor_count: int
+    viewer_can_edit: bool
+    viewer_can_paint: bool
     bounds: ClaimAreaBounds
     created_at: datetime
     updated_at: datetime
@@ -246,6 +282,7 @@ class PixelBatchClaimResponse(BaseModel):
 class ClaimAreaUpdateRequest(BaseModel):
     name: str | None = None
     description: str | None = None
+    status: ClaimAreaStatus | None = None
 
 
 class AreaContributorInviteRequest(BaseModel):

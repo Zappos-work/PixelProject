@@ -45,6 +45,25 @@ export type WorldLandmark = {
   tone: string;
 };
 
+export type WorldGrowthProgress = {
+  stage: number;
+  next_stage: number;
+  active_stage: number;
+  active_chunks: number;
+  current_chunks: number;
+  next_stage_chunks: number;
+  capacity_pixels: number;
+  painted_pixels: number;
+  claimed_pixels: number;
+  required_pixels: number;
+  remaining_pixels: number;
+  filled_percent: number;
+  expansion_threshold_percent: number;
+  progress_percent: number;
+  remaining_percent: number;
+  fill_ratio: number;
+};
+
 export type WorldOverview = {
   origin: {
     x: number;
@@ -54,6 +73,7 @@ export type WorldOverview = {
   expansion_buffer: number;
   chunk_count: number;
   bounds: WorldBounds;
+  growth: WorldGrowthProgress;
   chunks: WorldChunk[];
   landmarks: WorldLandmark[];
 };
@@ -162,12 +182,12 @@ export type WorldTileLayer =
   | "visual-low";
 
 const WORLD_TILE_STYLE_VERSION: Record<WorldTileLayer, string> = {
-  claims: "access-v3",
-  "claims-low": "access-v3-lod4",
-  paint: "v2",
-  "paint-low": "v2-lod4",
-  visual: "visual-neutral-v1",
-  "visual-low": "visual-neutral-v1-lod4",
+  claims: "access-v6-finished-cleanup",
+  "claims-low": "access-v6-finished-cleanup-lod4",
+  paint: "v4-centered",
+  "paint-low": "v4-centered-lod4",
+  visual: "visual-neutral-v2-finished-cleanup",
+  "visual-low": "visual-neutral-v2-finished-cleanup-lod4",
 };
 
 const apiBaseUrl =
@@ -196,23 +216,41 @@ export const fallbackWorld: WorldOverview = {
   chunk_size: 4000,
   expansion_buffer: 0,
   chunk_count: 1,
+  growth: {
+    stage: 1,
+    next_stage: 2,
+    active_stage: 1,
+    active_chunks: 1,
+    current_chunks: 1,
+    next_stage_chunks: 5,
+    capacity_pixels: 16000000,
+    painted_pixels: 0,
+    claimed_pixels: 0,
+    required_pixels: 11200000,
+    remaining_pixels: 11200000,
+    filled_percent: 0,
+    expansion_threshold_percent: 70,
+    progress_percent: 0,
+    remaining_percent: 70,
+    fill_ratio: 0.7,
+  },
   bounds: {
     min_chunk_x: 0,
     max_chunk_x: 0,
     min_chunk_y: 0,
     max_chunk_y: 0,
-    min_world_x: 0,
-    max_world_x: 4000,
-    min_world_y: 0,
-    max_world_y: 4000,
+    min_world_x: -2000,
+    max_world_x: 2000,
+    min_world_y: -2000,
+    max_world_y: 2000,
   },
   chunks: [
     {
       id: "fallback-origin",
       chunk_x: 0,
       chunk_y: 0,
-      origin_x: 0,
-      origin_y: 0,
+      origin_x: -2000,
+      origin_y: -2000,
       width: 4000,
       height: 4000,
       is_active: true,
@@ -322,10 +360,15 @@ export type AreaContributorSummary = {
   display_name: string;
 };
 
+export type ClaimAreaStatus = "active" | "finished";
+export type ClaimAreaClaimMode = "new" | "expand";
+
 export type ClaimAreaPreview = {
   id: string;
+  public_id: number;
   name: string;
   description: string;
+  status: ClaimAreaStatus;
   owner: AreaOwnerSummary;
   claimed_pixels_count: number;
   painted_pixels_count: number;
@@ -356,11 +399,16 @@ export type ClaimAreaBounds = {
 
 export type ClaimAreaListItem = {
   id: string;
+  public_id: number;
   name: string;
   description: string;
+  status: ClaimAreaStatus;
+  owner: AreaOwnerSummary;
   claimed_pixels_count: number;
   painted_pixels_count: number;
   contributor_count: number;
+  viewer_can_edit: boolean;
+  viewer_can_paint: boolean;
   bounds: ClaimAreaBounds;
   created_at: string;
   updated_at: string;
@@ -799,6 +847,8 @@ export async function claimWorldPixel(x: number, y: number): Promise<PixelClaimR
 export async function claimWorldPixels(input: {
   pixels: Array<{ x: number; y: number }>;
   rectangles?: ClaimRectangleInput[];
+  claimMode: ClaimAreaClaimMode;
+  targetAreaId?: string | null;
 }): Promise<PixelBatchClaimResult> {
   try {
     const response = await fetch(`${clientApiBaseUrl}/world/claims/batch`, {
@@ -815,6 +865,8 @@ export async function claimWorldPixels(input: {
           min_y: rectangle.minY,
           max_y: rectangle.maxY,
         })),
+        claim_mode: input.claimMode,
+        target_area_id: input.targetAreaId ?? null,
       }),
     });
 
@@ -1097,6 +1149,7 @@ export async function updateClaimArea(
   areaId: string,
   name: string,
   description: string,
+  status?: ClaimAreaStatus,
 ): Promise<ClaimAreaResult> {
   try {
     const response = await fetch(`${clientApiBaseUrl}/world/areas/${areaId}`, {
@@ -1105,7 +1158,7 @@ export async function updateClaimArea(
         "Content-Type": "application/json",
       },
       credentials: "include",
-      body: JSON.stringify({ name, description }),
+      body: JSON.stringify({ name, description, status }),
     });
 
     if (!response.ok) {

@@ -11,6 +11,48 @@ export type ChangelogEntry = {
 
 export const APP_CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.1.9",
+    date: "Apr 23, 2026",
+    sections: [
+      {
+        title: "New Features",
+        items: [
+          "The starting world now uses a centered coordinate system with `0:0` in the middle of the first canvas and standard positive-up world coordinates.",
+          "Claim Areas now have active and finished states. Only active areas can be extended or painted, while finished areas stay visible as read-only artwork.",
+          "Areas now get simple public IDs like `#1`, `#2` and `#3`, with a floating context menu for copying the ID and adding future area actions.",
+          "My Areas is now split into your active artworks, active claims you joined and finished artworks.",
+        ],
+      },
+      {
+        title: "Improvements",
+        items: [
+          "Claim Area and Color Pixel tools now have clearer labels, disabled states and helper text.",
+          "The build panel can be minimized or fully closed, and Area Info also has a close button.",
+          "Color Pixel mode now supports left-click single-pixel placement, a local eraser tool and right-click or Space-based quick erasing for staged pixels.",
+          "The hovered and selected pixel outline was refreshed so it reads clearly without center-cross artifacts.",
+          "The debug overlay now reports the active world stage and filled painted-area progress toward the next expansion.",
+        ],
+      },
+      {
+        title: "Bug Fixes",
+        items: [
+          "Finished areas now automatically release unpainted claim pixels and existing finished-area data is cleaned up so claim counts match painted pixels.",
+          "World growth now uses painted pixels instead of raw claimed pixels, so expansion happens at 70% filled artwork.",
+          "Stage detection no longer activates extra chunks just because future or test claims exist outside the current growth shape.",
+          "Tile rendering and migrations now preserve artwork orientation after the centered-coordinate migration.",
+          "Staged painting no longer creates accidental horizontal line artifacts, and the mouse crosshair shows both axes again.",
+        ],
+      },
+      {
+        title: "Developer & Tooling",
+        items: [
+          "Tile cache versions were bumped for the centered world, finished-area cleanup and visual rendering updates.",
+          "Local migration repair now recomputes claim, area, user and chunk counters after status and coordinate changes.",
+        ],
+      },
+    ],
+  },
+  {
     version: "0.1.8",
     date: "Apr 22, 2026",
     sections: [
