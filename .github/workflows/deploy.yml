@@ -36,6 +36,10 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
 
+          compose_prod() {
+            docker compose --project-directory /opt/pixelproject -f /opt/pixelproject/.github/deploy/compose.prod.yml "$@"
+          }
+
           set_env_value() {
             local key="$1"
             local value="$2"
@@ -54,6 +58,10 @@ jobs:
           set_env_value WORLD_EXPANSION_CLAIM_FILL_RATIO 0.7
           set_env_value APP_ENV production
           set_env_value AUTH_COOKIE_SECURE true
+          set_env_value BACKEND_CORS_ORIGINS https://pixel.zappos-dev.work
+          set_env_value FRONTEND_APP_URL https://pixel.zappos-dev.work
+          set_env_value NEXT_PUBLIC_API_BASE_URL https://pixel.zappos-dev.work/api/v1
+          set_env_value GOOGLE_REDIRECT_URI https://pixel.zappos-dev.work/api/v1/auth/google/callback
 
           export WORLD_CHUNK_SIZE=4000
           export WORLD_ORIGIN_X=-2000
@@ -62,11 +70,19 @@ jobs:
           export WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7
           export APP_ENV=production
           export AUTH_COOKIE_SECURE=true
+          export BACKEND_CORS_ORIGINS=https://pixel.zappos-dev.work
+          export FRONTEND_APP_URL=https://pixel.zappos-dev.work
+          export NEXT_PUBLIC_API_BASE_URL=https://pixel.zappos-dev.work/api/v1
+          export GOOGLE_REDIRECT_URI=https://pixel.zappos-dev.work/api/v1/auth/google/callback
 
-          docker compose -f compose.prod.yml up -d --build --remove-orphans
+          if ! compose_prod up -d --build --remove-orphans; then
+            compose_prod ps || true
+            compose_prod logs --tail=200 frontend backend caddy || true
+            exit 1
+          fi
           docker image prune -f
 
-          docker compose -f compose.prod.yml ps
+          compose_prod ps
 
           for attempt in $(seq 1 30); do
             if curl -fsS https://pixel.zappos-dev.work/api/v1/health > /dev/null; then
@@ -81,7 +97,22 @@ jobs:
             sleep 2
           done
 
-          docker compose -f compose.prod.yml exec -T backend python - <<'PY'
+          for attempt in $(seq 1 30); do
+            if curl -fsS https://pixel.zappos-dev.work/health > /dev/null; then
+              break
+            fi
+
+            if [ "$attempt" -eq 30 ]; then
+              echo "Frontend health check did not recover in time." >&2
+              compose_prod ps || true
+              compose_prod logs --tail=200 frontend caddy || true
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          compose_prod exec -T backend python - <<'PY'
           import asyncio
 
           from app.db.session import AsyncSessionLocal
@@ -111,11 +142,11 @@ jobs:
 
           LAST_COMMIT_SUBJECT="$(git log -1 --pretty=%s)"
           if printf '%s' "$LAST_COMMIT_SUBJECT" | grep -Fq "[run-production-heart-reset-20260423-1]"; then
-            docker compose -f compose.prod.yml exec -T backend python -m app.cli.reset_seed_production_world
+            compose_prod exec -T backend python -m app.cli.reset_seed_production_world
           elif printf '%s' "$LAST_COMMIT_SUBJECT" | grep -Fq "[run-production-heart-reset-20260423-2]"; then
-            docker compose -f compose.prod.yml exec -T backend python -m app.cli.reset_seed_production_world --target-width 22 --target-height 26
+            compose_prod exec -T backend python -m app.cli.reset_seed_production_world --target-width 22 --target-height 26
           elif printf '%s' "$LAST_COMMIT_SUBJECT" | grep -Fq "[run-production-heart-reset-20260423-3]"; then
-            docker compose -f compose.prod.yml exec -T backend python -m app.cli.reset_seed_production_world --image-path /app/app/assets/heart-manual.png
+            compose_prod exec -T backend python -m app.cli.reset_seed_production_world --image-path /app/app/assets/heart-manual.png
           fi
           REMOTE
 
