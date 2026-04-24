@@ -465,6 +465,8 @@ const CLAIM_OUTLINE_FETCH_DEBOUNCE_MS = 120;
 const CLAIM_OUTLINE_FETCH_REPEAT_CACHE_MS = 1000;
 const CLAIM_OUTLINE_FETCH_MARGIN = 2;
 const CLAIM_OUTLINE_FETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
+const CLAIM_OUTLINE_MAX_FREE_FETCH_CELLS = 200_000;
+const CLAIM_OUTLINE_MAX_FOCUSED_FETCH_CELLS = 90_000;
 const VISIBLE_AREA_PREFETCH_DEBOUNCE_MS = 180;
 const VISIBLE_AREA_POLL_INTERVAL_MS = 5000;
 const VISIBLE_AREA_PREFETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
@@ -1325,6 +1327,10 @@ function getPendingClaimCount(
     (total, rectangle) => total + getPendingClaimRectanglePixelCount(rectangle),
     0,
   );
+}
+
+function getWorldWindowCellCount(bounds: Pick<VisibleAreaBounds, "minX" | "maxX" | "minY" | "maxY">): number {
+  return Math.max(0, bounds.maxX - bounds.minX + 1) * Math.max(0, bounds.maxY - bounds.minY + 1);
 }
 
 function isPixelInsidePendingClaimRectangle(
@@ -4324,7 +4330,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return ownedAreas.find((area) => area.id === claimTargetAreaId) ?? null;
   }, [claimTargetAreaId, ownedAreas, selectedArea]);
   const activeClaimTargetAreaName = activeClaimTargetArea?.name ?? "selected area";
-  const focusedClaimOutlineArea = selectedArea?.status === "finished" ? selectedArea : null;
+  const focusedClaimOutlineArea = selectedArea?.bounds ? selectedArea : null;
   const focusedClaimOutlineAreaId = focusedClaimOutlineArea?.id ?? null;
   const focusedClaimOutlineAreaPublicId = focusedClaimOutlineArea?.public_id ?? null;
   const focusedClaimOutlineAreaBounds = focusedClaimOutlineArea?.bounds ?? null;
@@ -4911,7 +4917,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return null;
     }
 
-    if (fetchWorldTileDetailScale !== 1 && focusedClaimOutlineAreaId === null) {
+    if (focusedClaimOutlineAreaId === null && (!semanticZoomMode || fetchWorldTileDetailScale !== 1)) {
       return null;
     }
 
@@ -4956,11 +4962,15 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     };
 
     if (focusedClaimOutlineAreaId === null) {
+      if (getWorldWindowCellCount(viewportBounds) > CLAIM_OUTLINE_MAX_FREE_FETCH_CELLS) {
+        return null;
+      }
+
       return viewportBounds;
     }
 
     if (focusedClaimOutlineAreaBounds === null) {
-      return fetchWorldTileDetailScale === 1 ? viewportBounds : null;
+      return null;
     }
 
     const focusedAreaBounds = {
@@ -4983,6 +4993,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return null;
     }
 
+    if (getWorldWindowCellCount(focusedWindowBounds) > CLAIM_OUTLINE_MAX_FOCUSED_FETCH_CELLS) {
+      return null;
+    }
+
     return focusedWindowBounds;
   }, [
     activeWorldBounds.maxX,
@@ -4995,6 +5009,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     fetchWorldTileDetailScale,
     focusedClaimOutlineAreaBounds,
     focusedClaimOutlineAreaId,
+    semanticZoomMode,
     viewportSize.height,
     viewportSize.width,
   ]);

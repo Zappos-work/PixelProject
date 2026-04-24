@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import Integer, and_, case, delete, func, insert, or_, select, text, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from PIL import Image
 
 from app.core.config import Settings, get_settings
@@ -990,6 +991,144 @@ async def get_claim_context_pixels(
     )
 
 
+def _build_claim_outline_segments(
+    orientation: str,
+    edges_by_line: dict[tuple[str, int], list[tuple[int, int, str]]],
+) -> list[ClaimOutlineSegment]:
+    segments: list[ClaimOutlineSegment] = []
+
+    for (status, line), edges in edges_by_line.items():
+        edges.sort(key=lambda edge: edge[0])
+        current_start: int | None = None
+        current_end: int | None = None
+
+        for start, end, _status in edges:
+            if current_start is not None and current_end == start:
+                current_end = end
+                continue
+
+            if current_start is not None and current_end is not None:
+                segments.append(
+                    ClaimOutlineSegment(
+                        orientation=orientation,
+                        line=line,
+                        start=current_start,
+                        end=current_end,
+                        status=status,
+                    )
+                )
+
+            current_start = start
+            current_end = end
+
+        if current_start is not None and current_end is not None:
+            segments.append(
+                ClaimOutlineSegment(
+                    orientation=orientation,
+                    line=line,
+                    start=current_start,
+                    end=current_end,
+                    status=status,
+                )
+            )
+
+    return segments
+
+
+async def _get_focused_claim_outline_pixels(
+    session: AsyncSession,
+    low_x: int,
+    high_x: int,
+    low_y: int,
+    high_y: int,
+    viewer: User | None,
+    area_id: UUID,
+) -> ClaimOutlineWindow:
+    contributor_area_ids = await _get_viewer_contributor_area_ids(session, viewer, {area_id})
+    horizontal_edges: dict[tuple[str, int], list[tuple[int, int, str]]] = {}
+    vertical_edges: dict[tuple[str, int], list[tuple[int, int, str]]] = {}
+    edge_count = 0
+    truncated = False
+
+    edge_specs = (
+        ("horizontal", 0, -1, 0, 0),
+        ("horizontal", 0, 1, 0, 1),
+        ("vertical", -1, 0, 0, 0),
+        ("vertical", 1, 0, 1, 0),
+    )
+
+    for orientation, neighbor_dx, neighbor_dy, line_offset_x, line_offset_y in edge_specs:
+        if edge_count > MAX_CLAIM_OUTLINE_PIXELS:
+            truncated = True
+            break
+
+        pixel = aliased(WorldPixel)
+        neighbor = aliased(WorldPixel)
+        neighbor_exists = (
+            select(neighbor.id)
+            .where(
+                neighbor.area_id == area_id,
+                neighbor.x == pixel.x + neighbor_dx,
+                neighbor.y == pixel.y + neighbor_dy,
+            )
+            .exists()
+        )
+        rows = (
+            await session.execute(
+                select(pixel.x, pixel.y, pixel.owner_user_id)
+                .where(
+                    pixel.area_id == area_id,
+                    pixel.x >= low_x,
+                    pixel.x <= high_x,
+                    pixel.y >= low_y,
+                    pixel.y <= high_y,
+                    ~neighbor_exists,
+                )
+                .order_by(pixel.y, pixel.x)
+                .limit(MAX_CLAIM_OUTLINE_PIXELS + 1 - edge_count)
+            )
+        ).all()
+
+        if edge_count + len(rows) > MAX_CLAIM_OUTLINE_PIXELS:
+            truncated = True
+            rows = rows[: MAX_CLAIM_OUTLINE_PIXELS - edge_count]
+
+        for x, y, owner_user_id in rows:
+            relation = _get_claim_viewer_relation(
+                owner_user_id,
+                area_id,
+                False,
+                viewer,
+                contributor_area_ids,
+            )
+            status = relation if relation in {"owner", "contributor", "blocked", "starter"} else "blocked"
+
+            if orientation == "horizontal":
+                line = int(y) + line_offset_y
+                start = int(x)
+                end = start + 1
+                horizontal_edges.setdefault((status, line), []).append((start, end, status))
+            else:
+                line = int(x) + line_offset_x
+                start = int(y)
+                end = start + 1
+                vertical_edges.setdefault((status, line), []).append((start, end, status))
+
+        edge_count += len(rows)
+
+    return ClaimOutlineWindow(
+        min_x=low_x,
+        max_x=high_x,
+        min_y=low_y,
+        max_y=high_y,
+        truncated=truncated,
+        segments=[
+            *_build_claim_outline_segments("horizontal", horizontal_edges),
+            *_build_claim_outline_segments("vertical", vertical_edges),
+        ],
+    )
+
+
 async def get_claim_outline_pixels(
     session: AsyncSession,
     min_x: int,
@@ -1009,6 +1148,17 @@ async def get_claim_outline_pixels(
             select(ClaimArea.id).where(ClaimArea.public_id == focus_area_public_id)
         )
 
+    if resolved_focus_area_id is not None:
+        return await _get_focused_claim_outline_pixels(
+            session,
+            low_x,
+            high_x,
+            low_y,
+            high_y,
+            viewer,
+            resolved_focus_area_id,
+        )
+
     # Fetch only the viewport plus a one-cell gutter. The gutter lets us suppress
     # edges against neighboring claimed pixels without pulling whole areas into
     # memory, which is especially important for large finished artworks.
@@ -1016,10 +1166,7 @@ async def get_claim_outline_pixels(
     query_high_x = high_x + 1
     query_low_y = low_y - 1
     query_high_y = high_y + 1
-    area_visibility_filters = [ClaimArea.status == CLAIM_AREA_STATUS_ACTIVE]
-
-    if resolved_focus_area_id is not None:
-        area_visibility_filters.append(WorldPixel.area_id == resolved_focus_area_id)
+    area_visibility_filter = ClaimArea.status == CLAIM_AREA_STATUS_ACTIVE
 
     visible_claim_filter = and_(
         WorldPixel.x >= query_low_x,
@@ -1032,7 +1179,7 @@ async def get_claim_outline_pixels(
                 WorldPixel.area_id.is_(None),
                 WorldPixel.owner_user_id.is_not(None),
             ),
-            *area_visibility_filters,
+            area_visibility_filter,
         ),
     )
     rows = (

@@ -395,18 +395,10 @@ select {
   0%,
   100% {
     background: rgba(62, 152, 129, 0.12);
-    box-shadow:
-      inset 0 0 0 1px rgba(122, 255, 222, 0.72),
-      0 0 0 1px rgba(6, 12, 18, 0.22),
-      0 0 10px rgba(122, 255, 222, 0.12);
   }
 
   50% {
     background: rgba(62, 152, 129, 0.18);
-    box-shadow:
-      inset 0 0 0 1px rgba(168, 255, 235, 0.9),
-      0 0 0 1px rgba(6, 12, 18, 0.28),
-      0 0 16px rgba(122, 255, 222, 0.2);
   }
 }
 

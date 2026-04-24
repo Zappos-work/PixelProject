@@ -8,11 +8,13 @@ Player-facing release notes for PixelProject.
 
 - Area Info opened from the world now receives the full area summary in the inspection response, avoiding the extra detail hydrate request.
 - Focused finished-area outlines now use the public Area # in requests and clamp to the selected area's bounds instead of the whole zoomed-out viewport.
+- Claim outlines now stay off in visual-only zoom, and large focused Area Info outlines wait until the player zooms closer.
 - World pixel window reads now use a slimmer backend projection and a y/x window index for faster high-zoom fetches.
 
 ### Bug Fixes
 
 - Pending Claim Area fills are merged into union rectangles before rendering, preventing row seams when a new rectangle overlaps already staged claim cells.
+- Pending Claim Area fills no longer draw their own animated internal border; the shared union outline is the only border.
 
 ## 0.1.11 - Apr 24, 2026
 
