@@ -15,7 +15,9 @@ CMD ["npm", "run", "dev"]
 
 FROM deps AS builder
 
+ARG NEXT_PUBLIC_API_BASE_URL=/api/v1
 ENV NEXT_TELEMETRY_DISABLED=1
+ENV NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}
 RUN npm run build
 
 FROM node:22-alpine AS production
