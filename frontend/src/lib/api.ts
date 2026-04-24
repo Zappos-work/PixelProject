@@ -785,6 +785,7 @@ export async function fetchClaimOutlinePixels(
   maxX: number,
   minY: number,
   maxY: number,
+  focusAreaId?: string | null,
   signal?: AbortSignal,
 ): Promise<ClaimOutlineWindow> {
   try {
@@ -794,6 +795,11 @@ export async function fetchClaimOutlinePixels(
       min_y: String(minY),
       max_y: String(maxY),
     });
+
+    if (focusAreaId) {
+      params.set("focus_area_id", focusAreaId);
+    }
+
     const response = await fetch(`${clientApiBaseUrl}/world/claims/outline?${params.toString()}`, {
       cache: "no-store",
       credentials: "include",

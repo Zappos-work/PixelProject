@@ -906,47 +906,36 @@ async def get_claim_outline_pixels(
     min_y: int,
     max_y: int,
     viewer: User | None = None,
+    focus_area_id: UUID | None = None,
 ) -> ClaimOutlineWindow:
     low_x, high_x = sorted((min_x, max_x))
     low_y, high_y = sorted((min_y, max_y))
-    visible_area_ids = [
-        area_id
-        for area_id in (
-            await session.scalars(
-                select(WorldPixel.area_id)
-                .where(
-                    WorldPixel.area_id.is_not(None),
-                    WorldPixel.is_starter.is_(False),
-                    WorldPixel.x >= low_x,
-                    WorldPixel.x <= high_x,
-                    WorldPixel.y >= low_y,
-                    WorldPixel.y <= high_y,
-                )
-                .distinct()
-            )
-        ).all()
-        if area_id is not None
-    ]
-    viewport_claim_filter = and_(
-        WorldPixel.x >= low_x,
-        WorldPixel.x <= high_x,
-        WorldPixel.y >= low_y,
-        WorldPixel.y <= high_y,
+
+    # Fetch only the viewport plus a one-cell gutter. The gutter lets us suppress
+    # edges against neighboring claimed pixels without pulling whole areas into
+    # memory, which is especially important for large finished artworks.
+    query_low_x = low_x - 1
+    query_high_x = high_x + 1
+    query_low_y = low_y - 1
+    query_high_y = high_y + 1
+    area_visibility_filters = [ClaimArea.status == CLAIM_AREA_STATUS_ACTIVE]
+
+    if focus_area_id is not None:
+        area_visibility_filters.append(WorldPixel.area_id == focus_area_id)
+
+    visible_claim_filter = and_(
+        WorldPixel.x >= query_low_x,
+        WorldPixel.x <= query_high_x,
+        WorldPixel.y >= query_low_y,
+        WorldPixel.y <= query_high_y,
         or_(
             WorldPixel.is_starter.is_(True),
             and_(
                 WorldPixel.area_id.is_(None),
                 WorldPixel.owner_user_id.is_not(None),
             ),
+            *area_visibility_filters,
         ),
-    )
-    outline_scope_filter = (
-        or_(
-            viewport_claim_filter,
-            WorldPixel.area_id.in_(visible_area_ids),
-        )
-        if visible_area_ids
-        else viewport_claim_filter
     )
     rows = (
         await session.execute(
@@ -957,7 +946,8 @@ async def get_claim_outline_pixels(
                 WorldPixel.area_id,
                 WorldPixel.is_starter,
             )
-            .where(outline_scope_filter)
+            .outerjoin(ClaimArea, ClaimArea.id == WorldPixel.area_id)
+            .where(visible_claim_filter)
             .order_by(WorldPixel.y, WorldPixel.x)
             .limit(MAX_CLAIM_OUTLINE_PIXELS + 1)
         )
@@ -1007,6 +997,9 @@ async def get_claim_outline_pixels(
         target.setdefault((status, line), []).append((start, end, status))
 
     for (x, y), state in outline_pixels.items():
+        if x < low_x or x > high_x or y < low_y or y > high_y:
+            continue
+
         region_key = state["region_key"]
         status = str(state["status"])
         neighbors = (
@@ -1071,16 +1064,11 @@ async def get_claim_outline_pixels(
 
         return segments
 
-    resolved_min_x = min((x for x, _y, _owner_user_id, _area_id, _is_starter in visible_rows), default=low_x)
-    resolved_max_x = max((x for x, _y, _owner_user_id, _area_id, _is_starter in visible_rows), default=high_x)
-    resolved_min_y = min((y for _x, y, _owner_user_id, _area_id, _is_starter in visible_rows), default=low_y)
-    resolved_max_y = max((y for _x, y, _owner_user_id, _area_id, _is_starter in visible_rows), default=high_y)
-
     return ClaimOutlineWindow(
-        min_x=resolved_min_x,
-        max_x=resolved_max_x,
-        min_y=resolved_min_y,
-        max_y=resolved_max_y,
+        min_x=low_x,
+        max_x=high_x,
+        min_y=low_y,
+        max_y=high_y,
         truncated=truncated,
         segments=[
             *build_segments("horizontal", horizontal_edges),

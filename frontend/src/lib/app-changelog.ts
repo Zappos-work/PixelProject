@@ -21,6 +21,16 @@ export const APP_CHANGELOG: ChangelogEntry[] = [
           "Local Docker Compose now keeps hot-reload development containers, while production Docker builds use dedicated runtime stages.",
           "Production frontend containers now run `next start`, and production backend containers run Uvicorn without reload and with worker support.",
           "Large world-window API reads and tile requests outside the active world are now rejected before they can create expensive database or cache work.",
+          "Claim outlines now load from the visible window plus a small neighbor gutter instead of pulling whole areas into memory.",
+        ],
+      },
+      {
+        title: "Bug Fixes",
+        items: [
+          "Color Pixels can no longer be staged outside the actual claimed area barrier.",
+          "Finished areas immediately free the local area slot and clear their border while slower refreshes continue in the background.",
+          "Finished area outlines stay hidden during normal browsing and are only requested when that finished area is opened in Area Info.",
+          "Pending Claim Area rectangles now share one combined outline, so adjacent rectangles no longer draw internal borders.",
         ],
       },
       {

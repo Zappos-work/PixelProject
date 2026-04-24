@@ -421,6 +421,7 @@ type WorldViewportCanvasProps = {
   onTileLoaded?: (layer: DebugTileLayer, tileKey: string, src: string) => void;
   outsideArtPatternImages: ReactNode;
   pendingPaintTiles: PendingPaintCanvasTile[];
+  pendingClaimOutlinePath: string | null;
   renderedPendingClaims: PendingClaimSegment[];
   renderedWorldTiles: WorldTile[];
   retainedVisualTileSrcs: Map<string, string>;
@@ -1593,6 +1594,99 @@ function buildPendingClaimSegments(
   return segments;
 }
 
+function addPendingClaimEdgeInterval(
+  target: Map<number, Map<number, number>>,
+  line: number,
+  start: number,
+  end: number,
+): void {
+  if (start === end) {
+    return;
+  }
+
+  const events = target.get(line) ?? new Map<number, number>();
+  events.set(start, (events.get(start) ?? 0) + 1);
+  events.set(end, (events.get(end) ?? 0) - 1);
+  target.set(line, events);
+}
+
+function appendPendingClaimOutlineCommands(
+  target: string[],
+  orientation: "horizontal" | "vertical",
+  intervalEvents: Map<number, Map<number, number>>,
+  camera: CameraState,
+): void {
+  const lines = [...intervalEvents.entries()].sort((left, right) => left[0] - right[0]);
+
+  for (const [line, events] of lines) {
+    const sortedEvents = [...events.entries()].sort((left, right) => left[0] - right[0]);
+    let activeCount = 0;
+    let segmentStart: number | null = null;
+
+    for (const [position, delta] of sortedEvents) {
+      const wasVisible = activeCount % 2 === 1;
+      activeCount += delta;
+      const isVisible = activeCount % 2 === 1;
+
+      if (!wasVisible && isVisible) {
+        segmentStart = position;
+        continue;
+      }
+
+      if (wasVisible && !isVisible && segmentStart !== null && segmentStart < position) {
+        if (orientation === "horizontal") {
+          const y = snapSvgLine(worldBoundaryScreenY(line, camera));
+          const x1 = snapSvgLine(camera.x + segmentStart * camera.zoom);
+          const x2 = snapSvgLine(camera.x + position * camera.zoom);
+          target.push(`M${x1} ${y}H${x2}`);
+        } else {
+          const x = snapSvgLine(camera.x + line * camera.zoom);
+          const y1 = snapSvgLine(worldBoundaryScreenY(segmentStart, camera));
+          const y2 = snapSvgLine(worldBoundaryScreenY(position, camera));
+          target.push(`M${x} ${y1}V${y2}`);
+        }
+
+        segmentStart = null;
+      }
+    }
+  }
+}
+
+function buildPendingClaimOutlinePath(
+  pendingClaimPixels: PixelCoordinate[],
+  pendingClaimRectangles: PendingClaimRectangle[],
+  camera: CameraState,
+): string | null {
+  if (pendingClaimPixels.length === 0 && pendingClaimRectangles.length === 0) {
+    return null;
+  }
+
+  const horizontalEdges = new Map<number, Map<number, number>>();
+  const verticalEdges = new Map<number, Map<number, number>>();
+
+  const addCellEdges = (minX: number, maxX: number, minY: number, maxY: number): void => {
+    const endX = maxX + 1;
+    const endY = maxY + 1;
+    addPendingClaimEdgeInterval(horizontalEdges, minY, minX, endX);
+    addPendingClaimEdgeInterval(horizontalEdges, endY, minX, endX);
+    addPendingClaimEdgeInterval(verticalEdges, minX, minY, endY);
+    addPendingClaimEdgeInterval(verticalEdges, endX, minY, endY);
+  };
+
+  for (const pixel of pendingClaimPixels) {
+    addCellEdges(pixel.x, pixel.x, pixel.y, pixel.y);
+  }
+
+  for (const rectangle of pendingClaimRectangles) {
+    addCellEdges(rectangle.minX, rectangle.maxX, rectangle.minY, rectangle.maxY);
+  }
+
+  const commands: string[] = [];
+  appendPendingClaimOutlineCommands(commands, "horizontal", horizontalEdges, camera);
+  appendPendingClaimOutlineCommands(commands, "vertical", verticalEdges, camera);
+  return commands.length === 0 ? null : commands.join("");
+}
+
 function snapSvgLine(value: number): number {
   return Math.round(value) + 0.5;
 }
@@ -2103,6 +2197,7 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
   onTileLoaded,
   outsideArtPatternImages,
   pendingPaintTiles,
+  pendingClaimOutlinePath,
   renderedPendingClaims,
   renderedWorldTiles,
   retainedVisualTileSrcs,
@@ -2238,6 +2333,22 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
                 vectorEffect="non-scaling-stroke"
               />
             ))}
+          </svg>
+        ) : null}
+        {pendingClaimOutlinePath ? (
+          <svg
+            aria-hidden="true"
+            className="world-pending-claim-outline-layer"
+            height={viewportSize.height}
+            shapeRendering="crispEdges"
+            width={viewportSize.width}
+          >
+            <path
+              className="world-pending-claim-outline-path"
+              d={pendingClaimOutlinePath}
+              fill="none"
+              vectorEffect="non-scaling-stroke"
+            />
           </svg>
         ) : null}
         {renderedPendingClaims.map((pixel) => (
@@ -3276,6 +3387,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const claimOutlineFetchAbortRef = useRef<AbortController | null>(null);
   const claimOutlineFetchKeyRef = useRef<string | null>(null);
   const claimOutlineFetchLastSuccessRef = useRef<{ key: string; at: number } | null>(null);
+  const claimOutlineFocusRef = useRef<string | null>(null);
   const syncSelectedPlacementStateRef = useRef<(pixel: PixelCoordinate | null) => void>(() => undefined);
   const syncInspectedPixelRecordRef = useRef<() => void>(() => undefined);
   const rightEraseStrokeRef = useRef<RightEraseStrokeState | null>(null);
@@ -4145,6 +4257,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return ownedAreas.find((area) => area.id === claimTargetAreaId) ?? null;
   }, [claimTargetAreaId, ownedAreas, selectedArea]);
   const activeClaimTargetAreaName = activeClaimTargetArea?.name ?? "selected area";
+  const focusedClaimOutlineAreaId = selectedArea?.status === "finished" ? selectedArea.id : null;
 
   currentUserRef.current = currentUser;
   activeWorldBoundsRef.current = activeWorldBounds;
@@ -4722,7 +4835,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   const claimOutlineFetchBounds = useMemo(() => {
     if (
-      fetchWorldTileDetailScale !== 1 ||
+      (fetchWorldTileDetailScale !== 1 && focusedClaimOutlineAreaId === null) ||
       viewportSize.width === 0 ||
       viewportSize.height === 0
     ) {
@@ -4777,6 +4890,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     fetchCamera.y,
     fetchCamera.zoom,
     fetchWorldTileDetailScale,
+    focusedClaimOutlineAreaId,
     viewportSize.height,
     viewportSize.width,
   ]);
@@ -4941,6 +5055,15 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setClaimOutlineSegments((current) => current.length === 0 ? current : []);
   }, []);
 
+  useEffect(() => {
+    if (claimOutlineFocusRef.current === focusedClaimOutlineAreaId) {
+      return;
+    }
+
+    claimOutlineFocusRef.current = focusedClaimOutlineAreaId;
+    clearClaimOutlinesImmediately();
+  }, [clearClaimOutlinesImmediately, focusedClaimOutlineAreaId]);
+
   const refreshClaimOutlineNow = useCallback(async (options?: { force?: boolean }): Promise<void> => {
     if (claimOutlineFetchBounds === null) {
       clearClaimOutlinesImmediately();
@@ -4948,7 +5071,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     const bounds = claimOutlineFetchBounds;
-    const requestKey = getFetchBoundsKey(bounds);
+    const requestKey = `${getFetchBoundsKey(bounds)}:${focusedClaimOutlineAreaId ?? "active"}:${currentUser?.id ?? "guest"}`;
     const now = performance.now();
     const force = options?.force === true;
     const cacheHit = claimOutlineFetchLastSuccessRef.current;
@@ -4983,6 +5106,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       bounds.maxX,
       bounds.minY,
       bounds.maxY,
+      focusedClaimOutlineAreaId,
       abortController.signal,
     );
 
@@ -5017,7 +5141,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       `${result.segments.length} segments`,
       performance.now() - startedAt,
     );
-  }, [claimOutlineFetchBounds, clearClaimOutlinesImmediately]);
+  }, [claimOutlineFetchBounds, clearClaimOutlinesImmediately, currentUser?.id, focusedClaimOutlineAreaId]);
 
   useEffect(() => {
     if (pixelFetchBounds === null) {
@@ -6080,6 +6204,14 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       "Compute pending claim overlay",
       () => buildPendingClaimSegments(pendingClaimPixels, pendingClaimRectangles, camera),
       (segments) => `${segments.length} segments from ${pendingClaimPixels.length} pixels, ${pendingClaimRectangles.length} rectangles`,
+    );
+  }, [camera, pendingClaimPixels, pendingClaimRectangles]);
+
+  const pendingClaimOutlinePath = useMemo(() => {
+    return measureDebugWork(
+      "Compute pending claim outline",
+      () => buildPendingClaimOutlinePath(pendingClaimPixels, pendingClaimRectangles, camera),
+      (path) => (path === null ? "no outline" : `${path.length} path characters`),
     );
   }, [camera, pendingClaimPixels, pendingClaimRectangles]);
 
@@ -8834,6 +8966,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               onTileLoaded={handleTileLoaded}
               outsideArtPatternImages={outsideArtPatternImages}
               pendingPaintTiles={pendingPaintTiles}
+              pendingClaimOutlinePath={pendingClaimOutlinePath}
               renderedPendingClaims={renderedPendingClaims}
               renderedWorldTiles={renderedWorldTiles}
           retainedVisualTileSrcs={retainedTileSrcRef.current.visual}
