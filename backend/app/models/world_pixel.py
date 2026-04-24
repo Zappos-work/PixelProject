@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -10,7 +10,14 @@ from app.models.base import Base
 
 class WorldPixel(Base):
     __tablename__ = "world_pixels"
-    __table_args__ = (UniqueConstraint("x", "y", name="uq_world_pixels_xy"),)
+    __table_args__ = (
+        UniqueConstraint("x", "y", name="uq_world_pixels_xy"),
+        Index(
+            "ix_world_pixels_window_yx",
+            "y",
+            "x",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     x: Mapped[int] = mapped_column(Integer, index=True, nullable=False)

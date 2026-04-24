@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(case_sensitive=False)
 
     app_name: str = "PixelProject API"
-    app_version: str = "0.1.11"
+    app_version: str = "0.1.12"
     app_env: str = "development"
     secret_key: str = "change-me"
     api_v1_prefix: str = "/api/v1"

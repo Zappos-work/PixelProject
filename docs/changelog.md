@@ -2,6 +2,17 @@
 
 Player-facing release notes for PixelProject.
 
+## 0.1.12 - Apr 24, 2026
+
+### Improvements
+
+- Area Info opened from the world now receives the full area summary in the inspection response, avoiding the extra detail hydrate request.
+- World pixel window reads now use a slimmer backend projection and a y/x window index for faster high-zoom fetches.
+
+### Bug Fixes
+
+- Pending Claim Area fills are merged into union rectangles before rendering, preventing row seams when a new rectangle overlaps already staged claim cells.
+
 ## 0.1.11 - Apr 24, 2026
 
 ### Improvements

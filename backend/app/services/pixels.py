@@ -797,7 +797,21 @@ async def get_visible_world_pixels(
     low_y, high_y = sorted((min_y, max_y))
 
     result = await session.execute(
-        select(WorldPixel, User)
+        select(
+            WorldPixel.id,
+            WorldPixel.x,
+            WorldPixel.y,
+            WorldPixel.chunk_x,
+            WorldPixel.chunk_y,
+            WorldPixel.color_id,
+            WorldPixel.owner_user_id,
+            User.public_id.label("owner_public_id"),
+            User.display_name.label("owner_display_name"),
+            WorldPixel.area_id,
+            WorldPixel.is_starter,
+            WorldPixel.created_at,
+            WorldPixel.updated_at,
+        )
         .outerjoin(User, User.id == WorldPixel.owner_user_id)
         .where(
             WorldPixel.x >= low_x,
@@ -805,20 +819,19 @@ async def get_visible_world_pixels(
             WorldPixel.y >= low_y,
             WorldPixel.y <= high_y,
         )
-        .order_by(WorldPixel.x.asc(), WorldPixel.y.asc())
+        .order_by(WorldPixel.y.asc(), WorldPixel.x.asc())
         .limit(MAX_VISIBLE_PIXELS + 1)
     )
     rows = result.all()
     truncated = len(rows) > MAX_VISIBLE_PIXELS
     visible_rows = rows[:MAX_VISIBLE_PIXELS]
-    visible_pixels = [pixel for pixel, _owner in visible_rows]
     contributor_area_ids = await _get_viewer_contributor_area_ids(
         session,
         viewer,
         {
-            pixel.area_id
-            for pixel in visible_pixels
-            if pixel.area_id is not None
+            row.area_id
+            for row in visible_rows
+            if row.area_id is not None
         },
     )
 
@@ -829,16 +842,29 @@ async def get_visible_world_pixels(
         max_y=high_y,
         truncated=truncated,
         pixels=[
-            build_world_pixel_summary(pixel, owner).model_copy(
-                update={
-                    "viewer_relation": _get_pixel_viewer_relation(
-                        pixel,
-                        viewer,
-                        contributor_area_ids,
-                    ),
-                },
+            WorldPixelSummary(
+                id=row.id,
+                x=row.x,
+                y=row.y,
+                chunk_x=row.chunk_x,
+                chunk_y=row.chunk_y,
+                color_id=row.color_id,
+                owner_user_id=row.owner_user_id,
+                owner_public_id=row.owner_public_id,
+                owner_display_name=row.owner_display_name,
+                area_id=row.area_id,
+                is_starter=row.is_starter,
+                viewer_relation=_get_claim_viewer_relation(
+                    row.owner_user_id,
+                    row.area_id,
+                    row.is_starter,
+                    viewer,
+                    contributor_area_ids,
+                ),
+                created_at=row.created_at,
+                updated_at=row.updated_at,
             )
-            for pixel, owner in visible_rows
+            for row in visible_rows
         ],
     )
 
@@ -2178,18 +2204,9 @@ async def get_claim_area_at_pixel(
         return ClaimAreaInspection(pixel=pixel_summary, area=None)
 
     area, area_owner = area_result
-    contributor_count = (await _get_area_contributor_counts(session, [area.id])).get(area.id, 0)
-    admin_area_ids = await _get_viewer_admin_area_ids(session, viewer, {area.id})
     return ClaimAreaInspection(
         pixel=pixel_summary,
-        area=build_claim_area_preview(
-            area,
-            area_owner,
-            contributor_count,
-            viewer,
-            contributor_area_ids,
-            admin_area_ids,
-        ),
+        area=await build_claim_area_summary(session, area, area_owner, viewer),
     )
 
 

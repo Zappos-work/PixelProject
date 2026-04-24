@@ -153,6 +153,11 @@ type PendingClaimRectangle = {
   maxY: number;
 };
 
+type PendingClaimRowInterval = {
+  start: number;
+  end: number;
+};
+
 type ClaimContextPixelRecord = ClaimContextPixel;
 
 type ProfileMessage = {
@@ -1534,66 +1539,6 @@ function splitPendingClaimRectangleAtPixel(
   return nextRectangles;
 }
 
-function buildPendingClaimSegments(
-  pendingClaimPixels: PixelCoordinate[],
-  pendingClaimRectangles: PendingClaimRectangle[],
-  camera: CameraState,
-): PendingClaimSegment[] {
-  const rows = new Map<number, number[]>();
-
-  for (const pixel of pendingClaimPixels) {
-    const row = rows.get(pixel.y);
-    if (row) {
-      row.push(pixel.x);
-    } else {
-      rows.set(pixel.y, [pixel.x]);
-    }
-  }
-
-  const segments: PendingClaimSegment[] = [];
-
-  for (const [y, xs] of rows) {
-    xs.sort((left, right) => left - right);
-    let runStart = xs[0];
-    let previousX = xs[0];
-
-    for (let index = 1; index <= xs.length; index += 1) {
-      const currentX = xs[index];
-      const continuesRun = currentX === previousX + 1;
-
-      if (continuesRun) {
-        previousX = currentX;
-        continue;
-      }
-
-      segments.push({
-        key: `pending-claim-${y}-${runStart}-${previousX}`,
-        left: camera.x + runStart * camera.zoom,
-        top: worldPixelScreenTop(y, camera),
-        width: (previousX - runStart + 1) * camera.zoom,
-        height: camera.zoom,
-        isBulk: false,
-      });
-
-      runStart = currentX;
-      previousX = currentX;
-    }
-  }
-
-  for (const rectangle of pendingClaimRectangles) {
-    segments.push({
-      key: `pending-claim-rectangle-${rectangle.minX}-${rectangle.minY}-${rectangle.maxX}-${rectangle.maxY}`,
-      left: camera.x + rectangle.minX * camera.zoom,
-      top: worldRangeScreenTop(rectangle.maxY + 1, camera),
-      width: (rectangle.maxX - rectangle.minX + 1) * camera.zoom,
-      height: (rectangle.maxY - rectangle.minY + 1) * camera.zoom,
-      isBulk: true,
-    });
-  }
-
-  return segments;
-}
-
 function addPendingClaimEdgeInterval(
   target: Map<number, Map<number, number>>,
   line: number,
@@ -1652,6 +1597,124 @@ function appendPendingClaimOutlineCommands(
   }
 }
 
+function buildMergedPendingClaimRowIntervals(
+  pendingClaimPixels: PixelCoordinate[],
+): Array<[number, PendingClaimRowInterval[]]> {
+  const rows = new Map<number, PendingClaimRowInterval[]>();
+  const addRowInterval = (y: number, start: number, end: number): void => {
+    if (start > end) {
+      return;
+    }
+
+    const row = rows.get(y);
+    const interval = { start, end };
+    if (row) {
+      row.push(interval);
+    } else {
+      rows.set(y, [interval]);
+    }
+  };
+
+  for (const pixel of pendingClaimPixels) {
+    addRowInterval(pixel.y, pixel.x, pixel.x);
+  }
+
+  return [...rows.entries()]
+    .sort((left, right) => left[0] - right[0])
+    .map(([y, intervals]): [number, PendingClaimRowInterval[]] => {
+      const sortedIntervals = [...intervals].sort((left, right) => (
+        left.start === right.start ? left.end - right.end : left.start - right.start
+      ));
+      const merged: PendingClaimRowInterval[] = [];
+
+      for (const interval of sortedIntervals) {
+        const previous = merged[merged.length - 1];
+
+        if (previous && interval.start <= previous.end + 1) {
+          previous.end = Math.max(previous.end, interval.end);
+          continue;
+        }
+
+        merged.push({ ...interval });
+      }
+
+      return [y, merged];
+    });
+}
+
+function buildPendingClaimPixelRectangles(pendingClaimPixels: PixelCoordinate[]): PendingClaimRectangle[] {
+  const rows = buildMergedPendingClaimRowIntervals(pendingClaimPixels);
+  const rectangles: PendingClaimRectangle[] = [];
+  const activeRectangles = new Map<string, PendingClaimRectangle>();
+
+  for (const [y, intervals] of rows) {
+    const activeKeysThisRow = new Set<string>();
+
+    for (const interval of intervals) {
+      const key = `${interval.start}:${interval.end}`;
+      const activeRectangle = activeRectangles.get(key);
+
+      if (activeRectangle && activeRectangle.maxY + 1 === y) {
+        activeRectangle.maxY = y;
+      } else {
+        if (activeRectangle) {
+          rectangles.push(activeRectangle);
+        }
+
+        activeRectangles.set(key, {
+          minX: interval.start,
+          maxX: interval.end,
+          minY: y,
+          maxY: y,
+        });
+      }
+
+      activeKeysThisRow.add(key);
+    }
+
+    for (const [key, rectangle] of [...activeRectangles.entries()]) {
+      if (!activeKeysThisRow.has(key)) {
+        rectangles.push(rectangle);
+        activeRectangles.delete(key);
+      }
+    }
+  }
+
+  for (const rectangle of activeRectangles.values()) {
+    rectangles.push(rectangle);
+  }
+
+  return rectangles;
+}
+
+function buildPendingClaimSegments(
+  pendingClaimPixels: PixelCoordinate[],
+  pendingClaimRectangles: PendingClaimRectangle[],
+  camera: CameraState,
+): PendingClaimSegment[] {
+  const segments: PendingClaimSegment[] = [];
+  const renderRectangle = (rectangle: PendingClaimRectangle, isBulk: boolean): void => {
+    segments.push({
+      key: `pending-claim-${isBulk ? "rectangle" : "pixels"}-${rectangle.minX}-${rectangle.minY}-${rectangle.maxX}-${rectangle.maxY}`,
+      left: camera.x + rectangle.minX * camera.zoom,
+      top: worldRangeScreenTop(rectangle.maxY + 1, camera),
+      width: (rectangle.maxX - rectangle.minX + 1) * camera.zoom,
+      height: (rectangle.maxY - rectangle.minY + 1) * camera.zoom,
+      isBulk,
+    });
+  };
+
+  for (const rectangle of buildPendingClaimPixelRectangles(pendingClaimPixels)) {
+    renderRectangle(rectangle, pendingClaimRectangles.length > 0);
+  }
+
+  for (const rectangle of pendingClaimRectangles) {
+    renderRectangle(rectangle, true);
+  }
+
+  return segments;
+}
+
 function buildPendingClaimOutlinePath(
   pendingClaimPixels: PixelCoordinate[],
   pendingClaimRectangles: PendingClaimRectangle[],
@@ -1663,6 +1726,7 @@ function buildPendingClaimOutlinePath(
 
   const horizontalEdges = new Map<number, Map<number, number>>();
   const verticalEdges = new Map<number, Map<number, number>>();
+  const pendingClaimPixelRectangles = buildPendingClaimPixelRectangles(pendingClaimPixels);
 
   const addCellEdges = (minX: number, maxX: number, minY: number, maxY: number): void => {
     const endX = maxX + 1;
@@ -1673,8 +1737,8 @@ function buildPendingClaimOutlinePath(
     addPendingClaimEdgeInterval(verticalEdges, endX, minY, endY);
   };
 
-  for (const pixel of pendingClaimPixels) {
-    addCellEdges(pixel.x, pixel.x, pixel.y, pixel.y);
+  for (const rectangle of pendingClaimPixelRectangles) {
+    addCellEdges(rectangle.minX, rectangle.maxX, rectangle.minY, rectangle.maxY);
   }
 
   for (const rectangle of pendingClaimRectangles) {
@@ -7243,11 +7307,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       markPerfEvent("area inspect done", pixelKey);
       setInspectedPixelRecord(result.inspection.pixel);
 
-      if (result.inspection.area !== null) {
-        cacheClaimAreaPreview(result.inspection.area);
-      }
+      const inspectedArea = result.inspection.area === null
+        ? null
+        : cacheClaimAreaSummary(result.inspection.area);
 
-      applyAreaSelection(result.inspection.area);
+      applyAreaSelection(inspectedArea);
     });
   }
 

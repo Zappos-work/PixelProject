@@ -500,7 +500,7 @@ export type ClaimAreaResult = {
 
 export type ClaimAreaInspection = {
   pixel: WorldPixel | null;
-  area: ClaimAreaPreview | null;
+  area: ClaimAreaSummary | null;
 };
 
 export type ClaimAreaInspectionResult = {

@@ -246,7 +246,7 @@ class ClaimAreaSummary(ClaimAreaPreview):
 
 class ClaimAreaInspection(BaseModel):
     pixel: WorldPixelSummary | None
-    area: ClaimAreaPreview | None
+    area: ClaimAreaSummary | None
 
 
 class ClaimAreaPreviewWindow(BaseModel):
