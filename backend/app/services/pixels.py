@@ -404,6 +404,30 @@ async def warm_active_world_tile_cache(
     return warmed_tiles, warmed_tiles
 
 
+async def is_world_tile_within_active_world(
+    session: AsyncSession,
+    layer: str,
+    tile_x: int,
+    tile_y: int,
+) -> bool:
+    if layer not in WORLD_TILE_LAYERS:
+        return False
+
+    min_x, max_x, min_y, max_y = get_world_tile_bounds(tile_x, tile_y, layer)
+    active_chunk_id = await session.scalar(
+        select(WorldChunk.id)
+        .where(
+            WorldChunk.is_active.is_(True),
+            WorldChunk.origin_x <= max_x,
+            WorldChunk.origin_x + WorldChunk.width > min_x,
+            WorldChunk.origin_y <= max_y,
+            WorldChunk.origin_y + WorldChunk.height > min_y,
+        )
+        .limit(1)
+    )
+    return active_chunk_id is not None
+
+
 def build_world_pixel_summary(pixel: WorldPixel, owner: User | None) -> WorldPixelSummary:
     return WorldPixelSummary(
         id=pixel.id,

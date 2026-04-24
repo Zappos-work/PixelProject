@@ -27,6 +27,11 @@ from app.schemas.auth import AuthSessionStatus, AuthUserSummary, LogoutResponse,
 router = APIRouter(prefix="/auth")
 
 
+def ensure_active_account(user) -> None:
+    if user.is_banned:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is banned.")
+
+
 @router.get("/session", response_model=AuthSessionStatus)
 async def get_auth_session(request: Request, db: AsyncSession = Depends(get_db)) -> AuthSessionStatus:
     settings = get_settings()
@@ -125,6 +130,7 @@ async def patch_display_name(
 
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_account(user)
 
     try:
         updated_user = await update_user_display_name(db, user, payload.display_name)
@@ -145,6 +151,7 @@ async def post_avatar_upload(
 
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_account(user)
 
     try:
         contents = await avatar.read()

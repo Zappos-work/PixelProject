@@ -1,10 +1,10 @@
 # Project Status
 
-Last updated: 2026-04-23
+Last updated: 2026-04-24
 
 ## Current Snapshot
 
-- Current frontend build marker: `0.1.9`.
+- Current frontend build marker: `0.1.11`.
 - Local development stack is running through Docker Compose.
 - Frontend is available on `http://localhost:3000`.
 - Backend API and docs are available on `http://localhost:8000`.
@@ -12,6 +12,7 @@ Last updated: 2026-04-23
 - Production health is available at `https://pixel.zappos-dev.work/api/v1/health`.
 - PostgreSQL and Redis are connected and included in local startup.
 - Production uses Docker Compose with Caddy, PostgreSQL and Redis on the server.
+- Docker builds now have separate local development and production runtime stages.
 - Daily PostgreSQL backups are configured on the server with 14-day retention.
 - A dedicated changelog is tracked in `docs/changelog.md` and is now opened in-app from the clickable version badge.
 
@@ -74,6 +75,8 @@ Last updated: 2026-04-23
 - The world now starts as one `4,000 x 4,000` active chunk and expands at `70%` claimed Holder coverage.
 - Growth alternates between cross/diamond and square shapes: origin, diamond radius 1, square radius 1, diamond radius 2, and so on.
 - Production deployment notes are documented in `docs/production-deployment.md`, including DNS, Caddy routing, production environment variables, Google OAuth URLs, backups and GitHub Actions deploy preparation.
+- Production startup now rejects default secrets, insecure auth cookies, HTTP frontend URLs and wildcard CORS when `APP_ENV=production`.
+- Banned accounts are blocked from profile, claim, paint and area mutations.
 
 ## Confirmed World Decisions
 

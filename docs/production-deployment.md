@@ -1,6 +1,6 @@
 # Production Deployment Runbook
 
-Last updated: 2026-04-23
+Last updated: 2026-04-24
 
 This document captures the first production server setup for PixelProject.
 
@@ -165,10 +165,12 @@ The server `.env` contains production values. It must never be committed.
 Important production variables:
 
 ```env
+APP_ENV=production
 BACKEND_CORS_ORIGINS=https://pixel.zappos-dev.work
 FRONTEND_APP_URL=https://pixel.zappos-dev.work
 GOOGLE_REDIRECT_URI=https://pixel.zappos-dev.work/api/v1/auth/google/callback
 NEXT_PUBLIC_API_BASE_URL=https://pixel.zappos-dev.work/api/v1
+AUTH_COOKIE_SECURE=true
 WORLD_CHUNK_SIZE=4000
 WORLD_ORIGIN_X=-2000
 WORLD_ORIGIN_Y=-2000
@@ -412,6 +414,8 @@ export WORLD_ORIGIN_X=-2000
 export WORLD_ORIGIN_Y=-2000
 export WORLD_EXPANSION_BUFFER=0
 export WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7
+export APP_ENV=production
+export AUTH_COOKIE_SECURE=true
 docker compose -f compose.prod.yml up -d --build --remove-orphans
 docker image prune -f
 docker compose -f compose.prod.yml ps

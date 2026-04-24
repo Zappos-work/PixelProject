@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(case_sensitive=False)
 
     app_name: str = "PixelProject API"
+    app_version: str = "0.1.11"
     app_env: str = "development"
     secret_key: str = "change-me"
     api_v1_prefix: str = "/api/v1"
@@ -37,11 +38,26 @@ class Settings(BaseSettings):
     world_expansion_buffer: int = 0
     world_expansion_claim_fill_ratio: float = 0.7
 
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.lower() in {"production", "prod"}
+
     @model_validator(mode="after")
-    def normalize_world_origin(self) -> "Settings":
+    def normalize_and_validate_runtime_settings(self) -> "Settings":
         centered_origin = -(self.world_chunk_size // 2)
         self.world_origin_x = centered_origin
         self.world_origin_y = centered_origin
+
+        if self.is_production:
+            if self.secret_key in {"change-me", "change-me-in-local-dev"} or len(self.secret_key) < 32:
+                raise ValueError("SECRET_KEY must be a strong non-default value in production.")
+            if not self.auth_cookie_secure:
+                raise ValueError("AUTH_COOKIE_SECURE must be true in production.")
+            if not self.frontend_app_url.startswith("https://"):
+                raise ValueError("FRONTEND_APP_URL must use https in production.")
+            if "*" in self.cors_origins:
+                raise ValueError("Wildcard CORS origins are not allowed in production.")
+
         return self
 
     @property

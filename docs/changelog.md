@@ -2,6 +2,28 @@
 
 Player-facing release notes for PixelProject.
 
+## 0.1.11 - Apr 24, 2026
+
+### Improvements
+
+- The frontend runtime and tooling were updated to Next.js 16, the current Next ESLint config and TypeScript 6.
+- Local Docker Compose now keeps hot-reload development containers, while production Docker builds use dedicated runtime stages.
+- Production frontend containers now run `next start`, and production backend containers run Uvicorn without reload and with worker support.
+- Large world-window API reads and tile requests outside the active world are now rejected before they can create expensive database or cache work.
+
+### Security
+
+- Production startup now fails fast when default secrets, insecure auth cookies, HTTP frontend URLs or wildcard CORS settings are used.
+- The deploy workflow now enforces `APP_ENV=production` and secure auth cookies on the production server.
+- Missing Discord webhook configuration no longer turns an otherwise completed deploy notification step into a workflow failure.
+- Banned accounts can no longer mutate profile, world, paint or area state.
+- Avatar uploads now reject oversized pixel dimensions and decompression-bomb style images, even when the uploaded file is small.
+
+### Developer & Tooling
+
+- The FastAPI version now follows the project app version instead of a stale hard-coded value.
+- The legacy ESLint compatibility bridge was replaced with the current Next.js flat-config exports.
+
 ## 0.1.10 - Apr 24, 2026
 
 ### New Features

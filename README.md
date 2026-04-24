@@ -6,7 +6,7 @@ The repository is no longer just a planning sandbox. It already contains a worki
 
 ## Current Status
 
-- Current frontend build marker: `0.1.9`
+- Current frontend build marker: `0.1.11`
 - Production URL: `https://pixel.zappos-dev.work`
 - Local frontend: `http://localhost:3000`
 - Local backend API docs: `http://localhost:8000/docs`
@@ -30,6 +30,8 @@ The repository is no longer just a planning sandbox. It already contains a worki
 - Paint brush and local eraser workflow
 - Visual overview tiles plus semantic build-mode data loading
 - Cached `1,000 x 1,000` backend PNG tiles for world rendering
+- Request guardrails for oversized world reads and off-world tile cache generation
+- Separate development and production Docker image stages
 - Canvas debug/performance instrumentation through `?perf=1`
 - First production deployment with Docker Compose, Caddy, PostgreSQL backups, and GitHub Actions deploys
 

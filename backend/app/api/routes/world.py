@@ -42,6 +42,7 @@ from app.services.pixels import (
     get_visible_claim_area_previews,
     get_visible_world_pixels,
     is_claim_world_tile_layer,
+    is_world_tile_within_active_world,
     invite_area_contributor,
     list_owned_claim_areas,
     paint_world_pixels,
@@ -53,6 +54,23 @@ from app.services.pixels import (
 from app.services.world import get_world_overview
 
 router = APIRouter()
+MAX_WORLD_WINDOW_SPAN = 16_384
+
+
+def ensure_reasonable_world_window(min_x: int, max_x: int, min_y: int, max_y: int) -> None:
+    width = abs(max_x - min_x) + 1
+    height = abs(max_y - min_y) + 1
+
+    if width > MAX_WORLD_WINDOW_SPAN or height > MAX_WORLD_WINDOW_SPAN:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"World windows are limited to {MAX_WORLD_WINDOW_SPAN} cells per axis.",
+        )
+
+
+def ensure_active_player(user) -> None:
+    if user.is_banned:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is banned.")
 
 
 @router.get("/overview", response_model=WorldOverview)
@@ -74,6 +92,7 @@ async def world_pixels(
     max_y: int = Query(...),
     session: AsyncSession = Depends(get_db),
 ) -> WorldPixelWindow:
+    ensure_reasonable_world_window(min_x, max_x, min_y, max_y)
     settings = get_settings()
     viewer = await peek_authenticated_user(request, session, settings)
     return await get_visible_world_pixels(session, min_x, max_x, min_y, max_y, viewer)
@@ -87,6 +106,7 @@ async def claim_context_pixels(
     max_y: int = Query(...),
     session: AsyncSession = Depends(get_db),
 ) -> ClaimContextPixelWindow:
+    ensure_reasonable_world_window(min_x, max_x, min_y, max_y)
     return await get_claim_context_pixels(session, min_x, max_x, min_y, max_y)
 
 
@@ -99,6 +119,7 @@ async def claim_outline(
     max_y: int = Query(...),
     session: AsyncSession = Depends(get_db),
 ) -> ClaimOutlineWindow:
+    ensure_reasonable_world_window(min_x, max_x, min_y, max_y)
     settings = get_settings()
     viewer = await peek_authenticated_user(request, session, settings)
     return await get_claim_outline_pixels(session, min_x, max_x, min_y, max_y, viewer)
@@ -116,6 +137,9 @@ async def world_tile(
     viewer = await peek_authenticated_user(request, session, settings) if is_claim_world_tile_layer(layer) else None
 
     try:
+        if not await is_world_tile_within_active_world(session, layer, tile_x, tile_y):
+            raise WorldTileError("World tile is outside the active world.", 404)
+
         tile_path = await ensure_world_tile_png(session, layer, tile_x, tile_y, viewer)
         if not tile_path.exists():
             tile_path = await ensure_world_tile_png(session, layer, tile_x, tile_y, viewer)
@@ -150,6 +174,7 @@ async def claim_pixel(
 
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_player(user)
 
     try:
         return await claim_world_pixel(
@@ -176,6 +201,7 @@ async def claim_pixels(
 
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_player(user)
 
     try:
         return await claim_world_pixels(
@@ -205,6 +231,7 @@ async def paint_pixel(
 
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_player(user)
 
     try:
         return await paint_world_pixel(session, user, payload.x, payload.y, payload.color_id, settings)
@@ -223,6 +250,7 @@ async def paint_pixels(
 
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_player(user)
 
     try:
         return await paint_world_pixels(
@@ -270,6 +298,7 @@ async def get_visible_areas(
     max_y: int = Query(...),
     session: AsyncSession = Depends(get_db),
 ) -> ClaimAreaPreviewWindow:
+    ensure_reasonable_world_window(min_x, max_x, min_y, max_y)
     settings = get_settings()
     viewer = await peek_authenticated_user(request, session, settings)
     return await get_visible_claim_area_previews(session, min_x, max_x, min_y, max_y, viewer)
@@ -302,6 +331,7 @@ async def patch_area(
 
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_player(user)
 
     try:
         return await update_claim_area_metadata(
@@ -328,6 +358,7 @@ async def post_area_contributor(
 
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_player(user)
 
     try:
         return await invite_area_contributor(session, area_id, user, payload.public_id)
@@ -347,6 +378,7 @@ async def delete_area_contributor(
 
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_player(user)
 
     try:
         return await remove_area_contributor(session, area_id, user, contributor_public_id)
@@ -366,6 +398,7 @@ async def post_area_contributor_promote(
 
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_player(user)
 
     try:
         return await promote_area_contributor(session, area_id, user, contributor_public_id)

@@ -52,12 +52,16 @@ jobs:
           set_env_value WORLD_ORIGIN_Y -2000
           set_env_value WORLD_EXPANSION_BUFFER 0
           set_env_value WORLD_EXPANSION_CLAIM_FILL_RATIO 0.7
+          set_env_value APP_ENV production
+          set_env_value AUTH_COOKIE_SECURE true
 
           export WORLD_CHUNK_SIZE=4000
           export WORLD_ORIGIN_X=-2000
           export WORLD_ORIGIN_Y=-2000
           export WORLD_EXPANSION_BUFFER=0
           export WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7
+          export APP_ENV=production
+          export AUTH_COOKIE_SECURE=true
 
           docker compose -f compose.prod.yml up -d --build --remove-orphans
           docker image prune -f
@@ -125,6 +129,11 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is not configured; skipping success notification."
+            exit 0
+          fi
+
           curl -sS -X POST "$DISCORD_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "{\"content\":\"PixelProject deploy successful.\nBranch: main\nCommit: ${{ github.sha }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"
@@ -134,6 +143,11 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is not configured; skipping failure notification."
+            exit 0
+          fi
+
           tail -c 180000 deploy.log > deploy_error.log
 
           curl -sS -X POST "$DISCORD_WEBHOOK_URL" \

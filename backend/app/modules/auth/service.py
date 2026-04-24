@@ -3,6 +3,7 @@ import hashlib
 import io
 import re
 import secrets
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -31,6 +32,8 @@ DEFAULT_AVATAR_KEY = "default-avatar"
 CUSTOM_AVATAR_KEY = "custom-upload"
 AVATAR_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
 AVATAR_RENDER_SIZE = 128
+AVATAR_UPLOAD_MAX_DIMENSION = 4096
+AVATAR_UPLOAD_MAX_PIXELS = 8_000_000
 
 
 class GoogleOAuthError(Exception):
@@ -538,14 +541,33 @@ def process_avatar_upload(file_name: str | None, content_type: str | None, conte
         raise AvatarUploadError("Only image uploads are allowed for avatars.", 415)
 
     try:
-        with Image.open(io.BytesIO(contents)) as image:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            image_file = Image.open(io.BytesIO(contents))
+
+        with image_file as image:
+            width, height = image.size
+            if (
+                width <= 0
+                or height <= 0
+                or width > AVATAR_UPLOAD_MAX_DIMENSION
+                or height > AVATAR_UPLOAD_MAX_DIMENSION
+                or width * height > AVATAR_UPLOAD_MAX_PIXELS
+            ):
+                raise AvatarUploadError(
+                    "Avatar image is too large. Maximum size is 4096 x 4096 and 8 megapixels.",
+                    413,
+                )
+
             prepared = _crop_to_square(image.convert("RGBA")).resize(
                 (AVATAR_RENDER_SIZE, AVATAR_RENDER_SIZE),
                 Image.Resampling.LANCZOS,
             )
             target = io.BytesIO()
             prepared.save(target, format="PNG", optimize=True)
-    except (UnidentifiedImageError, OSError) as error:
+    except AvatarUploadError:
+        raise
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
         raise AvatarUploadError("The uploaded file is not a valid image.", 422) from error
 
     processed = target.getvalue()
