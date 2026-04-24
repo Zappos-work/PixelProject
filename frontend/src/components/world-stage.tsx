@@ -28,6 +28,7 @@ import {
   fetchVisibleWorldPixels,
   fetchWorldOverview,
   getClientApiBaseUrl,
+  getWorldRealtimeUrl,
   getWorldTileUrl,
   inviteAreaContributor,
   logoutAuthSession,
@@ -53,6 +54,8 @@ import {
   type PaintTileInput,
   type WorldOverview,
   type WorldPixel,
+  type WorldRealtimeUpdate,
+  type WorldTileCoordinate,
 } from "@/lib/api";
 import { APP_CHANGELOG } from "@/lib/app-changelog";
 import { APP_VERSION } from "@/lib/app-version";
@@ -816,6 +819,40 @@ function appendPerfLog(event: PerfEventRecord): void {
 
 function getPixelKey(pixel: PixelCoordinate): string {
   return `${pixel.x}:${pixel.y}`;
+}
+
+function isWorldTileCoordinate(value: unknown): value is WorldTileCoordinate {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as WorldTileCoordinate).tile_x === "number" &&
+    typeof (value as WorldTileCoordinate).tile_y === "number"
+  );
+}
+
+function isWorldRealtimeUpdate(value: unknown): value is WorldRealtimeUpdate {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const payload = value as Partial<WorldRealtimeUpdate>;
+  return (
+    payload.type === "world:update" &&
+    Array.isArray(payload.paint_tiles) &&
+    payload.paint_tiles.every(isWorldTileCoordinate) &&
+    Array.isArray(payload.claim_tiles) &&
+    payload.claim_tiles.every(isWorldTileCoordinate)
+  );
+}
+
+function getRealtimeDirtyTiles(update: WorldRealtimeUpdate): WorldTileCoordinate[] {
+  const dirtyTiles = new Map<string, WorldTileCoordinate>();
+
+  for (const tile of [...update.paint_tiles, ...update.claim_tiles]) {
+    dirtyTiles.set(`${tile.tile_x}:${tile.tile_y}`, tile);
+  }
+
+  return [...dirtyTiles.values()];
 }
 
 function parsePaletteHex(hexColor: string): { r: number; g: number; b: number } | null {
@@ -3947,6 +3984,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const inspectedPixelSnapshotRef = useRef<PixelCoordinate | null>(null);
   const selectedAreaSnapshotRef = useRef<ClaimAreaRecord | null>(null);
   const buildPanelOpenRef = useRef(false);
+  const buildPanelMinimizedRef = useRef(false);
   const areaPanelBusyRef = useRef(false);
   const areaDetailsBusyRef = useRef(false);
   const rectanglePlacementBusyRef = useRef(false);
@@ -3984,6 +4022,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const visibleAreaFetchAbortRef = useRef<AbortController | null>(null);
   const visibleAreaFetchKeyRef = useRef<string | null>(null);
   const visibleAreaLastSuccessRef = useRef<{ key: string; at: number } | null>(null);
+  const visibleAreaPrefetchBoundsRef = useRef<VisibleAreaBounds | null>(null);
   const pixelFetchAbortRef = useRef<AbortController | null>(null);
   const pixelFetchKeyRef = useRef<string | null>(null);
   const pixelFetchLastSuccessRef = useRef<{ key: string; at: number } | null>(null);
@@ -3992,6 +4031,15 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const claimOutlineFetchAbortRef = useRef<AbortController | null>(null);
   const claimOutlineFetchKeyRef = useRef<string | null>(null);
   const claimOutlineFetchLastSuccessRef = useRef<{ key: string; at: number } | null>(null);
+  const worldRealtimeRefreshTimerRef = useRef<number | null>(null);
+  const refreshVisiblePixelWindowRef = useRef<(options?: { force?: boolean }) => Promise<void>>(async () => undefined);
+  const refreshClaimOutlineNowRef = useRef<(options?: { force?: boolean }) => Promise<void>>(async () => undefined);
+  const fetchVisibleAreaPreviewWindowRef = useRef<(
+    bounds: VisibleAreaBounds,
+    triggerLiveRefresh: boolean,
+  ) => Promise<void>>(async () => undefined);
+  const refreshOwnedAreasRef = useRef<(options?: { showLoading?: boolean }) => Promise<void>>(async () => undefined);
+  const refreshAuthStatusRef = useRef<(showLoading?: boolean) => Promise<void>>(async () => undefined);
   const claimOutlineFocusRef = useRef<string | null>(null);
   const syncSelectedPlacementStateRef = useRef<(pixel: PixelCoordinate | null) => void>(() => undefined);
   const syncInspectedPixelRecordRef = useRef<() => void>(() => undefined);
@@ -4125,6 +4173,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   inspectedPixelSnapshotRef.current = inspectedPixel;
   selectedAreaSnapshotRef.current = selectedArea;
   buildPanelOpenRef.current = buildPanelOpen;
+  buildPanelMinimizedRef.current = buildPanelMinimized;
   areaPanelBusyRef.current = areaPanelBusy;
   areaDetailsBusyRef.current = areaDetailsBusy;
   rectanglePlacementBusyRef.current = rectanglePlacementBusy;
@@ -4146,6 +4195,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setAuthLoading(false);
     markPerfEvent("auth refresh done", nextStatus.authenticated ? "authenticated" : "guest");
   }, []);
+  refreshAuthStatusRef.current = refreshAuthStatus;
 
   const refreshOwnedAreas = useCallback(async (options?: { showLoading?: boolean }): Promise<void> => {
     const showLoading = options?.showLoading ?? true;
@@ -4181,6 +4231,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setOwnedAreasMessage(null);
     setOwnedAreasLoading(false);
   }, []);
+  refreshOwnedAreasRef.current = refreshOwnedAreas;
 
   const syncOwnedAreaSummary = useCallback((summary: ClaimAreaSummary): void => {
     setOwnedAreas((current) => {
@@ -4472,8 +4523,24 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       setOwnedAreas([]);
       setOwnedAreasLoaded(false);
       setOwnedAreasMessage(null);
+      setBuildPanelOpen(false);
+      setBuildPanelMinimized(false);
+      setBuildPanelPosition(null);
       setClaimAreaMode("new");
       setClaimTargetAreaId(null);
+      setRectangleAnchor(null);
+      setPendingOverlayDraft(null);
+      setOverlayPaletteOpen(false);
+      setPendingClaimPixels([]);
+      setPendingClaimRectangles([]);
+      setPendingPaints([]);
+      pendingClaimPixelsRef.current = [];
+      pendingClaimPixelMapRef.current = new Set();
+      pendingClaimRectanglesRef.current = [];
+      pendingPaintsRef.current = [];
+      pendingPaintMapRef.current = new Map();
+      pendingOverlayDraftRef.current = null;
+      overlaySourceRef.current = null;
       return;
     }
 
@@ -5687,6 +5754,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     viewportSize.height,
     viewportSize.width,
   ]);
+  visibleAreaPrefetchBoundsRef.current = visibleAreaPrefetchBounds;
 
   const refreshVisiblePixelWindow = useCallback(async (options?: { force?: boolean }): Promise<void> => {
     if (pixelFetchBounds === null) {
@@ -5779,6 +5847,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       performance.now() - startedAt,
     );
   }, [pixelFetchBounds]);
+  refreshVisiblePixelWindowRef.current = refreshVisiblePixelWindow;
 
   const clearClaimOutlinesImmediately = useCallback((): void => {
     claimOutlineFetchAbortRef.current?.abort();
@@ -5881,6 +5950,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     currentUser?.id,
     focusedClaimOutlineAreaPublicId,
   ]);
+  refreshClaimOutlineNowRef.current = refreshClaimOutlineNow;
 
   useEffect(() => {
     if (pixelFetchBounds === null) {
@@ -5949,6 +6019,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       pixelFetchKeyRef.current = null;
       claimOutlineFetchAbortRef.current?.abort();
       claimOutlineFetchKeyRef.current = null;
+      if (worldRealtimeRefreshTimerRef.current !== null) {
+        window.clearTimeout(worldRealtimeRefreshTimerRef.current);
+        worldRealtimeRefreshTimerRef.current = null;
+      }
     };
   }, []);
 
@@ -6355,6 +6429,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       performance.now() - startedAt,
     );
   }, [syncVisibleAreaPreviewWindow]);
+  fetchVisibleAreaPreviewWindowRef.current = fetchVisibleAreaPreviewWindow;
 
   const getPlacementState = useCallback((pixel: PixelCoordinate | null): PlacementState => {
     if (pixel === null) {
@@ -6777,6 +6852,114 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [fetchVisibleAreaPreviewWindow, visibleAreaPrefetchBounds]);
+
+  useEffect(() => {
+    let closed = false;
+    let reconnectTimer: number | null = null;
+    let socket: WebSocket | null = null;
+
+    const scheduleRealtimeRefresh = (source: string): void => {
+      if (worldRealtimeRefreshTimerRef.current !== null) {
+        return;
+      }
+
+      worldRealtimeRefreshTimerRef.current = window.setTimeout(() => {
+        worldRealtimeRefreshTimerRef.current = null;
+
+        void (async () => {
+          const startedAt = performance.now();
+          const visibleAreaBounds = visibleAreaPrefetchBoundsRef.current;
+
+          emitDebugEvent("network", "Realtime world refresh start", source);
+          const refreshes: Promise<unknown>[] = [
+            refreshVisiblePixelWindowRef.current({ force: true }),
+            refreshClaimOutlineNowRef.current({ force: true }),
+            fetchWorldOverview().then((nextWorld) => setWorld(nextWorld)),
+          ];
+
+          if (visibleAreaBounds !== null) {
+            refreshes.push(fetchVisibleAreaPreviewWindowRef.current(visibleAreaBounds, true));
+          }
+
+          if (currentUserRef.current !== null) {
+            refreshes.push(refreshOwnedAreasRef.current({ showLoading: false }));
+            refreshes.push(refreshAuthStatusRef.current(false));
+          }
+
+          const results = await Promise.allSettled(refreshes);
+          const failedCount = results.filter((result) => result.status === "rejected").length;
+
+          emitDebugEvent(
+            failedCount > 0 ? "warning" : "network",
+            failedCount > 0 ? "Realtime world refresh partially failed" : "Realtime world refresh done",
+            `${failedCount} failed refresh${failedCount === 1 ? "" : "es"}`,
+            performance.now() - startedAt,
+          );
+        })();
+      }, 80);
+    };
+
+    const connect = (): void => {
+      if (closed) {
+        return;
+      }
+
+      socket = new WebSocket(getWorldRealtimeUrl());
+
+      socket.onopen = () => {
+        emitDebugEvent("network", "Realtime world socket connected", "world/live");
+      };
+
+      socket.onmessage = (event) => {
+        let payload: unknown;
+
+        try {
+          payload = JSON.parse(String(event.data));
+        } catch {
+          return;
+        }
+
+        if (!isWorldRealtimeUpdate(payload)) {
+          return;
+        }
+
+        const dirtyTiles = getRealtimeDirtyTiles(payload);
+
+        if (dirtyTiles.length > 0) {
+          markWorldTilesDirty(dirtyTiles);
+        }
+
+        scheduleRealtimeRefresh(payload.source);
+      };
+
+      socket.onclose = () => {
+        socket = null;
+
+        if (closed) {
+          return;
+        }
+
+        emitDebugEvent("warning", "Realtime world socket closed", "reconnecting");
+        reconnectTimer = window.setTimeout(connect, 2000);
+      };
+
+      socket.onerror = () => {
+        socket?.close();
+      };
+    };
+
+    connect();
+
+    return () => {
+      closed = true;
+
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+
+      socket?.close();
+    };
+  }, [markWorldTilesDirty]);
 
   useEffect(() => {
     if (selectedArea === null || isClaimAreaSummary(selectedArea)) {
@@ -7967,19 +8150,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return screenToWorldPixel(event.clientX - rect.left, event.clientY - rect.top);
   }
 
-  function handleViewportContextMenu(event: React.MouseEvent<HTMLDivElement>): void {
-    event.preventDefault();
-    const targetPixel = getMouseEventPixel(event);
-
-    if (!isPixelInsideActiveWorld(targetPixel)) {
-      return;
-    }
-
-    if (buildPanelOpenRef.current && activeBuildModeRef.current === "paint") {
-      removePendingPaintAtPixel(targetPixel, { quiet: true });
-      return;
-    }
-
+  function inspectAreaAtPixel(targetPixel: PixelCoordinate): void {
     const pixelKey = getPixelKey(targetPixel);
     const immediatePlacementState = getPlacementState(targetPixel);
     const immediatePixelRecord = immediatePlacementState.pixelRecord;
@@ -8043,6 +8214,19 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
       applyAreaSelection(inspectedArea);
     });
+  }
+
+  function handleViewportContextMenu(event: React.MouseEvent<HTMLDivElement>): void {
+    event.preventDefault();
+    const targetPixel = getMouseEventPixel(event);
+
+    if (!isPixelInsideActiveWorld(targetPixel)) {
+      return;
+    }
+
+    if (buildPanelOpenRef.current && activeBuildModeRef.current === "paint") {
+      removePendingPaintAtPixel(targetPixel, { quiet: true });
+    }
   }
 
   function handleViewportAuxClick(event: React.MouseEvent<HTMLDivElement>): void {
@@ -8269,6 +8453,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         })();
         return;
       }
+
+      if (buildPanelOpenRef.current || buildPanelMinimizedRef.current) {
+        return;
+      }
+
+      inspectAreaAtPixel(clickedPixel);
     }
   }
 
@@ -9134,6 +9324,24 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return;
     }
 
+    const releasedPixelCount = Math.max(0, selectedArea.claimed_pixels_count - selectedArea.painted_pixels_count);
+    const confirmed = window.confirm(
+      [
+        "Finish this Area permanently?",
+        "",
+        "This action cannot be undone.",
+        `${formatCount(releasedPixelCount)} unpainted claimed pixel${releasedPixelCount === 1 ? "" : "s"} will be released for other players.`,
+      ].join("\n"),
+    );
+
+    if (!confirmed) {
+      setAreaMessage({
+        tone: "info",
+        text: "Area finish cancelled.",
+      });
+      return;
+    }
+
     setAreaPanelBusy(true);
     setAreaMessage(null);
     const startedAt = performance.now();
@@ -9377,6 +9585,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }
 
   function handleBuildModeChange(nextMode: BuildMode): void {
+    if (currentUser === null) {
+      setActiveModal("login");
+      return;
+    }
+
     if (nextMode === "claim") {
       openClaimBuildPanel("new", null);
       return;
@@ -9980,33 +10193,35 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         </button>
       </div>
 
-      <div className="world-hud world-hud-bottom-center">
-        <div className="build-taskbar" aria-label="Build tools">
-          <button
-            className={`build-tool-button ${newAreaButtonActive ? "is-active" : ""}`}
-            disabled={newAreaButtonDisabled}
-            onClick={() => handleBuildModeChange("claim")}
-            title={newAreaBlockedReason ?? "Start a new claim area"}
-            type="button"
-          >
-            <span>{BUILD_MODE_LABEL.claim}</span>
-            <small>{newAreaButtonDisabled ? "Unavailable" : "New area"}</small>
-            {pendingClaimCount > 0 ? <strong>{pendingClaimCount}</strong> : null}
-          </button>
-          <button
-            className={`build-tool-button ${buildPanelOpen && activeBuildMode === "paint" ? "is-active" : ""}`}
-            onClick={() => handleBuildModeChange("paint")}
-            title={colorPixelButtonHelp}
-            type="button"
-          >
-            <span>{BUILD_MODE_LABEL.paint}</span>
-            <small>{colorPixelButtonLabel}</small>
-            {pendingPaints.length > 0 ? <strong>{pendingPaints.length}</strong> : null}
-          </button>
+      {currentUser ? (
+        <div className="world-hud world-hud-bottom-center">
+          <div className="build-taskbar" aria-label="Build tools">
+            <button
+              className={`build-tool-button ${newAreaButtonActive ? "is-active" : ""}`}
+              disabled={newAreaButtonDisabled}
+              onClick={() => handleBuildModeChange("claim")}
+              title={newAreaBlockedReason ?? "Start a new claim area"}
+              type="button"
+            >
+              <span>{BUILD_MODE_LABEL.claim}</span>
+              <small>{newAreaButtonDisabled ? "Unavailable" : "New area"}</small>
+              {pendingClaimCount > 0 ? <strong>{pendingClaimCount}</strong> : null}
+            </button>
+            <button
+              className={`build-tool-button ${buildPanelOpen && activeBuildMode === "paint" ? "is-active" : ""}`}
+              onClick={() => handleBuildModeChange("paint")}
+              title={colorPixelButtonHelp}
+              type="button"
+            >
+              <span>{BUILD_MODE_LABEL.paint}</span>
+              <small>{colorPixelButtonLabel}</small>
+              {pendingPaints.length > 0 ? <strong>{pendingPaints.length}</strong> : null}
+            </button>
+          </div>
         </div>
-      </div>
+      ) : null}
 
-      {buildPanelOpen ? (
+      {buildPanelOpen && currentUser ? (
         <div
           className={`world-hud world-hud-placement ${buildPanelPosition ? "is-floating" : ""}`}
           style={buildPanelStyle}
@@ -10365,7 +10580,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         </div>
       ) : null}
 
-      {buildPanelMinimized && !buildPanelOpen ? (
+      {buildPanelMinimized && !buildPanelOpen && currentUser ? (
         <button
           aria-label="Open build panel"
           className="build-panel-launcher"
@@ -10883,19 +11098,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                     ) : null}
                   </div>
                 </div>
-                {currentUser.avatar_history.length > 0 ? (
-                  <div className="avatar-history-block compact">
-                    <span className="account-label">Previous uploads</span>
-                    <div className="avatar-history-grid">
-                      {currentUser.avatar_history.map((avatar) => (
-                        <div className="avatar-history-tile" key={`${avatar.image_url}-${avatar.selected_at}`}>
-                          <Image alt={avatar.label} className="avatar-history-image" height={56} src={avatar.image_url} width={56} />
-                          <span>{avatar.label}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
               </div>
             </div>
           </section>

@@ -2805,6 +2805,8 @@ async def _finish_claim_area(
             )
         )
 
+    await session.execute(delete(ClaimAreaOverlay).where(ClaimAreaOverlay.area_id == area.id))
+
     area.status = CLAIM_AREA_STATUS_FINISHED
     area.claimed_pixels_count = painted_count
     area.painted_pixels_count = painted_count
@@ -3087,42 +3089,42 @@ async def claim_world_pixels(
     )
     claimed_count = len(normalized_pixels)
 
-    await _bulk_insert_claimed_pixels(
-        session,
-        user,
-        area,
-        normalized_pixels,
-        resolved_settings,
-    )
-    await _increment_world_chunk_claim_counts(session, normalized_pixels, resolved_settings)
-
-    area.claimed_pixels_count += claimed_count
-    area.last_activity_at = now
-    user.holders_placed_total += claimed_count
-    user.claimed_pixels_count += claimed_count
-
-    if overlay is not None and normalized_overlay_pixels is not None:
-        session.add(
-            ClaimAreaOverlay(
-                id=uuid4(),
-                area_id=area.id,
-                image_name=_normalize_overlay_image_name(overlay.image_name),
-                image_width=overlay.image_width,
-                image_height=overlay.image_height,
-                origin_x=overlay.origin_x,
-                origin_y=overlay.origin_y,
-                width=overlay.width,
-                height=overlay.height,
-                color_mode=overlay.color_mode,
-                color_palette=overlay.color_palette,
-                dithering=overlay.dithering,
-                flip_x=overlay.flip_x,
-                flip_y=overlay.flip_y,
-                template_pixels=normalized_overlay_pixels,
-            )
-        )
-
     try:
+        await _bulk_insert_claimed_pixels(
+            session,
+            user,
+            area,
+            normalized_pixels,
+            resolved_settings,
+        )
+        await _increment_world_chunk_claim_counts(session, normalized_pixels, resolved_settings)
+
+        area.claimed_pixels_count += claimed_count
+        area.last_activity_at = now
+        user.holders_placed_total += claimed_count
+        user.claimed_pixels_count += claimed_count
+
+        if overlay is not None and normalized_overlay_pixels is not None:
+            session.add(
+                ClaimAreaOverlay(
+                    id=uuid4(),
+                    area_id=area.id,
+                    image_name=_normalize_overlay_image_name(overlay.image_name),
+                    image_width=overlay.image_width,
+                    image_height=overlay.image_height,
+                    origin_x=overlay.origin_x,
+                    origin_y=overlay.origin_y,
+                    width=overlay.width,
+                    height=overlay.height,
+                    color_mode=overlay.color_mode,
+                    color_palette=overlay.color_palette,
+                    dithering=overlay.dithering,
+                    flip_x=overlay.flip_x,
+                    flip_y=overlay.flip_y,
+                    template_pixels=normalized_overlay_pixels,
+                )
+            )
+
         await session.commit()
     except IntegrityError as error:
         await session.rollback()

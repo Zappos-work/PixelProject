@@ -4,12 +4,6 @@ from uuid import UUID
 from pydantic import BaseModel
 
 
-class AvatarHistoryEntry(BaseModel):
-    image_url: str
-    label: str
-    selected_at: datetime
-
-
 class AuthUserSummary(BaseModel):
     id: UUID
     public_id: int
@@ -17,7 +11,6 @@ class AuthUserSummary(BaseModel):
     display_name_changed_at: datetime | None = None
     avatar_key: str
     avatar_url: str | None
-    avatar_history: list[AvatarHistoryEntry]
     role: str
     is_banned: bool
     holders: int

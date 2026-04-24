@@ -11,6 +11,58 @@ export type ChangelogEntry = {
 
 export const APP_CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.2.2",
+    date: "Apr 24, 2026",
+    sections: [
+      {
+        title: "New Features",
+        items: [
+          "World changes now stream through WebSockets so other players see fresh paint, claim tiles and area changes without waiting for the old timed refresh.",
+        ],
+      },
+      {
+        title: "Improvements",
+        items: [
+          "Finishing an Area now shows an irreversible-action warning and tells the player that unpainted claimed pixels will be released.",
+          "Finished Areas now delete saved overlay templates during finish and migration cleanup, reducing stored overlay data after the artwork is locked.",
+        ],
+      },
+      {
+        title: "Bug Fixes",
+        items: [
+          "Simultaneous overlapping claims now resolve as one successful claim and one conflict response instead of risking a raw database error.",
+        ],
+      },
+    ],
+  },
+  {
+    version: "0.2.1",
+    date: "Apr 24, 2026",
+    sections: [
+      {
+        title: "Improvements",
+        items: [
+          "PostgreSQL now runs on the Postgres 18 image, with a one-time dump and restore upgrade path that keeps the old Postgres 16 volume untouched.",
+          "Guests no longer see Claim Area or Color Pixel build buttons.",
+          "Area Info now opens from a normal left click while browsing the world.",
+        ],
+      },
+      {
+        title: "Security",
+        items: [
+          "Avatar upload history has been removed from storage, API responses and the profile UI.",
+        ],
+      },
+      {
+        title: "Bug Fixes",
+        items: [
+          "Uploaded overlay images no longer stack above HUD buttons, menus or build controls.",
+          "Area Info no longer opens while Claim Area or Color Pixel build tools are active.",
+        ],
+      },
+    ],
+  },
+  {
     version: "0.2.0",
     date: "Apr 24, 2026",
     sections: [

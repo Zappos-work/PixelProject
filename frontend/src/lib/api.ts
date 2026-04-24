@@ -83,12 +83,6 @@ export type DashboardData = {
   world: WorldOverview;
 };
 
-export type AvatarHistoryEntry = {
-  image_url: string;
-  label: string;
-  selected_at: string;
-};
-
 export type AuthUser = {
   id: string;
   public_id: number;
@@ -96,7 +90,6 @@ export type AuthUser = {
   display_name_changed_at: string | null;
   avatar_key: string;
   avatar_url: string | null;
-  avatar_history: AvatarHistoryEntry[];
   role: string;
   is_banned: boolean;
   holders: number;
@@ -510,6 +503,19 @@ export type WorldTileCoordinate = {
   tile_y: number;
 };
 
+export type WorldRealtimeUpdate = {
+  type: "world:update";
+  event_id: string;
+  source: "claim" | "paint" | "area_finish" | "area_update" | string;
+  actor_user_id: string | null;
+  area_id: string | null;
+  area_public_id: number | null;
+  paint_tiles: WorldTileCoordinate[];
+  claim_tiles: WorldTileCoordinate[];
+  world_dirty: boolean;
+  at: string;
+};
+
 export type PixelBatchClaimResult = {
   ok: boolean;
   pixels: WorldPixel[];
@@ -597,6 +603,23 @@ export async function fetchWorldOverview(): Promise<WorldOverview> {
 
 export function getClientApiBaseUrl(): string {
   return clientApiBaseUrl;
+}
+
+export function getWorldRealtimeUrl(): string {
+  const path = "/world/live";
+
+  if (clientApiBaseUrl.startsWith("/")) {
+    if (typeof window === "undefined") {
+      return `${clientApiBaseUrl}${path}`;
+    }
+
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}${clientApiBaseUrl}${path}`;
+  }
+
+  const url = new URL(`${clientApiBaseUrl}${path}`);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.toString();
 }
 
 export function getWorldTileUrl(

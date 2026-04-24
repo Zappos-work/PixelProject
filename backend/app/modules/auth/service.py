@@ -5,7 +5,6 @@ import re
 import secrets
 import warnings
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -18,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.models.auth_session import AuthSession
 from app.models.user import User
-from app.schemas.auth import AvatarHistoryEntry, AuthSessionStatus, AuthUserSummary
+from app.schemas.auth import AuthSessionStatus, AuthUserSummary
 
 GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
@@ -92,67 +91,6 @@ def normalize_frontend_redirect_url(raw_url: str | None, settings: Settings) -> 
 
 def hash_session_token(token: str, settings: Settings) -> str:
     return hashlib.sha256(f"{settings.secret_key}:{token}".encode("utf-8")).hexdigest()
-
-
-def make_avatar_label(filename: str | None, selected_at: datetime) -> str:
-    if filename:
-        stem = Path(filename).stem.strip()
-        if stem:
-            return stem[:32]
-
-    return selected_at.strftime("Avatar %d %b %Y %H:%M")
-
-
-def normalize_avatar_history(user: User) -> list[AvatarHistoryEntry]:
-    entries: list[AvatarHistoryEntry] = []
-    raw_history = user.avatar_history or []
-
-    for entry in raw_history:
-        image_url = str(entry.get("image_url") or "").strip()
-        if not image_url:
-            continue
-
-        selected_at_raw = entry.get("selected_at")
-        if selected_at_raw is None:
-            continue
-
-        try:
-            selected_at = datetime.fromisoformat(str(selected_at_raw).replace("Z", "+00:00"))
-        except ValueError:
-            continue
-
-        label = str(entry.get("label") or make_avatar_label(None, selected_at))
-        entries.append(
-            AvatarHistoryEntry(
-                image_url=image_url,
-                label=label,
-                selected_at=selected_at,
-            )
-        )
-
-    if user.avatar_url:
-        already_present = any(entry.image_url == user.avatar_url for entry in entries)
-        if not already_present:
-            entries.insert(
-                0,
-                AvatarHistoryEntry(
-                    image_url=user.avatar_url,
-                    label=make_avatar_label(None, user.updated_at),
-                    selected_at=user.updated_at,
-                ),
-            )
-
-    unique_entries: list[AvatarHistoryEntry] = []
-    seen: set[tuple[str, datetime]] = set()
-
-    for entry in sorted(entries, key=lambda item: item.selected_at, reverse=True):
-        key = (entry.image_url, entry.selected_at)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_entries.append(entry)
-
-    return unique_entries[:8]
 
 
 def needs_display_name_setup(user: User) -> bool:
@@ -300,7 +238,6 @@ def build_auth_user_summary(user: User, settings: Settings | None = None) -> Aut
         display_name_changed_at=user.display_name_changed_at,
         avatar_key=user.avatar_key or DEFAULT_AVATAR_KEY,
         avatar_url=user.avatar_url,
-        avatar_history=normalize_avatar_history(user),
         role=user.role,
         is_banned=user.is_banned,
         holders=user.holders,
@@ -434,7 +371,6 @@ async def upsert_google_user(
             display_name=DEFAULT_DISPLAY_NAME,
             avatar_key=DEFAULT_AVATAR_KEY,
             avatar_url=None,
-            avatar_history=[],
             role="player",
             is_banned=False,
             holders=resolved_settings.holder_start_amount,
@@ -455,7 +391,6 @@ async def upsert_google_user(
         user.email = email
         user.display_name = user.display_name or DEFAULT_DISPLAY_NAME
         user.avatar_key = CUSTOM_AVATAR_KEY if user.avatar_url else DEFAULT_AVATAR_KEY
-        user.avatar_history = user.avatar_history or []
         user.holders_unlimited = bool(user.holders_unlimited)
         user.claim_area_limit = max(1, int(user.claim_area_limit or resolved_settings.claim_area_start_limit))
         user.normal_pixel_limit = max(0, int(user.normal_pixel_limit or resolved_settings.normal_pixel_start_limit))
@@ -530,7 +465,7 @@ def _crop_to_square(image: Image.Image) -> Image.Image:
     return image.crop((left, top, left + side, top + side))
 
 
-def process_avatar_upload(file_name: str | None, content_type: str | None, contents: bytes) -> tuple[str, str]:
+def process_avatar_upload(_file_name: str | None, content_type: str | None, contents: bytes) -> str:
     if not contents:
         raise AvatarUploadError("No avatar file was uploaded.", 422)
 
@@ -571,8 +506,7 @@ def process_avatar_upload(file_name: str | None, content_type: str | None, conte
         raise AvatarUploadError("The uploaded file is not a valid image.", 422) from error
 
     processed = target.getvalue()
-    data_url = _build_avatar_data_url(processed)
-    return data_url, make_avatar_label(file_name, datetime.now(timezone.utc))
+    return _build_avatar_data_url(processed)
 
 
 async def upload_user_avatar(
@@ -582,36 +516,9 @@ async def upload_user_avatar(
     content_type: str | None,
     contents: bytes,
 ) -> User:
-    data_url, label = process_avatar_upload(file_name, content_type, contents)
-    now = datetime.now(timezone.utc)
-    history = list(user.avatar_history or [])
-    history.insert(
-        0,
-        {
-            "image_url": data_url,
-            "label": label,
-            "selected_at": now.isoformat(),
-        },
-    )
-
-    deduped: list[dict[str, str]] = []
-    seen_urls: set[str] = set()
-    for entry in history:
-        image_url = str(entry.get("image_url") or "")
-        if not image_url or image_url in seen_urls:
-            continue
-        seen_urls.add(image_url)
-        deduped.append(
-            {
-                "image_url": image_url,
-                "label": str(entry.get("label") or label),
-                "selected_at": str(entry.get("selected_at") or now.isoformat()),
-            }
-        )
-
+    data_url = process_avatar_upload(file_name, content_type, contents)
     user.avatar_key = CUSTOM_AVATAR_KEY
     user.avatar_url = data_url
-    user.avatar_history = deduped[:8]
     await db.commit()
     await db.refresh(user)
     return user

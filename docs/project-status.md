@@ -4,13 +4,13 @@ Last updated: 2026-04-24
 
 ## Current Snapshot
 
-- Current frontend build marker: `0.2.0`.
+- Current frontend build marker: `0.2.2`.
 - Local development stack is running through Docker Compose.
 - Frontend is available on `http://localhost:3000`.
 - Backend API and docs are available on `http://localhost:8000`.
 - First production deployment is live at `https://pixel.zappos-dev.work`.
 - Production health is available at `https://pixel.zappos-dev.work/api/v1/health`.
-- PostgreSQL and Redis are connected and included in local startup.
+- PostgreSQL 18 and Redis are connected and included in local startup.
 - Production uses Docker Compose with Caddy, PostgreSQL and Redis on the server.
 - Docker builds now have separate local development and production runtime stages.
 - Daily PostgreSQL backups are configured on the server with 14-day retention.
@@ -44,7 +44,7 @@ Last updated: 2026-04-24
 - Holders are now consumed by claiming only; painting is restricted to already claimed cells owned by the player.
 - Claimed territory is now highlighted in the viewport, with starter-frontier cells shown separately from owned territory.
 - `holders_placed_total`, claimed-pixel stats, level progress, and territory ownership now update from actual claim events.
-- The account modal now includes custom avatar upload with automatic crop/resize handling, compact previous-upload history, and a pencil shortcut under the profile image.
+- The account modal now includes custom avatar upload with automatic crop/resize handling and a pencil shortcut under the profile image.
 - Authenticated players now get `/me` as raw JSON output, exposing all currently known account fields from the backend instead of a separate HTML settings page.
 - Newly created accounts are redirected back into the main app and prompted there to choose a display name before settling in.
 - The version badge now opens a dedicated changelog modal, separate from the info modal.
@@ -77,6 +77,8 @@ Last updated: 2026-04-24
 - Production deployment notes are documented in `docs/production-deployment.md`, including DNS, Caddy routing, production environment variables, Google OAuth URLs, backups and GitHub Actions deploy preparation.
 - Production startup now rejects default secrets, insecure auth cookies, HTTP frontend URLs and wildcard CORS when `APP_ENV=production`.
 - Banned accounts are blocked from profile, claim, paint and area mutations.
+- Claim, paint and Area finish mutations now publish WebSocket world updates so other open clients can refresh dirty tiles and nearby semantic data immediately.
+- Finishing an Area now clears stored overlay templates and warns the owner that the action is irreversible and releases unpainted pixels.
 
 ## Confirmed World Decisions
 
@@ -93,7 +95,6 @@ Last updated: 2026-04-24
 
 - Exact claim-shape editor tools beyond the first Space staging brush and rectangle tool, such as lasso or fill selection.
 - Pixel history, first-paint coin rewards, and moderation rollback tools.
-- Live chunk subscriptions and WebSocket update strategy.
 - Future far-zoom support should add level-of-detail or pre-scaled overview tiles so distant artwork does not require full-resolution tile rendering.
 - Holder/coin balancing, rate-limits, and broader gameplay systems beyond the first pixel-placement loop.
 - Production hardening: SSH lock-down, external backups, monitoring, and final GitHub Actions/Discord deploy notification verification.

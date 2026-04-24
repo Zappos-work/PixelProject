@@ -74,7 +74,7 @@ services:
       retries: 10
 
   db:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-pixelproject}
       POSTGRES_USER: ${POSTGRES_USER:-pixelproject}
@@ -82,7 +82,7 @@ services:
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres18_data:/var/lib/postgresql
     healthcheck:
       test:
         [
@@ -107,3 +107,4 @@ services:
 volumes:
   frontend_node_modules:
   postgres_data:
+  postgres18_data:

@@ -6,7 +6,7 @@ The repository is no longer just a planning sandbox. It already contains a worki
 
 ## Current Status
 
-- Current frontend build marker: `0.2.0`
+- Current frontend build marker: `0.2.2`
 - Production URL: `https://pixel.zappos-dev.work`
 - Local frontend: `http://localhost:3000`
 - Local backend API docs: `http://localhost:8000/docs`
@@ -29,6 +29,7 @@ The repository is no longer just a planning sandbox. It already contains a worki
 - Claim brush and rectangle tools
 - Paint brush and local eraser workflow
 - Visual overview tiles plus semantic build-mode data loading
+- WebSocket world updates for near-real-time paint, claim and Area refreshes
 - Cached `1,000 x 1,000` backend PNG tiles for world rendering
 - Request guardrails for oversized world reads and off-world tile cache generation
 - Separate development and production Docker image stages
@@ -46,9 +47,9 @@ The repository is no longer just a planning sandbox. It already contains a worki
 
 ## Tech Stack
 
-- Frontend: Next.js 15, React 19, TypeScript
+- Frontend: Next.js 16, React 19, TypeScript
 - Backend: FastAPI, SQLAlchemy, asyncpg, Redis, Pillow
-- Database: PostgreSQL 16
+- Database: PostgreSQL 18
 - Cache/auxiliary services: Redis 7
 - Local orchestration: Docker Compose
 - Production reverse proxy: Caddy
@@ -94,6 +95,22 @@ To stop the stack:
 ```bash
 docker compose down
 ```
+
+### Upgrading Existing Local PostgreSQL Data To 18
+
+Version `0.2.1` moves the local database from Postgres 16 to Postgres 18 and stores the new data in a separate `postgres18_data` volume. If you already have local data, run the one-time upgrade before starting the new stack:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\upgrade-postgres-18.ps1
+```
+
+On bash-compatible shells:
+
+```bash
+bash tools/upgrade-postgres-18.sh
+```
+
+The upgrade creates a SQL safety dump under `backups/postgres-major-upgrade`, restores it into the Postgres 18 volume, and leaves the old `postgres_data` volume untouched.
 
 ## Local OAuth Setup
 
@@ -178,6 +195,7 @@ Important routes already implemented:
 - `GET /api/v1/world/overview`
 - `GET /api/v1/world/palette`
 - `GET /api/v1/world/pixels`
+- `WS /api/v1/world/live`
 - `GET /api/v1/world/claims/outline`
 - `GET /api/v1/world/tiles/{layer}/{tile_x}/{tile_y}.png`
 - `POST /api/v1/world/claims`

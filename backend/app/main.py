@@ -12,6 +12,7 @@ from app.core.redis import close_redis_client
 from app.db.bootstrap import initialize_database
 from app.db.session import AsyncSessionLocal, dispose_engine
 from app.services.pixels import warm_active_world_tile_cache
+from app.services.realtime import relay_world_updates_from_redis
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -32,13 +33,17 @@ async def warm_initial_world_overview_tiles() -> None:
 async def lifespan(_: FastAPI):
     await initialize_database()
     overview_warmup_task = asyncio.create_task(warm_initial_world_overview_tiles())
+    world_realtime_task = asyncio.create_task(relay_world_updates_from_redis())
 
     try:
         yield
     finally:
         overview_warmup_task.cancel()
+        world_realtime_task.cancel()
         with suppress(asyncio.CancelledError):
             await overview_warmup_task
+        with suppress(asyncio.CancelledError):
+            await world_realtime_task
         await close_redis_client()
         await dispose_engine()
 

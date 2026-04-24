@@ -20,10 +20,9 @@ def build_png(width: int, height: int) -> bytes:
 
 class AuthServiceTests(unittest.TestCase):
     def test_avatar_upload_is_normalized_to_png_data_url(self) -> None:
-        data_url, label = process_avatar_upload("avatar.png", "image/png", build_png(32, 48))
+        data_url = process_avatar_upload("avatar.png", "image/png", build_png(32, 48))
 
         self.assertTrue(data_url.startswith("data:image/png;base64,"))
-        self.assertEqual(label, "avatar")
 
     def test_avatar_upload_rejects_excessive_pixel_dimensions(self) -> None:
         with self.assertRaises(AvatarUploadError) as raised:

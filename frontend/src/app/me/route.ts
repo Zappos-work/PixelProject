@@ -7,12 +7,6 @@ const apiBaseUrl =
   process.env.NEXT_PUBLIC_API_BASE_URL ??
   "http://backend:8000/api/v1";
 
-type AvatarHistoryEntry = {
-  image_url: string;
-  label: string;
-  selected_at: string;
-};
-
 type AuthMeResponse = {
   id: string;
   public_id: number;
@@ -20,7 +14,6 @@ type AuthMeResponse = {
   display_name_changed_at: string | null;
   avatar_key: string;
   avatar_url: string | null;
-  avatar_history: AvatarHistoryEntry[];
   role: string;
   is_banned: boolean;
   holders: number;
@@ -166,11 +159,6 @@ export async function GET(request: Request) {
     display_name_changed_at: user.display_name_changed_at,
     avatar_key: user.avatar_key,
     avatar: summarizeImageSource(user.avatar_url),
-    avatar_history: user.avatar_history.map((entry) => ({
-      label: entry.label,
-      selected_at: entry.selected_at,
-      image: summarizeImageSource(entry.image_url),
-    })),
     role: user.role,
     is_banned: user.is_banned,
     holders: user.holders,

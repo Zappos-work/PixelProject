@@ -308,7 +308,7 @@ select {
 }
 
 .claim-template-overlay.is-editable {
-  z-index: 12;
+  z-index: 11;
   pointer-events: auto;
   cursor: move;
 }

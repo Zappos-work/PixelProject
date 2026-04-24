@@ -95,14 +95,14 @@ services:
       retries: 10
 
   db:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-pixelproject}
       POSTGRES_USER: ${POSTGRES_USER:-pixelproject}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres18_data:/var/lib/postgresql
     healthcheck:
       test:
         [
@@ -129,4 +129,5 @@ volumes:
   caddy_data:
   caddy_config:
   postgres_data:
+  postgres18_data:
   redis_data:

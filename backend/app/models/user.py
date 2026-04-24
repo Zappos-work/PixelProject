@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, Sequence, String, Text, func
+from sqlalchemy import Boolean, DateTime, Integer, Sequence, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -28,7 +28,6 @@ class User(Base):
     display_name_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     avatar_key: Mapped[str] = mapped_column(String(64), default="default-avatar", nullable=False)
     avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    avatar_history: Mapped[list[dict[str, str]]] = mapped_column(JSON, default=list, nullable=False)
     role: Mapped[str] = mapped_column(String(32), default="player", nullable=False)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     holders: Mapped[int] = mapped_column(Integer, default=128, nullable=False)

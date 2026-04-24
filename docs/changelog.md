@@ -2,6 +2,38 @@
 
 Player-facing release notes for PixelProject.
 
+## 0.2.2 - Apr 24, 2026
+
+### New Features
+
+- World changes now stream through WebSockets so fresh paint, claim tiles and area changes become visible to other players without waiting for the old timed refresh.
+
+### Improvements
+
+- Finishing an Area now shows an irreversible-action warning and tells the player that unpainted claimed pixels will be released for other players.
+- Finished Areas now delete saved overlay templates during finish and migration cleanup, reducing stored overlay data after the artwork is locked.
+
+### Bug Fixes
+
+- Simultaneous overlapping claims now resolve as one successful claim and one conflict response instead of risking a raw database error.
+
+## 0.2.1 - Apr 24, 2026
+
+### Improvements
+
+- PostgreSQL now runs on the Postgres 18 image, with a one-time dump and restore upgrade path that keeps the old Postgres 16 volume untouched.
+- Guests no longer see Claim Area or Color Pixel build buttons.
+- Area Info now opens from a normal left click while browsing the world.
+
+### Security
+
+- Avatar upload history has been removed from storage, API responses and the profile UI.
+
+### Bug Fixes
+
+- Uploaded overlay images no longer stack above HUD buttons, menus or build controls.
+- Area Info no longer opens while Claim Area or Color Pixel build tools are active.
+
 ## 0.2.0 - Apr 24, 2026
 
 ### New Features

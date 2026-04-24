@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+import asyncio
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
@@ -27,6 +29,7 @@ from app.schemas.world import (
     PixelPaintResponse,
     WorldOverview,
     WorldPixelWindow,
+    WorldTileCoordinate,
 )
 from app.services.pixels import (
     PIXEL_PALETTE,
@@ -50,7 +53,9 @@ from app.services.pixels import (
     promote_area_contributor,
     remove_area_contributor,
     update_claim_area_metadata,
+    get_world_tile_key,
 )
+from app.services.realtime import publish_world_update, world_realtime_hub
 from app.services.world import get_world_overview
 
 router = APIRouter()
@@ -73,9 +78,49 @@ def ensure_active_player(user) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is banned.")
 
 
+async def publish_world_mutation(
+    *,
+    source: str,
+    user_id: object | None = None,
+    area: ClaimAreaSummary | None = None,
+    paint_tiles: list[WorldTileCoordinate] | None = None,
+    claim_tiles: list[WorldTileCoordinate] | None = None,
+    world_dirty: bool = True,
+) -> None:
+    await publish_world_update(
+        source=source,
+        actor_user_id=str(user_id) if user_id is not None else None,
+        area_id=str(area.id) if area is not None else None,
+        area_public_id=area.public_id if area is not None else None,
+        paint_tiles=paint_tiles,
+        claim_tiles=claim_tiles,
+        world_dirty=world_dirty,
+    )
+
+
 @router.get("/overview", response_model=WorldOverview)
 async def world_overview(session: AsyncSession = Depends(get_db)) -> WorldOverview:
     return await get_world_overview(session)
+
+
+@router.websocket("/live")
+async def world_live(websocket: WebSocket) -> None:
+    connection = await world_realtime_hub.connect(websocket)
+
+    try:
+        await world_realtime_hub.send(connection, {"type": "world:connected"})
+
+        while True:
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=45)
+            except asyncio.TimeoutError:
+                await world_realtime_hub.send(connection, {"type": "world:ping"})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        await world_realtime_hub.disconnect(connection)
 
 
 @router.get("/palette", response_model=list[PixelColor])
@@ -188,7 +233,7 @@ async def claim_pixel(
     ensure_active_player(user)
 
     try:
-        return await claim_world_pixel(
+        result = await claim_world_pixel(
             session,
             user,
             payload.x,
@@ -197,6 +242,13 @@ async def claim_pixel(
             payload.claim_mode,
             payload.target_area_id,
         )
+        tile_x, tile_y = get_world_tile_key(payload.x, payload.y)
+        await publish_world_mutation(
+            source="claim",
+            user_id=user.id,
+            claim_tiles=[WorldTileCoordinate(tile_x=tile_x, tile_y=tile_y)],
+        )
+        return result
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 
@@ -215,7 +267,7 @@ async def claim_pixels(
     ensure_active_player(user)
 
     try:
-        return await claim_world_pixels(
+        result = await claim_world_pixels(
             session,
             user,
             [(pixel.x, pixel.y) for pixel in payload.pixels],
@@ -228,6 +280,13 @@ async def claim_pixels(
             target_area_id=payload.target_area_id,
             overlay=payload.overlay,
         )
+        await publish_world_mutation(
+            source="claim",
+            user_id=user.id,
+            area=result.area,
+            claim_tiles=result.claim_tiles,
+        )
+        return result
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 
@@ -246,7 +305,14 @@ async def paint_pixel(
     ensure_active_player(user)
 
     try:
-        return await paint_world_pixel(session, user, payload.x, payload.y, payload.color_id, settings)
+        result = await paint_world_pixel(session, user, payload.x, payload.y, payload.color_id, settings)
+        tile_x, tile_y = get_world_tile_key(payload.x, payload.y)
+        await publish_world_mutation(
+            source="paint",
+            user_id=user.id,
+            paint_tiles=[WorldTileCoordinate(tile_x=tile_x, tile_y=tile_y)],
+        )
+        return result
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 
@@ -265,12 +331,19 @@ async def paint_pixels(
     ensure_active_player(user)
 
     try:
-        return await paint_world_pixels(
+        result = await paint_world_pixels(
             session,
             user,
             [(tile.x, tile.y, tile.pixels) for tile in payload.tiles],
             settings,
         )
+        await publish_world_mutation(
+            source="paint",
+            user_id=user.id,
+            paint_tiles=result.paint_tiles,
+            claim_tiles=result.claim_tiles,
+        )
+        return result
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 
@@ -346,7 +419,7 @@ async def patch_area(
     ensure_active_player(user)
 
     try:
-        return await update_claim_area_metadata(
+        result = await update_claim_area_metadata(
             session,
             area_id,
             user,
@@ -354,6 +427,13 @@ async def patch_area(
             payload.description,
             payload.status,
         )
+        await publish_world_mutation(
+            source="area_finish" if payload.status == "finished" else "area_update",
+            user_id=user.id,
+            area=result.area,
+            claim_tiles=result.claim_tiles,
+        )
+        return result
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 

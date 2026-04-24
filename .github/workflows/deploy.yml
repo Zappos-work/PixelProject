@@ -75,6 +75,8 @@ jobs:
           export NEXT_PUBLIC_API_BASE_URL=https://pixel.zappos-dev.work/api/v1
           export GOOGLE_REDIRECT_URI=https://pixel.zappos-dev.work/api/v1/auth/google/callback
 
+          bash tools/upgrade-postgres-18.sh --compose-file /opt/pixelproject/.github/deploy/compose.prod.yml
+
           if ! compose_prod up -d --build --remove-orphans; then
             compose_prod ps || true
             compose_prod logs --tail=200 frontend backend caddy || true

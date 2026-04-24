@@ -11,7 +11,7 @@ This document captures the first production server setup for PixelProject.
 - Server project directory: `/opt/pixelproject`
 - Frontend: Next.js, React, TypeScript
 - Backend: FastAPI, Python
-- Database: PostgreSQL
+- Database: PostgreSQL 18
 - Cache: Redis
 - Deployment: Docker Compose
 - Reverse proxy: Caddy
@@ -87,6 +87,24 @@ Internal ports:
 
 PostgreSQL and Redis are intentionally not exposed directly to the public internet.
 
+## PostgreSQL 18 Major Upgrade
+
+Version `0.2.1` moves production from `postgres:16-alpine` to `postgres:18-alpine`. The production Compose file uses a new `postgres18_data` volume mounted at `/var/lib/postgresql`, while the old `postgres_data` volume is left untouched as a rollback safety net.
+
+Deploys run this one-time upgrade helper before `docker compose up`:
+
+```bash
+bash tools/upgrade-postgres-18.sh --compose-file /opt/pixelproject/.github/deploy/compose.prod.yml
+```
+
+The helper stops app-facing services, dumps the Postgres 16 database, restores it into a fresh Postgres 18 volume, verifies that public tables exist on a Postgres 18 server, and stores a compressed safety dump under:
+
+```text
+/opt/pixelproject/backups/postgres-major-upgrade
+```
+
+If `postgres18_data` is already initialized, the helper exits without touching the running stack.
+
 ## Caddy Reverse Proxy
 
 The server-side Caddyfile is:
@@ -116,6 +134,7 @@ Routes:
 
 - `https://pixel.zappos-dev.work` -> frontend
 - `https://pixel.zappos-dev.work/api/v1/...` -> backend
+- `wss://pixel.zappos-dev.work/api/v1/world/live` -> backend world update stream
 - `https://pixel.zappos-dev.work/docs` -> backend API docs
 - `https://pixel.zappos-dev.work/openapi.json` -> backend OpenAPI schema
 
@@ -416,6 +435,7 @@ export WORLD_EXPANSION_BUFFER=0
 export WORLD_EXPANSION_CLAIM_FILL_RATIO=0.7
 export APP_ENV=production
 export AUTH_COOKIE_SECURE=true
+bash tools/upgrade-postgres-18.sh --compose-file /opt/pixelproject/.github/deploy/compose.prod.yml
 docker compose -f compose.prod.yml up -d --build --remove-orphans
 docker image prune -f
 docker compose -f compose.prod.yml ps

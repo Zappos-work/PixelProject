@@ -171,7 +171,6 @@ async def main():
             user.display_name = f"Stress Player {{idx:04d}}"
             user.avatar_key = "default-avatar"
             user.avatar_url = None
-            user.avatar_history = []
             user.role = "player"
             user.is_banned = False
             user.holders_unlimited = True

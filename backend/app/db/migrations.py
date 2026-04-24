@@ -18,7 +18,6 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
         text("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name_changed_at TIMESTAMPTZ")
     )
     await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_key VARCHAR(64)"))
-    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_history JSONB"))
     await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS holders_unlimited BOOLEAN"))
     await connection.execute(
         text("ALTER TABLE users ADD COLUMN IF NOT EXISTS holders_last_updated_at TIMESTAMPTZ")
@@ -42,9 +41,6 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(
         text("UPDATE users SET avatar_key = 'default-avatar' WHERE avatar_key IS NULL OR avatar_key <> 'custom-upload'")
     )
-    await connection.execute(
-        text("UPDATE users SET avatar_history = '[]'::jsonb WHERE avatar_history IS NULL")
-    )
     await connection.execute(text("UPDATE users SET holders_unlimited = TRUE WHERE holders_unlimited IS NULL"))
     await connection.execute(
         text("UPDATE users SET avatar_url = NULL WHERE avatar_url LIKE 'https://lh3.googleusercontent.com/%'")
@@ -52,6 +48,7 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(
         text("UPDATE users SET avatar_url = NULL WHERE avatar_url LIKE 'data:image/svg+xml%'")
     )
+    await connection.execute(text("ALTER TABLE users DROP COLUMN IF EXISTS avatar_history"))
     await connection.execute(
         text("UPDATE users SET holders_last_updated_at = NOW() WHERE holders_last_updated_at IS NULL")
     )
@@ -79,7 +76,6 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     )
     await connection.execute(text("ALTER TABLE users ALTER COLUMN public_id SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN avatar_key SET NOT NULL"))
-    await connection.execute(text("ALTER TABLE users ALTER COLUMN avatar_history SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN holders_unlimited SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN holders_last_updated_at SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN claim_area_limit SET NOT NULL"))
@@ -391,6 +387,16 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
               AND area.status = 'finished'
               AND COALESCE(pixel.is_starter, FALSE) IS FALSE
               AND pixel.color_id IS NULL
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            DELETE FROM claim_area_overlays AS overlay
+            USING claim_areas AS area
+            WHERE overlay.area_id = area.id
+              AND area.status = 'finished'
             """
         )
     )
