@@ -17,6 +17,18 @@ class WorldPixel(Base):
             "y",
             "x",
         ),
+        Index(
+            "ix_world_pixels_area_xy",
+            "area_id",
+            "x",
+            "y",
+        ),
+        Index(
+            "ix_world_pixels_area_yx",
+            "area_id",
+            "y",
+            "x",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

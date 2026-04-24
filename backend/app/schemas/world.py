@@ -223,6 +223,17 @@ class AreaContributorSummary(BaseModel):
     role: str
 
 
+class ClaimAreaBounds(BaseModel):
+    min_x: int
+    max_x: int
+    min_y: int
+    max_y: int
+    width: int
+    height: int
+    center_x: float
+    center_y: float
+
+
 class ClaimAreaPreview(BaseModel):
     id: UUID
     public_id: int
@@ -238,6 +249,7 @@ class ClaimAreaPreview(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_activity_at: datetime
+    bounds: ClaimAreaBounds | None = None
 
 
 class ClaimAreaSummary(ClaimAreaPreview):
@@ -255,17 +267,6 @@ class ClaimAreaPreviewWindow(BaseModel):
     min_y: int
     max_y: int
     areas: list[ClaimAreaPreview]
-
-
-class ClaimAreaBounds(BaseModel):
-    min_x: int
-    max_x: int
-    min_y: int
-    max_y: int
-    width: int
-    height: int
-    center_x: float
-    center_y: float
 
 
 class ClaimAreaListItem(BaseModel):

@@ -118,12 +118,22 @@ async def claim_outline(
     min_y: int = Query(...),
     max_y: int = Query(...),
     focus_area_id: UUID | None = Query(default=None),
+    focus_area_public_id: int | None = Query(default=None),
     session: AsyncSession = Depends(get_db),
 ) -> ClaimOutlineWindow:
     ensure_reasonable_world_window(min_x, max_x, min_y, max_y)
     settings = get_settings()
     viewer = await peek_authenticated_user(request, session, settings)
-    return await get_claim_outline_pixels(session, min_x, max_x, min_y, max_y, viewer, focus_area_id)
+    return await get_claim_outline_pixels(
+        session,
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+        viewer,
+        focus_area_id,
+        focus_area_public_id,
+    )
 
 
 @router.get("/tiles/{layer}/{tile_x}/{tile_y}.png")

@@ -407,6 +407,7 @@ export type ClaimAreaPreview = {
   created_at: string;
   updated_at: string;
   last_activity_at: string;
+  bounds?: ClaimAreaBounds | null;
 };
 
 export type ClaimAreaSummary = ClaimAreaPreview & {
@@ -785,7 +786,7 @@ export async function fetchClaimOutlinePixels(
   maxX: number,
   minY: number,
   maxY: number,
-  focusAreaId?: string | null,
+  focusAreaPublicId?: number | null,
   signal?: AbortSignal,
 ): Promise<ClaimOutlineWindow> {
   try {
@@ -796,8 +797,8 @@ export async function fetchClaimOutlinePixels(
       max_y: String(maxY),
     });
 
-    if (focusAreaId) {
-      params.set("focus_area_id", focusAreaId);
+    if (focusAreaPublicId !== null && focusAreaPublicId !== undefined) {
+      params.set("focus_area_public_id", String(focusAreaPublicId));
     }
 
     const response = await fetch(`${clientApiBaseUrl}/world/claims/outline?${params.toString()}`, {

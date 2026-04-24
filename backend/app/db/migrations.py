@@ -490,6 +490,22 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(
         text(
             """
+            CREATE INDEX IF NOT EXISTS ix_world_pixels_area_xy
+            ON world_pixels (area_id, x, y)
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_world_pixels_area_yx
+            ON world_pixels (area_id, y, x)
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
             DO $$
             BEGIN
                 IF NOT EXISTS (

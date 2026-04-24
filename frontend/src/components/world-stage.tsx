@@ -923,6 +923,9 @@ function buildAreaSelectionSignature(area: ClaimAreaRecord | null): string {
     Number(area.viewer_can_paint),
     area.updated_at,
     area.last_activity_at,
+    area.bounds
+      ? `${area.bounds.min_x}:${area.bounds.min_y}:${area.bounds.max_x}:${area.bounds.max_y}`
+      : "",
   ];
 
   if (isClaimAreaSummary(area)) {
@@ -4321,7 +4324,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return ownedAreas.find((area) => area.id === claimTargetAreaId) ?? null;
   }, [claimTargetAreaId, ownedAreas, selectedArea]);
   const activeClaimTargetAreaName = activeClaimTargetArea?.name ?? "selected area";
-  const focusedClaimOutlineAreaId = selectedArea?.status === "finished" ? selectedArea.id : null;
+  const focusedClaimOutlineArea = selectedArea?.status === "finished" ? selectedArea : null;
+  const focusedClaimOutlineAreaId = focusedClaimOutlineArea?.id ?? null;
+  const focusedClaimOutlineAreaPublicId = focusedClaimOutlineArea?.public_id ?? null;
+  const focusedClaimOutlineAreaBounds = focusedClaimOutlineArea?.bounds ?? null;
 
   currentUserRef.current = currentUser;
   activeWorldBoundsRef.current = activeWorldBounds;
@@ -4899,10 +4905,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   const claimOutlineFetchBounds = useMemo(() => {
     if (
-      (fetchWorldTileDetailScale !== 1 && focusedClaimOutlineAreaId === null) ||
       viewportSize.width === 0 ||
       viewportSize.height === 0
     ) {
+      return null;
+    }
+
+    if (fetchWorldTileDetailScale !== 1 && focusedClaimOutlineAreaId === null) {
       return null;
     }
 
@@ -4915,7 +4924,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         CLAIM_OUTLINE_FETCH_OVERSCAN_VIEWPORT_FACTOR,
     );
 
-    return {
+    const viewportBounds = {
       minX: Math.max(
         activeWorldBounds.minX,
         snapVisibleAreaMin(
@@ -4945,6 +4954,36 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         ),
       ),
     };
+
+    if (focusedClaimOutlineAreaId === null) {
+      return viewportBounds;
+    }
+
+    if (focusedClaimOutlineAreaBounds === null) {
+      return fetchWorldTileDetailScale === 1 ? viewportBounds : null;
+    }
+
+    const focusedAreaBounds = {
+      minX: Math.max(activeWorldBounds.minX, focusedClaimOutlineAreaBounds.min_x - 1),
+      maxX: Math.min(activeWorldBounds.maxX - 1, focusedClaimOutlineAreaBounds.max_x + 1),
+      minY: Math.max(activeWorldBounds.minY, focusedClaimOutlineAreaBounds.min_y - 1),
+      maxY: Math.min(activeWorldBounds.maxY - 1, focusedClaimOutlineAreaBounds.max_y + 1),
+    };
+    const focusedWindowBounds = {
+      minX: Math.max(viewportBounds.minX, focusedAreaBounds.minX),
+      maxX: Math.min(viewportBounds.maxX, focusedAreaBounds.maxX),
+      minY: Math.max(viewportBounds.minY, focusedAreaBounds.minY),
+      maxY: Math.min(viewportBounds.maxY, focusedAreaBounds.maxY),
+    };
+
+    if (
+      focusedWindowBounds.minX > focusedWindowBounds.maxX ||
+      focusedWindowBounds.minY > focusedWindowBounds.maxY
+    ) {
+      return null;
+    }
+
+    return focusedWindowBounds;
   }, [
     activeWorldBounds.maxX,
     activeWorldBounds.maxY,
@@ -4954,6 +4993,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     fetchCamera.y,
     fetchCamera.zoom,
     fetchWorldTileDetailScale,
+    focusedClaimOutlineAreaBounds,
     focusedClaimOutlineAreaId,
     viewportSize.height,
     viewportSize.width,
@@ -5135,7 +5175,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     const bounds = claimOutlineFetchBounds;
-    const requestKey = `${getFetchBoundsKey(bounds)}:${focusedClaimOutlineAreaId ?? "active"}:${currentUser?.id ?? "guest"}`;
+    const requestKey = `${getFetchBoundsKey(bounds)}:${focusedClaimOutlineAreaPublicId ?? "active"}:${currentUser?.id ?? "guest"}`;
     const now = performance.now();
     const force = options?.force === true;
     const cacheHit = claimOutlineFetchLastSuccessRef.current;
@@ -5170,7 +5210,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       bounds.maxX,
       bounds.minY,
       bounds.maxY,
-      focusedClaimOutlineAreaId,
+      focusedClaimOutlineAreaPublicId,
       abortController.signal,
     );
 
@@ -5205,7 +5245,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       `${result.segments.length} segments`,
       performance.now() - startedAt,
     );
-  }, [claimOutlineFetchBounds, clearClaimOutlinesImmediately, currentUser?.id, focusedClaimOutlineAreaId]);
+  }, [
+    claimOutlineFetchBounds,
+    clearClaimOutlinesImmediately,
+    currentUser?.id,
+    focusedClaimOutlineAreaPublicId,
+  ]);
 
   useEffect(() => {
     if (pixelFetchBounds === null) {
@@ -5384,13 +5429,16 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   const cacheClaimAreaPreview = useCallback((area: ClaimAreaPreview): ClaimAreaRecord => {
     const cachedDetail = claimAreaDetailCacheRef.current.get(area.id) ?? null;
+    const cachedPreview = claimAreaCacheRef.current.get(area.id) ?? null;
+    const preservedBounds = area.bounds ?? cachedDetail?.bounds ?? cachedPreview?.bounds ?? null;
+    const areaWithBounds = preservedBounds === area.bounds ? area : { ...area, bounds: preservedBounds };
     const nextArea: ClaimAreaRecord = cachedDetail
       ? {
         ...cachedDetail,
-        ...area,
+        ...areaWithBounds,
         contributors: cachedDetail.contributors,
       }
-      : area;
+      : areaWithBounds;
     const cache = claimAreaCacheRef.current;
     cache.delete(area.id);
     cache.set(area.id, nextArea);

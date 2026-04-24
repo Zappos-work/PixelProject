@@ -592,6 +592,7 @@ def build_claim_area_preview(
     viewer: User | None = None,
     viewer_contributor_area_ids: set[UUID] | None = None,
     viewer_admin_area_ids: set[UUID] | None = None,
+    bounds: ClaimAreaBounds | None = None,
 ) -> ClaimAreaPreview:
     resolved_viewer_contributor_area_ids = viewer_contributor_area_ids or set()
     resolved_viewer_admin_area_ids = viewer_admin_area_ids or set()
@@ -622,6 +623,69 @@ def build_claim_area_preview(
         created_at=area.created_at,
         updated_at=area.updated_at,
         last_activity_at=area.last_activity_at,
+        bounds=bounds,
+    )
+
+
+async def _get_claim_area_bounds(
+    session: AsyncSession,
+    area_id: UUID,
+) -> ClaimAreaBounds | None:
+    min_x_query = (
+        select(WorldPixel.x)
+        .where(WorldPixel.area_id == area_id)
+        .order_by(WorldPixel.x.asc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    max_x_query = (
+        select(WorldPixel.x)
+        .where(WorldPixel.area_id == area_id)
+        .order_by(WorldPixel.x.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    min_y_query = (
+        select(WorldPixel.y)
+        .where(WorldPixel.area_id == area_id)
+        .order_by(WorldPixel.y.asc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    max_y_query = (
+        select(WorldPixel.y)
+        .where(WorldPixel.area_id == area_id)
+        .order_by(WorldPixel.y.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    row = (
+        await session.execute(
+            select(
+                min_x_query,
+                max_x_query,
+                min_y_query,
+                max_y_query,
+            )
+        )
+    ).first()
+
+    if row is None or row[0] is None:
+        return None
+
+    min_x, max_x, min_y, max_y = (int(value) for value in row)
+    width = max_x - min_x + 1
+    height = max_y - min_y + 1
+
+    return ClaimAreaBounds(
+        min_x=min_x,
+        max_x=max_x,
+        min_y=min_y,
+        max_y=max_y,
+        width=width,
+        height=height,
+        center_x=min_x + width / 2,
+        center_y=min_y + height / 2,
     )
 
 
@@ -661,6 +725,7 @@ async def build_claim_area_summary(
             viewer,
             viewer_contributor_area_ids,
             viewer_admin_area_ids,
+            await _get_claim_area_bounds(session, area.id),
         ).model_dump(),
         contributors=[
             AreaContributorSummary(
@@ -933,9 +998,16 @@ async def get_claim_outline_pixels(
     max_y: int,
     viewer: User | None = None,
     focus_area_id: UUID | None = None,
+    focus_area_public_id: int | None = None,
 ) -> ClaimOutlineWindow:
     low_x, high_x = sorted((min_x, max_x))
     low_y, high_y = sorted((min_y, max_y))
+    resolved_focus_area_id = focus_area_id
+
+    if resolved_focus_area_id is None and focus_area_public_id is not None:
+        resolved_focus_area_id = await session.scalar(
+            select(ClaimArea.id).where(ClaimArea.public_id == focus_area_public_id)
+        )
 
     # Fetch only the viewport plus a one-cell gutter. The gutter lets us suppress
     # edges against neighboring claimed pixels without pulling whole areas into
@@ -946,8 +1018,8 @@ async def get_claim_outline_pixels(
     query_high_y = high_y + 1
     area_visibility_filters = [ClaimArea.status == CLAIM_AREA_STATUS_ACTIVE]
 
-    if focus_area_id is not None:
-        area_visibility_filters.append(WorldPixel.area_id == focus_area_id)
+    if resolved_focus_area_id is not None:
+        area_visibility_filters.append(WorldPixel.area_id == resolved_focus_area_id)
 
     visible_claim_filter = and_(
         WorldPixel.x >= query_low_x,

@@ -18,6 +18,7 @@ export const APP_CHANGELOG: ChangelogEntry[] = [
         title: "Improvements",
         items: [
           "Area Info opened from the world now receives the full area summary in the inspection response, avoiding the extra detail hydrate request.",
+          "Focused finished-area outlines now use the public Area # in requests and clamp to the selected area's bounds instead of the whole zoomed-out viewport.",
           "World pixel window reads now use a slimmer backend projection and a y/x window index for faster high-zoom fetches.",
         ],
       },
