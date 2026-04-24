@@ -214,8 +214,6 @@ type PlacementState = {
   canClaim: boolean;
   canPaint: boolean;
   isPendingClaim: boolean;
-  optimisticPaintAreaId: string | null;
-  optimisticPaintAreaName: string | null;
   pendingPaint: PendingPaint | null;
 };
 
@@ -255,8 +253,6 @@ const EMPTY_PLACEMENT_STATE: PlacementState = {
   canClaim: false,
   canPaint: false,
   isPendingClaim: false,
-  optimisticPaintAreaId: null,
-  optimisticPaintAreaName: null,
   pendingPaint: null,
 };
 
@@ -880,15 +876,6 @@ function getClaimAreaStatusLabel(status: ClaimAreaStatus): string {
 
 function formatClaimAreaId(publicId: number): string {
   return `#${publicId}`;
-}
-
-function isPixelInsideAreaBounds(pixel: PixelCoordinate, area: ClaimAreaListItem): boolean {
-  return (
-    pixel.x >= area.bounds.min_x &&
-    pixel.x <= area.bounds.max_x &&
-    pixel.y >= area.bounds.min_y &&
-    pixel.y <= area.bounds.max_y
-  );
 }
 
 function isPixelInsideActiveWorldBounds(
@@ -1778,8 +1765,6 @@ function arePlacementStatesEqual(
     left.canClaim === right.canClaim &&
     left.canPaint === right.canPaint &&
     left.isPendingClaim === right.isPendingClaim &&
-    left.optimisticPaintAreaId === right.optimisticPaintAreaId &&
-    left.optimisticPaintAreaName === right.optimisticPaintAreaName &&
     arePendingPaintEntriesEqual(left.pendingPaint, right.pendingPaint)
   );
 }
@@ -3301,7 +3286,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const knownPaintableAreaIdsRef = useRef<Set<string>>(new Set());
   const selectedColorIdRef = useRef(DEFAULT_COLOR_ID);
   const lastPaintBlockedMissingPixelAtRef = useRef(0);
-  const lastOptimisticPaintDebugAtRef = useRef(0);
   const zoomRef = useRef(DEFAULT_ZOOM);
   const cameraRef = useRef<CameraState>({
     x: 0,
@@ -3444,18 +3428,25 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     markPerfEvent("auth refresh done", nextStatus.authenticated ? "authenticated" : "guest");
   }, []);
 
-  const refreshOwnedAreas = useCallback(async (): Promise<void> => {
-    setOwnedAreasLoading(true);
-    setOwnedAreasMessage(null);
+  const refreshOwnedAreas = useCallback(async (options?: { showLoading?: boolean }): Promise<void> => {
+    const showLoading = options?.showLoading ?? true;
+
+    if (showLoading) {
+      setOwnedAreasLoading(true);
+      setOwnedAreasMessage(null);
+    }
+
     const result = await fetchMyClaimAreas();
 
     if (!result.ok) {
-      setOwnedAreas([]);
-      setOwnedAreasLoaded(true);
-      setOwnedAreasMessage({
-        tone: "error",
-        text: result.error ?? "Your claim areas could not be loaded.",
-      });
+      if (showLoading) {
+        setOwnedAreas([]);
+        setOwnedAreasLoaded(true);
+        setOwnedAreasMessage({
+          tone: "error",
+          text: result.error ?? "Your claim areas could not be loaded.",
+        });
+      }
       setOwnedAreasLoading(false);
       return;
     }
@@ -3467,6 +3458,55 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     );
 
     setOwnedAreas(result.areas);
+    setOwnedAreasLoaded(true);
+    setOwnedAreasMessage(null);
+    setOwnedAreasLoading(false);
+  }, []);
+
+  const syncOwnedAreaSummary = useCallback((summary: ClaimAreaSummary): void => {
+    setOwnedAreas((current) => {
+      let matched = false;
+      const nextAreas = current.map((area) => {
+        if (area.id !== summary.id) {
+          return area;
+        }
+
+        matched = true;
+        return {
+          ...area,
+          public_id: summary.public_id,
+          name: summary.name,
+          description: summary.description,
+          status: summary.status,
+          owner: summary.owner,
+          claimed_pixels_count: summary.claimed_pixels_count,
+          painted_pixels_count: summary.painted_pixels_count,
+          contributor_count: summary.contributor_count,
+          viewer_can_edit: summary.viewer_can_edit,
+          viewer_can_paint: summary.viewer_can_paint,
+          created_at: summary.created_at,
+          updated_at: summary.updated_at,
+          last_activity_at: summary.last_activity_at,
+        };
+      });
+
+      if (!matched) {
+        if (summary.status === "active" && summary.viewer_can_paint) {
+          knownPaintableAreaIdsRef.current.add(summary.id);
+        } else {
+          knownPaintableAreaIdsRef.current.delete(summary.id);
+        }
+        return current;
+      }
+
+      ownedAreasRef.current = nextAreas;
+      knownPaintableAreaIdsRef.current = new Set(
+        nextAreas
+          .filter((area) => area.status === "active" && area.viewer_can_paint)
+          .map((area) => area.id),
+      );
+      return nextAreas;
+    });
     setOwnedAreasLoaded(true);
     setOwnedAreasLoading(false);
   }, []);
@@ -4892,13 +4932,18 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     );
   }, [pixelFetchBounds]);
 
+  const clearClaimOutlinesImmediately = useCallback((): void => {
+    claimOutlineFetchAbortRef.current?.abort();
+    claimOutlineFetchAbortRef.current = null;
+    claimOutlineFetchKeyRef.current = null;
+    claimOutlineFetchLastSuccessRef.current = null;
+    claimOutlineSegmentsRef.current = [];
+    setClaimOutlineSegments((current) => current.length === 0 ? current : []);
+  }, []);
+
   const refreshClaimOutlineNow = useCallback(async (options?: { force?: boolean }): Promise<void> => {
     if (claimOutlineFetchBounds === null) {
-      claimOutlineFetchAbortRef.current?.abort();
-      claimOutlineFetchAbortRef.current = null;
-      claimOutlineFetchKeyRef.current = null;
-      claimOutlineSegmentsRef.current = [];
-      setClaimOutlineSegments((current) => current.length === 0 ? current : []);
+      clearClaimOutlinesImmediately();
       return;
     }
 
@@ -4972,7 +5017,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       `${result.segments.length} segments`,
       performance.now() - startedAt,
     );
-  }, [claimOutlineFetchBounds]);
+  }, [claimOutlineFetchBounds, clearClaimOutlinesImmediately]);
 
   useEffect(() => {
     if (pixelFetchBounds === null) {
@@ -5453,8 +5498,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         canClaim: false,
         canPaint: false,
         isPendingClaim: false,
-        optimisticPaintAreaId: null,
-        optimisticPaintAreaName: null,
         pendingPaint: null,
       };
     }
@@ -5476,8 +5519,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         canClaim: false,
         canPaint: false,
         isPendingClaim: false,
-        optimisticPaintAreaId: null,
-        optimisticPaintAreaName: null,
         pendingPaint: null,
       };
     }
@@ -5486,13 +5527,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     const pixelRecord = pixelMap.get(pixelKey) ?? null;
     const isPendingClaim = hasPendingClaimAtPixel(pixel, pendingClaimPixelMap, pendingClaimRectangles);
     const pendingPaint = pendingPaintsMap.get(pixelKey) ?? null;
-    const optimisticPaintArea = pixelRecord === null
-      ? ownedAreasRef.current.find((area) => (
-        area.status === "active" &&
-        area.viewer_can_paint &&
-        isPixelInsideAreaBounds(pixel, area)
-      )) ?? null
-      : null;
 
     if (
       nextUser === null ||
@@ -5504,23 +5538,16 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         canClaim: false,
         canPaint: false,
         isPendingClaim,
-        optimisticPaintAreaId: null,
-        optimisticPaintAreaName: null,
         pendingPaint,
       };
     }
 
     const canPaint =
       !isPendingClaim &&
-      (
-        pixelRecord !== null
-          ? (
-            !pixelRecord.is_starter &&
-            pixelRecord.area_id !== null &&
-            knownPaintableAreaIdsRef.current.has(pixelRecord.area_id)
-          )
-          : optimisticPaintArea !== null
-      );
+      pixelRecord !== null &&
+      !pixelRecord.is_starter &&
+      pixelRecord.area_id !== null &&
+      knownPaintableAreaIdsRef.current.has(pixelRecord.area_id);
     let canClaim = false;
 
     if (!semanticZoomModeRef.current) {
@@ -5530,8 +5557,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         canClaim: false,
         canPaint,
         isPendingClaim,
-        optimisticPaintAreaId: optimisticPaintArea?.id ?? null,
-        optimisticPaintAreaName: optimisticPaintArea?.name ?? null,
         pendingPaint,
       };
     }
@@ -5544,8 +5569,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           canClaim: false,
           canPaint,
           isPendingClaim,
-          optimisticPaintAreaId: optimisticPaintArea?.id ?? null,
-          optimisticPaintAreaName: optimisticPaintArea?.name ?? null,
           pendingPaint,
         };
       }
@@ -5557,8 +5580,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           canClaim: false,
           canPaint,
           isPendingClaim,
-          optimisticPaintAreaId: optimisticPaintArea?.id ?? null,
-          optimisticPaintAreaName: optimisticPaintArea?.name ?? null,
           pendingPaint,
         };
       }
@@ -5595,8 +5616,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       canClaim,
       canPaint,
       isPendingClaim,
-      optimisticPaintAreaId: optimisticPaintArea?.id ?? null,
-      optimisticPaintAreaName: optimisticPaintArea?.name ?? null,
       pendingPaint,
     };
   }, [isPixelInsideActiveWorld]);
@@ -5821,10 +5840,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const selectedPendingPaint = selectedPlacementState.pendingPaint;
   const canFetchSelectedPixelRecord = semanticZoomMode && (
     activeBuildMode !== "paint" ||
-    (
-      selectedPlacementState.optimisticPaintAreaId === null &&
-      selectedPendingPaint === null
-    )
+    selectedPendingPaint === null
   );
 
   useEffect(() => {
@@ -6482,7 +6498,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     let changed = false;
     let blockedOutsidePaintableArea = false;
     let notEnoughPixels = false;
-    let optimisticPaintDetail: string | null = null;
 
     for (let index = 0; index < nextPaints.length; index += 1) {
       const paint = nextPaints[index];
@@ -6545,24 +6560,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
       stagedKeys.add(paintKey);
       changed = true;
-
-      if (targetState.pixelRecord === null && optimisticPaintDetail === null) {
-        optimisticPaintDetail =
-          `${targetPixel.x}:${targetPixel.y} in ${targetState.optimisticPaintAreaName ?? targetState.optimisticPaintAreaId ?? "active paintable area"}; backend validates exact claimed pixel on submit`;
-      }
     }
 
     if (changed) {
       syncPendingPaints(nextPaints, nextPaintMap);
-    }
-
-    if (optimisticPaintDetail !== null) {
-      const now = performance.now();
-
-      if (now - lastOptimisticPaintDebugAtRef.current > 2500) {
-        lastOptimisticPaintDebugAtRef.current = now;
-        emitDebugEvent("action", "Paint staged optimistically", optimisticPaintDetail);
-      }
     }
 
     if (!options?.quiet) {
@@ -7777,13 +7778,15 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return;
     }
 
+    const finishedArea = cacheClaimAreaSummary(result.area);
     markWorldTilesDirty(result.claim_tiles);
-    applyAreaSelection(cacheClaimAreaSummary(result.area));
+    clearClaimOutlinesImmediately();
+    syncOwnedAreaSummary(finishedArea);
+    applyAreaSelection(finishedArea);
     if (claimTargetAreaIdRef.current === result.area.id) {
       setClaimAreaMode("new");
       setClaimTargetAreaId(null);
     }
-    await refreshAuthStatus(false);
 
     void (async () => {
       const refreshStartedAt = performance.now();
@@ -7798,7 +7801,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       const refreshResults = await Promise.allSettled([
         refreshVisiblePixelWindow({ force: true }),
         refreshClaimOutlineNow({ force: true }),
-        refreshOwnedAreas(),
+        refreshOwnedAreas({ showLoading: false }),
+        refreshAuthStatus(false),
         overviewRefresh(),
       ]);
       const failedRefreshCount = refreshResults
