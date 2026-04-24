@@ -15,19 +15,19 @@ export const APP_CHANGELOG: ChangelogEntry[] = [
     date: "Apr 24, 2026",
     sections: [
       {
-        title: "Improvements",
+        title: "New Features",
         items: [
-          "Area Info opened from the world now receives the full area summary in the inspection response, avoiding the extra detail hydrate request.",
-          "Focused finished-area outlines now use the public Area # in requests and clamp to the selected area's bounds instead of the whole zoomed-out viewport.",
-          "Claim outlines now stay off in visual-only zoom, and large focused Area Info outlines wait until the player zooms closer.",
-          "World pixel window reads now use a slimmer backend projection and a y/x window index for faster high-zoom fetches.",
+          "Claim Area now has an Overlay tool for uploading an image, placing it on the world, resizing it, flipping it, centering it and restoring its source ratio.",
+          "Overlay images convert into deterministic palette template pixels with RGB or perceptual matching, optional dithering and a Color Plate window for toggling colors.",
+          "Submitting an overlay creates the Claim Area and stores the generated pixel template privately on that area for the owner and invited players.",
+          "Saved private templates render back on the world for players with area access, giving contributors a shared placement guide.",
         ],
       },
       {
-        title: "Bug Fixes",
+        title: "Improvements",
         items: [
-          "Pending Claim Area fills are merged into union rectangles before rendering, preventing row seams when a new rectangle overlaps already staged claim cells.",
-          "Pending Claim Area fills no longer draw their own animated internal border; the shared union outline is the only border.",
+          "Overlay movement snaps to already preloaded claim pixels so new templates can line up against existing zones before submission.",
+          "Overlay conversion uses fixed sRGB palette math in the client instead of browser-dependent CSS color rendering.",
         ],
       },
     ],

@@ -111,6 +111,35 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
             """
         )
     )
+    await connection.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS claim_area_overlays (
+                id UUID PRIMARY KEY,
+                area_id UUID NOT NULL REFERENCES claim_areas(id) ON DELETE CASCADE,
+                image_name VARCHAR(120) NOT NULL DEFAULT 'overlay',
+                image_width INTEGER NOT NULL,
+                image_height INTEGER NOT NULL,
+                origin_x INTEGER NOT NULL,
+                origin_y INTEGER NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                color_mode VARCHAR(16) NOT NULL DEFAULT 'perceptual',
+                color_palette VARCHAR(64) NOT NULL DEFAULT 'all',
+                dithering BOOLEAN NOT NULL DEFAULT FALSE,
+                flip_x BOOLEAN NOT NULL DEFAULT FALSE,
+                flip_y BOOLEAN NOT NULL DEFAULT FALSE,
+                template_pixels JSONB NOT NULL DEFAULT '[]'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_claim_area_overlays_area_id UNIQUE (area_id)
+            )
+            """
+        )
+    )
+    await connection.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_claim_area_overlays_area_id ON claim_area_overlays (area_id)")
+    )
 
     await connection.execute(
         text("ALTER TABLE world_chunks ADD COLUMN IF NOT EXISTS claimed_pixels_count INTEGER DEFAULT 0")

@@ -190,6 +190,35 @@ export type ClaimOutlineWindow = {
   segments: ClaimOutlineSegment[];
 };
 
+export type ClaimOverlayPixel = {
+  x: number;
+  y: number;
+  color_id: number;
+};
+
+export type ClaimAreaOverlayInput = {
+  image_name: string;
+  image_width: number;
+  image_height: number;
+  origin_x: number;
+  origin_y: number;
+  width: number;
+  height: number;
+  color_mode: "rgb" | "perceptual";
+  color_palette: string;
+  dithering: boolean;
+  flip_x: boolean;
+  flip_y: boolean;
+  template_pixels: ClaimOverlayPixel[];
+};
+
+export type ClaimAreaOverlayRecord = ClaimAreaOverlayInput & {
+  id: string;
+  area_id: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type WorldTileLayer =
   | "claims"
   | "claims-low"
@@ -412,6 +441,7 @@ export type ClaimAreaPreview = {
 
 export type ClaimAreaSummary = ClaimAreaPreview & {
   contributors: AreaContributorSummary[];
+  overlay: ClaimAreaOverlayRecord | null;
 };
 
 export type ClaimAreaRecord = ClaimAreaPreview | ClaimAreaSummary;
@@ -916,6 +946,7 @@ export async function claimWorldPixels(input: {
   rectangles?: ClaimRectangleInput[];
   claimMode: ClaimAreaClaimMode;
   targetAreaId?: string | null;
+  overlay?: ClaimAreaOverlayInput | null;
 }): Promise<PixelBatchClaimResult> {
   try {
     const response = await fetch(`${clientApiBaseUrl}/world/claims/batch`, {
@@ -934,6 +965,7 @@ export async function claimWorldPixels(input: {
         })),
         claim_mode: input.claimMode,
         target_area_id: input.targetAreaId ?? null,
+        overlay: input.overlay ?? null,
       }),
     });
 

@@ -15,6 +15,7 @@ from PIL import Image
 from app.core.config import Settings, get_settings
 from app.models.area_contributor import AreaContributor
 from app.models.claim_area import ClaimArea
+from app.models.claim_area_overlay import ClaimAreaOverlay
 from app.models.user import User
 from app.models.world_chunk import WorldChunk
 from app.models.world_pixel import WorldPixel
@@ -33,6 +34,8 @@ from app.schemas.world import (
     PixelBatchPaintResponse,
     PixelPaintResponse,
     AreaContributorSummary,
+    ClaimAreaOverlayRequest,
+    ClaimAreaOverlaySummary,
     ClaimAreaPreview,
     ClaimAreaPreviewWindow,
     ClaimAreaBounds,
@@ -107,6 +110,8 @@ WORLD_TILE_LAYERS = {"claims", "claims-low", "paint", "paint-low", "visual", "vi
 WORLD_TILE_RENDER_LOCKS: dict[tuple[str, int, int, str], asyncio.Lock] = {}
 MAX_BATCH_CLAIM_PIXELS = 500_000
 MAX_BATCH_PAINT_PIXELS = 20_000
+MAX_CLAIM_OVERLAY_PIXELS = 200_000
+MAX_CLAIM_OVERLAY_SIDE = 4096
 CLAIM_EXISTING_QUERY_BATCH_SIZE = 10_000
 CLAIM_INSERT_BATCH_SIZE = 10_000
 AREA_NAME_MAX_LENGTH = 20
@@ -628,6 +633,93 @@ def build_claim_area_preview(
     )
 
 
+def _normalize_overlay_image_name(value: str) -> str:
+    normalized = " ".join(value.strip().split())
+    return (normalized or "overlay")[:120]
+
+
+def build_claim_area_overlay_summary(overlay: ClaimAreaOverlay) -> ClaimAreaOverlaySummary:
+    return ClaimAreaOverlaySummary(
+        id=overlay.id,
+        area_id=overlay.area_id,
+        image_name=overlay.image_name,
+        image_width=overlay.image_width,
+        image_height=overlay.image_height,
+        origin_x=overlay.origin_x,
+        origin_y=overlay.origin_y,
+        width=overlay.width,
+        height=overlay.height,
+        color_mode=overlay.color_mode,
+        color_palette=overlay.color_palette,
+        dithering=overlay.dithering,
+        flip_x=overlay.flip_x,
+        flip_y=overlay.flip_y,
+        template_pixels=overlay.template_pixels,
+        created_at=overlay.created_at,
+        updated_at=overlay.updated_at,
+    )
+
+
+def _normalize_claim_area_overlay_payload(
+    overlay: ClaimAreaOverlayRequest,
+    normalized_pixels: list[tuple[int, int]],
+) -> list[dict[str, int]]:
+    if overlay.width > MAX_CLAIM_OVERLAY_SIDE or overlay.height > MAX_CLAIM_OVERLAY_SIDE:
+        raise PixelPlacementError(
+            f"Overlay dimensions are limited to {MAX_CLAIM_OVERLAY_SIDE} pixels per side.",
+            413,
+        )
+
+    if overlay.image_width > MAX_CLAIM_OVERLAY_SIDE or overlay.image_height > MAX_CLAIM_OVERLAY_SIDE:
+        raise PixelPlacementError(
+            f"Overlay source images are limited to {MAX_CLAIM_OVERLAY_SIDE} pixels per side.",
+            413,
+        )
+
+    if len(overlay.template_pixels) == 0:
+        raise PixelPlacementError("Overlay claims need at least one template pixel.", 422)
+
+    if len(overlay.template_pixels) > MAX_CLAIM_OVERLAY_PIXELS:
+        raise PixelPlacementError(
+            f"Overlay templates are limited to {MAX_CLAIM_OVERLAY_PIXELS} colored pixels.",
+            413,
+        )
+
+    claim_coordinates = set(normalized_pixels)
+    seen: dict[tuple[int, int], int] = {}
+    min_y = overlay.origin_y - overlay.height + 1
+    max_y = overlay.origin_y
+    max_x = overlay.origin_x + overlay.width - 1
+
+    for pixel in overlay.template_pixels:
+        coordinate = (pixel.x, pixel.y)
+
+        if coordinate in seen:
+            raise PixelPlacementError("Overlay template pixels must be unique.", 422)
+
+        if pixel.color_id not in VALID_COLOR_IDS or pixel.color_id == TRANSPARENT_COLOR_ID:
+            raise PixelPlacementError("Overlay template pixels must use visible palette colors.", 422)
+
+        if coordinate not in claim_coordinates:
+            raise PixelPlacementError("Overlay template pixels must match the submitted claim pixels.", 422)
+
+        if not (
+            overlay.origin_x <= pixel.x <= max_x and
+            min_y <= pixel.y <= max_y
+        ):
+            raise PixelPlacementError("Overlay template pixels must stay inside the overlay bounds.", 422)
+
+        seen[coordinate] = pixel.color_id
+
+    if set(seen.keys()) != claim_coordinates:
+        raise PixelPlacementError("Overlay claim pixels must match the generated template exactly.", 422)
+
+    return [
+        {"x": x, "y": y, "color_id": color_id}
+        for (x, y), color_id in sorted(seen.items(), key=lambda item: (item[0][1], item[0][0]))
+    ]
+
+
 async def _get_claim_area_bounds(
     session: AsyncSession,
     area_id: UUID,
@@ -717,6 +809,15 @@ async def build_claim_area_summary(
             and role == AREA_CONTRIBUTOR_ROLE_ADMIN
         )
     }
+    viewer_has_overlay_access = viewer is not None and (
+        viewer.id == area.owner_user_id or area.id in viewer_contributor_area_ids
+    )
+    overlay = None
+
+    if viewer_has_overlay_access:
+        overlay = await session.scalar(
+            select(ClaimAreaOverlay).where(ClaimAreaOverlay.area_id == area.id)
+        )
 
     return ClaimAreaSummary(
         **build_claim_area_preview(
@@ -738,6 +839,7 @@ async def build_claim_area_summary(
             )
             for contributor, role in contributor_records
         ],
+        overlay=build_claim_area_overlay_summary(overlay) if overlay is not None else None,
     )
 
 
@@ -2904,14 +3006,22 @@ async def claim_world_pixels(
     rectangles: list[tuple[int, int, int, int]] | None = None,
     claim_mode: str = CLAIM_AREA_MODE_NEW,
     target_area_id: UUID | None = None,
+    overlay: ClaimAreaOverlayRequest | None = None,
 ) -> PixelBatchClaimResponse:
     resolved_settings = settings or get_settings()
     now = datetime.now(timezone.utc)
     normalized_pixels = _normalize_batch_pixels(pixels, rectangles)
 
+    if overlay is not None and claim_mode != CLAIM_AREA_MODE_NEW:
+        raise PixelPlacementError("Overlay claims must create a new area.", 422)
+
     _validate_connected_pixels(normalized_pixels)
     active_chunk_coordinates = await _get_active_world_chunk_coordinates(session)
     _validate_pixels_inside_active_world(normalized_pixels, active_chunk_coordinates, resolved_settings)
+    normalized_overlay_pixels: list[dict[str, int]] | None = None
+
+    if overlay is not None:
+        normalized_overlay_pixels = _normalize_claim_area_overlay_payload(overlay, normalized_pixels)
 
     if await _has_existing_pixels_at(session, normalized_pixels):
         raise PixelPlacementError("This claim includes territory that is already claimed.", 409)
@@ -2954,6 +3064,27 @@ async def claim_world_pixels(
     area.last_activity_at = now
     user.holders_placed_total += claimed_count
     user.claimed_pixels_count += claimed_count
+
+    if overlay is not None and normalized_overlay_pixels is not None:
+        session.add(
+            ClaimAreaOverlay(
+                id=uuid4(),
+                area_id=area.id,
+                image_name=_normalize_overlay_image_name(overlay.image_name),
+                image_width=overlay.image_width,
+                image_height=overlay.image_height,
+                origin_x=overlay.origin_x,
+                origin_y=overlay.origin_y,
+                width=overlay.width,
+                height=overlay.height,
+                color_mode=overlay.color_mode,
+                color_palette=overlay.color_palette,
+                dithering=overlay.dithering,
+                flip_x=overlay.flip_x,
+                flip_y=overlay.flip_y,
+                template_pixels=normalized_overlay_pixels,
+            )
+        )
 
     try:
         await session.commit()

@@ -145,6 +145,35 @@ class ClaimOutlineWindow(BaseModel):
     segments: list[ClaimOutlineSegment]
 
 
+class ClaimOverlayPixel(BaseModel):
+    x: int
+    y: int
+    color_id: int
+
+
+class ClaimAreaOverlayRequest(BaseModel):
+    image_name: str = Field(default="overlay", max_length=120)
+    image_width: int = Field(gt=0)
+    image_height: int = Field(gt=0)
+    origin_x: int
+    origin_y: int
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    color_mode: Literal["rgb", "perceptual"] = "perceptual"
+    color_palette: str = Field(default="all", max_length=64)
+    dithering: bool = False
+    flip_x: bool = False
+    flip_y: bool = False
+    template_pixels: list[ClaimOverlayPixel] = Field(default_factory=list)
+
+
+class ClaimAreaOverlaySummary(ClaimAreaOverlayRequest):
+    id: UUID
+    area_id: UUID
+    created_at: datetime
+    updated_at: datetime
+
+
 ClaimAreaClaimMode = Literal["new", "expand"]
 ClaimAreaStatus = Literal["active", "finished"]
 
@@ -168,6 +197,7 @@ class PixelBatchClaimRequest(BaseModel):
     rectangles: list[ClaimRectangleRequest] = Field(default_factory=list)
     claim_mode: ClaimAreaClaimMode = "new"
     target_area_id: UUID | None = None
+    overlay: ClaimAreaOverlayRequest | None = None
 
 
 class PixelClaimResponse(BaseModel):
@@ -254,6 +284,7 @@ class ClaimAreaPreview(BaseModel):
 
 class ClaimAreaSummary(ClaimAreaPreview):
     contributors: list[AreaContributorSummary]
+    overlay: ClaimAreaOverlaySummary | None = None
 
 
 class ClaimAreaInspection(BaseModel):

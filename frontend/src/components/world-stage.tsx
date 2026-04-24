@@ -13,6 +13,7 @@ import {
   type ReactNode,
   type RefObject,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 
 import {
@@ -39,6 +40,8 @@ import {
   type AuthUser,
   type AuthSessionStatus,
   type AreaContributorSummary,
+  type ClaimAreaOverlayInput,
+  type ClaimAreaOverlayRecord,
   type ClaimAreaClaimMode,
   type ClaimContextPixel,
   type ClaimAreaPreview,
@@ -74,7 +77,7 @@ type DragState = PanDragState;
 
 type BuildMode = "claim" | "paint";
 
-type ClaimTool = "brush" | "rectangle";
+type ClaimTool = "brush" | "rectangle" | "overlay";
 type PaintTool = "brush" | "eraser" | "picker";
 
 type ActiveModal = "info" | "changelog" | "login" | "shop" | "avatar" | "areas";
@@ -250,6 +253,68 @@ type BuildPanelDragState = {
   originY: number;
   width: number;
   height: number;
+};
+
+type OverlayColorMode = ClaimAreaOverlayInput["color_mode"];
+type OverlayResizeHandle = "north" | "east" | "south" | "west" | "north-east" | "south-east" | "south-west" | "north-west";
+
+type ClaimOverlayTransform = {
+  originX: number;
+  originY: number;
+  width: number;
+  height: number;
+};
+
+type ClaimOverlaySource = {
+  image: HTMLImageElement;
+  imageName: string;
+  width: number;
+  height: number;
+  version: number;
+};
+
+type ClaimOverlayTemplatePixel = PixelCoordinate & {
+  colorId: number;
+};
+
+type ClaimOverlayDraft = {
+  sourceVersion: number;
+  imageName: string;
+  sourceWidth: number;
+  sourceHeight: number;
+  transform: ClaimOverlayTransform;
+  colorMode: OverlayColorMode;
+  colorPalette: string;
+  dithering: boolean;
+  flipX: boolean;
+  flipY: boolean;
+  enabledColorIds: number[];
+  templatePixels: ClaimOverlayTemplatePixel[];
+  previewDataUrl: string | null;
+  renderMessage: string | null;
+};
+
+type OverlayPointerDragState = {
+  pointerId: number;
+  mode: "move" | "resize";
+  handle: OverlayResizeHandle | null;
+  startX: number;
+  startY: number;
+  startTransform: ClaimOverlayTransform;
+};
+
+type ClaimOverlayRenderResult = {
+  previewDataUrl: string;
+  templatePixels: ClaimOverlayTemplatePixel[];
+};
+
+type ClaimOverlayPaletteColor = {
+  id: number;
+  name: string;
+  hex: string;
+  r: number;
+  g: number;
+  b: number;
 };
 
 const EMPTY_PLACEMENT_STATE: PlacementState = {
@@ -472,6 +537,9 @@ const VISIBLE_AREA_PREFETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
 const VISIBLE_AREA_PREFETCH_SNAP_WORLD_UNITS = 16;
 const VISIBLE_AREA_PREFETCH_CACHE_MS = 3000;
 const CLAIM_BATCH_PIXEL_LIMIT = 500_000;
+const CLAIM_OVERLAY_TEMPLATE_PIXEL_LIMIT = 200_000;
+const CLAIM_OVERLAY_MAX_SIDE = 4096;
+const CLAIM_OVERLAY_SNAP_DISTANCE = 4;
 const BULK_PENDING_CLAIM_THRESHOLD = 20_000;
 const PENDING_PAINT_CANVAS_TILE_SIZE = 128;
 const PENDING_PAINT_CANVAS_MAX_CELL_SIZE = 16;
@@ -501,6 +569,8 @@ const WORLD_LOW_TILE_OVERSCAN_VIEWPORT_FACTOR = 0.08;
 const TRANSPARENT_COLOR_ID = 31;
 const PIXEL_PALETTE_NAME_BY_ID = new Map<number, string>(PIXEL_PALETTE.map((color) => [color.id, color.name]));
 const PIXEL_PALETTE_COLOR_BY_ID = new Map<number, string>(PIXEL_PALETTE.map((color) => [color.id, color.hex]));
+const CLAIM_OVERLAY_VISIBLE_PALETTE = PIXEL_PALETTE.filter((color) => color.id !== TRANSPARENT_COLOR_ID);
+const CLAIM_OVERLAY_DEFAULT_COLOR_IDS = CLAIM_OVERLAY_VISIBLE_PALETTE.map((color) => color.id);
 const BUILD_MODE_LABEL: Record<BuildMode, string> = {
   claim: "Claim Area",
   paint: "Color Pixel",
@@ -743,6 +813,250 @@ function appendPerfLog(event: PerfEventRecord): void {
 
 function getPixelKey(pixel: PixelCoordinate): string {
   return `${pixel.x}:${pixel.y}`;
+}
+
+function parsePaletteHex(hexColor: string): { r: number; g: number; b: number } | null {
+  if (!hexColor.startsWith("#") || hexColor.length !== 7) {
+    return null;
+  }
+
+  return {
+    r: Number.parseInt(hexColor.slice(1, 3), 16),
+    g: Number.parseInt(hexColor.slice(3, 5), 16),
+    b: Number.parseInt(hexColor.slice(5, 7), 16),
+  };
+}
+
+const CLAIM_OVERLAY_PALETTE_RGB: ClaimOverlayPaletteColor[] = CLAIM_OVERLAY_VISIBLE_PALETTE.flatMap((color) => {
+  const rgb = parsePaletteHex(color.hex);
+
+  return rgb === null
+    ? []
+    : [{
+        id: color.id,
+        name: color.name,
+        hex: color.hex,
+        ...rgb,
+      }];
+});
+
+function srgbToLinear(value: number): number {
+  const normalized = value / 255;
+  return normalized <= 0.04045
+    ? normalized / 12.92
+    : ((normalized + 0.055) / 1.055) ** 2.4;
+}
+
+function getOverlayColorDistance(
+  r: number,
+  g: number,
+  b: number,
+  color: ClaimOverlayPaletteColor,
+  colorMode: OverlayColorMode,
+): number {
+  if (colorMode === "rgb") {
+    return (
+      (r - color.r) ** 2 +
+      (g - color.g) ** 2 +
+      (b - color.b) ** 2
+    );
+  }
+
+  return (
+    0.2126 * (srgbToLinear(r) - srgbToLinear(color.r)) ** 2 +
+    0.7152 * (srgbToLinear(g) - srgbToLinear(color.g)) ** 2 +
+    0.0722 * (srgbToLinear(b) - srgbToLinear(color.b)) ** 2
+  );
+}
+
+function findNearestOverlayColor(
+  r: number,
+  g: number,
+  b: number,
+  palette: ClaimOverlayPaletteColor[],
+  colorMode: OverlayColorMode,
+): ClaimOverlayPaletteColor {
+  let nearest = palette[0];
+  let nearestDistance = Number.POSITIVE_INFINITY;
+
+  for (const color of palette) {
+    const distance = getOverlayColorDistance(r, g, b, color, colorMode);
+
+    if (distance < nearestDistance) {
+      nearest = color;
+      nearestDistance = distance;
+    }
+  }
+
+  return nearest;
+}
+
+function clampColorChannel(value: number): number {
+  return Math.max(0, Math.min(255, value));
+}
+
+function buildClaimOverlayRender(
+  source: ClaimOverlaySource,
+  draft: ClaimOverlayDraft,
+): ClaimOverlayRenderResult {
+  const width = Math.max(1, Math.round(draft.transform.width));
+  const height = Math.max(1, Math.round(draft.transform.height));
+  const cellCount = width * height;
+
+  if (width > CLAIM_OVERLAY_MAX_SIDE || height > CLAIM_OVERLAY_MAX_SIDE) {
+    throw new Error(`Overlay sides are limited to ${formatCount(CLAIM_OVERLAY_MAX_SIDE)} pixels.`);
+  }
+
+  if (cellCount > CLAIM_OVERLAY_TEMPLATE_PIXEL_LIMIT) {
+    throw new Error(`Overlay templates are limited to ${formatCount(CLAIM_OVERLAY_TEMPLATE_PIXEL_LIMIT)} pixels.`);
+  }
+
+  const palette = CLAIM_OVERLAY_PALETTE_RGB.filter((color) => draft.enabledColorIds.includes(color.id));
+
+  if (palette.length === 0) {
+    throw new Error("Enable at least one color plate before generating the overlay.");
+  }
+
+  const sourceCanvas = document.createElement("canvas");
+  sourceCanvas.width = width;
+  sourceCanvas.height = height;
+  const sourceContext = sourceCanvas.getContext("2d", { willReadFrequently: true });
+
+  if (sourceContext === null) {
+    throw new Error("Could not prepare the overlay image.");
+  }
+
+  sourceContext.imageSmoothingEnabled = true;
+  sourceContext.save();
+
+  if (draft.flipX || draft.flipY) {
+    sourceContext.translate(draft.flipX ? width : 0, draft.flipY ? height : 0);
+    sourceContext.scale(draft.flipX ? -1 : 1, draft.flipY ? -1 : 1);
+  }
+
+  sourceContext.clearRect(0, 0, width, height);
+  sourceContext.drawImage(source.image, 0, 0, width, height);
+  sourceContext.restore();
+
+  const sourceImageData = sourceContext.getImageData(0, 0, width, height);
+  const outputImageData = sourceContext.createImageData(width, height);
+  const templatePixels: ClaimOverlayTemplatePixel[] = [];
+  const errorPixels = draft.dithering ? new Float32Array(cellCount * 3) : null;
+
+  if (errorPixels !== null) {
+    for (let pixelIndex = 0; pixelIndex < cellCount; pixelIndex += 1) {
+      const sourceIndex = pixelIndex * 4;
+      const errorIndex = pixelIndex * 3;
+      errorPixels[errorIndex] = sourceImageData.data[sourceIndex];
+      errorPixels[errorIndex + 1] = sourceImageData.data[sourceIndex + 1];
+      errorPixels[errorIndex + 2] = sourceImageData.data[sourceIndex + 2];
+    }
+  }
+
+  function addDitherError(pixelX: number, pixelY: number, errorR: number, errorG: number, errorB: number, weight: number): void {
+    if (errorPixels === null || pixelX < 0 || pixelX >= width || pixelY < 0 || pixelY >= height) {
+      return;
+    }
+
+    const errorIndex = (pixelY * width + pixelX) * 3;
+    errorPixels[errorIndex] = clampColorChannel(errorPixels[errorIndex] + errorR * weight);
+    errorPixels[errorIndex + 1] = clampColorChannel(errorPixels[errorIndex + 1] + errorG * weight);
+    errorPixels[errorIndex + 2] = clampColorChannel(errorPixels[errorIndex + 2] + errorB * weight);
+  }
+
+  for (let pixelY = 0; pixelY < height; pixelY += 1) {
+    for (let pixelX = 0; pixelX < width; pixelX += 1) {
+      const pixelIndex = pixelY * width + pixelX;
+      const sourceIndex = pixelIndex * 4;
+      const alpha = sourceImageData.data[sourceIndex + 3];
+      const worldX = draft.transform.originX + pixelX;
+      const worldY = draft.transform.originY - pixelY;
+
+      if (alpha < 16) {
+        outputImageData.data[sourceIndex + 3] = 0;
+        continue;
+      }
+
+      const r = errorPixels === null ? sourceImageData.data[sourceIndex] : errorPixels[pixelIndex * 3];
+      const g = errorPixels === null ? sourceImageData.data[sourceIndex + 1] : errorPixels[pixelIndex * 3 + 1];
+      const b = errorPixels === null ? sourceImageData.data[sourceIndex + 2] : errorPixels[pixelIndex * 3 + 2];
+      const nearest = findNearestOverlayColor(
+        clampColorChannel(r),
+        clampColorChannel(g),
+        clampColorChannel(b),
+        palette,
+        draft.colorMode,
+      );
+
+      outputImageData.data[sourceIndex] = nearest.r;
+      outputImageData.data[sourceIndex + 1] = nearest.g;
+      outputImageData.data[sourceIndex + 2] = nearest.b;
+      outputImageData.data[sourceIndex + 3] = 188;
+      templatePixels.push({
+        x: worldX,
+        y: worldY,
+        colorId: nearest.id,
+      });
+
+      if (errorPixels !== null) {
+        const errorR = r - nearest.r;
+        const errorG = g - nearest.g;
+        const errorB = b - nearest.b;
+        addDitherError(pixelX + 1, pixelY, errorR, errorG, errorB, 7 / 16);
+        addDitherError(pixelX - 1, pixelY + 1, errorR, errorG, errorB, 3 / 16);
+        addDitherError(pixelX, pixelY + 1, errorR, errorG, errorB, 5 / 16);
+        addDitherError(pixelX + 1, pixelY + 1, errorR, errorG, errorB, 1 / 16);
+      }
+    }
+  }
+
+  sourceContext.putImageData(outputImageData, 0, 0);
+
+  return {
+    previewDataUrl: sourceCanvas.toDataURL("image/png"),
+    templatePixels,
+  };
+}
+
+function buildClaimOverlayRecordPreview(overlay: ClaimAreaOverlayRecord): string | null {
+  if (typeof document === "undefined" || overlay.width <= 0 || overlay.height <= 0) {
+    return null;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = overlay.width;
+  canvas.height = overlay.height;
+  const context = canvas.getContext("2d");
+
+  if (context === null) {
+    return null;
+  }
+
+  const imageData = context.createImageData(overlay.width, overlay.height);
+
+  for (const pixel of overlay.template_pixels) {
+    const color = CLAIM_OVERLAY_PALETTE_RGB.find((paletteColor) => paletteColor.id === pixel.color_id);
+
+    if (!color) {
+      continue;
+    }
+
+    const x = pixel.x - overlay.origin_x;
+    const y = overlay.origin_y - pixel.y;
+
+    if (x < 0 || x >= overlay.width || y < 0 || y >= overlay.height) {
+      continue;
+    }
+
+    const index = (y * overlay.width + x) * 4;
+    imageData.data[index] = color.r;
+    imageData.data[index + 1] = color.g;
+    imageData.data[index + 2] = color.b;
+    imageData.data[index + 3] = 174;
+  }
+
+  context.putImageData(imageData, 0, 0);
+  return canvas.toDataURL("image/png");
 }
 
 function toClaimContextPixelRecord(
@@ -1330,6 +1644,96 @@ function getPendingClaimCount(
 
 function getWorldWindowCellCount(bounds: Pick<VisibleAreaBounds, "minX" | "maxX" | "minY" | "maxY">): number {
   return Math.max(0, bounds.maxX - bounds.minX + 1) * Math.max(0, bounds.maxY - bounds.minY + 1);
+}
+
+function normalizeOverlayTransform(
+  transform: ClaimOverlayTransform,
+  bounds: ActiveWorldBounds,
+): ClaimOverlayTransform {
+  const width = Math.max(1, Math.min(CLAIM_OVERLAY_MAX_SIDE, Math.round(transform.width)));
+  const height = Math.max(1, Math.min(CLAIM_OVERLAY_MAX_SIDE, Math.round(transform.height)));
+  const minOriginX = bounds.minX;
+  const maxOriginX = Math.max(bounds.minX, bounds.maxX - width);
+  const minOriginY = bounds.minY + height - 1;
+  const maxOriginY = bounds.maxY - 1;
+
+  return {
+    originX: Math.max(minOriginX, Math.min(maxOriginX, Math.round(transform.originX))),
+    originY: Math.max(minOriginY, Math.min(maxOriginY, Math.round(transform.originY))),
+    width,
+    height,
+  };
+}
+
+function snapOverlayTransformToClaims(
+  transform: ClaimOverlayTransform,
+  claimPixels: Iterable<ClaimContextPixelRecord>,
+): ClaimOverlayTransform {
+  const overlayLeft = transform.originX;
+  const overlayRight = transform.originX + transform.width;
+  const overlayTop = transform.originY + 1;
+  const overlayBottom = transform.originY - transform.height + 1;
+  let bestDeltaX = 0;
+  let bestDeltaY = 0;
+  let bestAbsDeltaX = CLAIM_OVERLAY_SNAP_DISTANCE + 1;
+  let bestAbsDeltaY = CLAIM_OVERLAY_SNAP_DISTANCE + 1;
+
+  for (const pixel of claimPixels) {
+    if (pixel.owner_user_id === null && !pixel.is_starter) {
+      continue;
+    }
+
+    const pixelLeft = pixel.x;
+    const pixelRight = pixel.x + 1;
+    const pixelBottom = pixel.y;
+    const pixelTop = pixel.y + 1;
+    const verticalOverlap = pixelTop > overlayBottom && pixelBottom < overlayTop;
+    const horizontalOverlap = pixelRight > overlayLeft && pixelLeft < overlayRight;
+
+    if (verticalOverlap) {
+      const leftDelta = pixelRight - overlayLeft;
+      const rightDelta = pixelLeft - overlayRight;
+      const leftAbs = Math.abs(leftDelta);
+      const rightAbs = Math.abs(rightDelta);
+
+      if (leftAbs <= CLAIM_OVERLAY_SNAP_DISTANCE && leftAbs < bestAbsDeltaX) {
+        bestDeltaX = leftDelta;
+        bestAbsDeltaX = leftAbs;
+      }
+
+      if (rightAbs <= CLAIM_OVERLAY_SNAP_DISTANCE && rightAbs < bestAbsDeltaX) {
+        bestDeltaX = rightDelta;
+        bestAbsDeltaX = rightAbs;
+      }
+    }
+
+    if (horizontalOverlap) {
+      const topDelta = pixelBottom - overlayTop;
+      const bottomDelta = pixelTop - overlayBottom;
+      const topAbs = Math.abs(topDelta);
+      const bottomAbs = Math.abs(bottomDelta);
+
+      if (topAbs <= CLAIM_OVERLAY_SNAP_DISTANCE && topAbs < bestAbsDeltaY) {
+        bestDeltaY = topDelta;
+        bestAbsDeltaY = topAbs;
+      }
+
+      if (bottomAbs <= CLAIM_OVERLAY_SNAP_DISTANCE && bottomAbs < bestAbsDeltaY) {
+        bestDeltaY = bottomDelta;
+        bestAbsDeltaY = bottomAbs;
+      }
+    }
+  }
+
+  if (bestDeltaX === 0 && bestDeltaY === 0) {
+    return transform;
+  }
+
+  return {
+    ...transform,
+    originX: transform.originX + bestDeltaX,
+    originY: transform.originY + bestDeltaY,
+  };
 }
 
 function isPixelInsidePendingClaimRectangle(
@@ -2253,6 +2657,92 @@ const PendingPaintTileCanvas = memo(function PendingPaintTileCanvas({
     />
   );
 });
+
+function ClaimOverlaySurface({
+  camera,
+  editable,
+  imageName,
+  onHandlePointerDown,
+  onMovePointerDown,
+  onPointerCancel,
+  onPointerMove,
+  onPointerUp,
+  previewDataUrl,
+  templatePixelCount,
+  transform,
+}: {
+  camera: CameraState;
+  editable: boolean;
+  imageName: string;
+  onHandlePointerDown?: (event: ReactPointerEvent<HTMLButtonElement>, handle: OverlayResizeHandle) => void;
+  onMovePointerDown?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onPointerCancel?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onPointerMove?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onPointerUp?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  previewDataUrl: string | null;
+  templatePixelCount: number;
+  transform: ClaimOverlayTransform;
+}) {
+  if (previewDataUrl === null) {
+    return null;
+  }
+
+  const left = camera.x + transform.originX * camera.zoom;
+  const top = worldPixelScreenTop(transform.originY, camera);
+  const width = Math.max(1, transform.width * camera.zoom);
+  const height = Math.max(1, transform.height * camera.zoom);
+  const handles: Array<{ key: OverlayResizeHandle; label: string }> = [
+    { key: "north-west", label: "Resize northwest" },
+    { key: "north", label: "Resize north" },
+    { key: "north-east", label: "Resize northeast" },
+    { key: "east", label: "Resize east" },
+    { key: "south-east", label: "Resize southeast" },
+    { key: "south", label: "Resize south" },
+    { key: "south-west", label: "Resize southwest" },
+    { key: "west", label: "Resize west" },
+  ];
+
+  return (
+    <div
+      aria-label={`${imageName} overlay, ${templatePixelCount} pixels`}
+      className={`claim-template-overlay ${editable ? "is-editable" : "is-saved"}`}
+      onPointerDown={editable ? onMovePointerDown : undefined}
+      onPointerCancel={editable ? onPointerCancel : undefined}
+      onPointerMove={editable ? onPointerMove : undefined}
+      onPointerUp={editable ? onPointerUp : undefined}
+      role={editable ? "group" : "presentation"}
+      style={{
+        left: `${left}px`,
+        top: `${top}px`,
+        width: `${width}px`,
+        height: `${height}px`,
+      }}
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element -- Overlay previews are generated client-side data URLs. */}
+      <img
+        alt=""
+        className="claim-template-overlay-image"
+        draggable={false}
+        src={previewDataUrl}
+      />
+      {editable ? (
+        <>
+          <div className="claim-template-overlay-border" aria-hidden="true" />
+          {handles.map((handle) => (
+            <button
+              aria-label={handle.label}
+              className={`claim-template-resize-handle is-${handle.key}`}
+              key={handle.key}
+              onPointerDown={(event) => onHandlePointerDown?.(event, handle.key)}
+              title={handle.label}
+              type="button"
+            />
+          ))}
+        </>
+      ) : null}
+    </div>
+  );
+}
 
 const WorldViewportCanvas = memo(function WorldViewportCanvas({
   activeChunkBoundaryRects,
@@ -3387,8 +3877,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const crosshairHorizontalRef = useRef<HTMLDivElement | null>(null);
   const crosshairVerticalRef = useRef<HTMLDivElement | null>(null);
   const avatarFileInputRef = useRef<HTMLInputElement | null>(null);
+  const overlayFileInputRef = useRef<HTMLInputElement | null>(null);
   const dragState = useRef<DragState | null>(null);
   const buildPanelDragState = useRef<BuildPanelDragState | null>(null);
+  const overlayPointerDragRef = useRef<OverlayPointerDragState | null>(null);
+  const overlaySourceRef = useRef<ClaimOverlaySource | null>(null);
   const cameraUpdateFrameRef = useRef<number | null>(null);
   const pendingCameraUpdateRef = useRef<CameraState | null>(null);
   const pointerVisualFrameRef = useRef<number | null>(null);
@@ -3444,6 +3937,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const canStartNewAreaRef = useRef(true);
   const newAreaBlockedReasonRef = useRef<string | null>(null);
   const claimToolRef = useRef<ClaimTool>("brush");
+  const pendingOverlayDraftRef = useRef<ClaimOverlayDraft | null>(null);
   const paintToolRef = useRef<PaintTool>("brush");
   const rectangleAnchorRef = useRef<PixelCoordinate | null>(null);
   const areaInspectionAbortRef = useRef<AbortController | null>(null);
@@ -3512,6 +4006,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [claimAreaMode, setClaimAreaMode] = useState<ClaimAreaClaimMode>("new");
   const [claimTargetAreaId, setClaimTargetAreaId] = useState<string | null>(null);
   const [claimTool, setClaimTool] = useState<ClaimTool>("brush");
+  const [pendingOverlayDraft, setPendingOverlayDraft] = useState<ClaimOverlayDraft | null>(null);
+  const [overlayPaletteOpen, setOverlayPaletteOpen] = useState(false);
   const [paintTool, setPaintTool] = useState<PaintTool>("brush");
   const [rectangleAnchor, setRectangleAnchor] = useState<PixelCoordinate | null>(null);
   const [rectanglePlacementBusy, setRectanglePlacementBusy] = useState(false);
@@ -4343,6 +4839,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   canStartNewAreaRef.current = canStartNewArea;
   newAreaBlockedReasonRef.current = newAreaBlockedReason;
   claimToolRef.current = claimTool;
+  pendingOverlayDraftRef.current = pendingOverlayDraft;
   paintToolRef.current = paintTool;
   rectangleAnchorRef.current = rectangleAnchor;
   selectedColorIdRef.current = selectedColorId;
@@ -4351,6 +4848,85 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   cameraRef.current = effectiveCameraRefState;
   activeModalRef.current = activeModal;
   spaceToolActiveRef.current = spaceToolActive;
+
+  const pendingOverlayColorKey = pendingOverlayDraft?.enabledColorIds.join(",") ?? "";
+  const selectedAreaOverlay = isClaimAreaSummary(selectedArea) ? selectedArea.overlay : null;
+  const selectedAreaOverlayPreviewDataUrl = useMemo(
+    () => (selectedAreaOverlay ? buildClaimOverlayRecordPreview(selectedAreaOverlay) : null),
+    [selectedAreaOverlay],
+  );
+  const selectedAreaOverlayTransform = selectedAreaOverlay
+    ? {
+        originX: selectedAreaOverlay.origin_x,
+        originY: selectedAreaOverlay.origin_y,
+        width: selectedAreaOverlay.width,
+        height: selectedAreaOverlay.height,
+      }
+    : null;
+
+  useEffect(() => {
+    const renderDraft = pendingOverlayDraftRef.current;
+
+    if (renderDraft === null) {
+      return;
+    }
+
+    const source = overlaySourceRef.current;
+
+    if (source === null || source.version !== renderDraft.sourceVersion) {
+      return;
+    }
+
+    let cancelled = false;
+    const renderTimeout = window.setTimeout(() => {
+      try {
+        const result = buildClaimOverlayRender(source, renderDraft);
+
+        if (cancelled) {
+          return;
+        }
+
+        setPendingOverlayDraft((current) => {
+          if (current === null || current.sourceVersion !== renderDraft.sourceVersion) {
+            return current;
+          }
+
+          return {
+            ...current,
+            previewDataUrl: result.previewDataUrl,
+            templatePixels: result.templatePixels,
+            renderMessage: null,
+          };
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Overlay rendering failed.";
+
+        if (!cancelled) {
+          setPendingOverlayDraft((current) => current === null
+            ? current
+            : {
+                ...current,
+                templatePixels: [],
+                renderMessage: message,
+              });
+        }
+      }
+    }, 80);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(renderTimeout);
+    };
+  }, [
+    pendingOverlayColorKey,
+    pendingOverlayDraft?.colorMode,
+    pendingOverlayDraft?.dithering,
+    pendingOverlayDraft?.flipX,
+    pendingOverlayDraft?.flipY,
+    pendingOverlayDraft?.sourceVersion,
+    pendingOverlayDraft?.transform.height,
+    pendingOverlayDraft?.transform.width,
+  ]);
 
   useEffect(() => {
     cameraFetchGenerationRef.current += 1;
@@ -6404,10 +6980,14 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     () => getPendingClaimCount(pendingClaimPixels, pendingClaimRectangles),
     [pendingClaimPixels, pendingClaimRectangles],
   );
+  const pendingOverlayPixelCount = pendingOverlayDraft?.templatePixels.length ?? 0;
+  const activeClaimPendingCount = claimTool === "overlay" ? pendingOverlayPixelCount : pendingClaimCount;
   const bulkPendingClaimOverlay = pendingClaimCount >= BULK_PENDING_CLAIM_THRESHOLD;
-  const activePendingCount = activeBuildMode === "claim" ? pendingClaimCount : pendingPaints.length;
+  const activePendingCount = activeBuildMode === "claim" ? activeClaimPendingCount : pendingPaints.length;
   const activePendingLabel = activeBuildMode === "claim"
-    ? `${pendingClaimCount} pending claim${pendingClaimCount === 1 ? "" : "s"}`
+    ? claimTool === "overlay"
+      ? `${pendingOverlayPixelCount} overlay claim${pendingOverlayPixelCount === 1 ? "" : "s"}`
+      : `${pendingClaimCount} pending claim${pendingClaimCount === 1 ? "" : "s"}`
     : `${pendingPaints.length} pending pixel${pendingPaints.length === 1 ? "" : "s"}`;
   const selectedPendingClaim = useMemo(() => {
     if (selectedPixel === null) {
@@ -6416,7 +6996,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     return hasPendingClaimAtPixel(selectedPixel, pendingClaimPixelMap, pendingClaimRectangles);
   }, [pendingClaimPixelMap, pendingClaimRectangles, selectedPixel]);
-  const canRemoveSelectedPending = activeBuildMode === "claim"
+  const canRemoveSelectedPending = activeBuildMode === "claim" && claimTool === "overlay"
+    ? false
+    : activeBuildMode === "claim"
     ? selectedPendingClaim
     : selectedPendingPaint !== null;
 
@@ -6429,10 +7011,14 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return "Nothing pending";
     }
 
+    if (activeBuildMode === "claim" && claimTool === "overlay") {
+      return `Create overlay claim (${formatCount(activePendingCount)})`;
+    }
+
     return activeBuildMode === "claim"
       ? `Submit ${activePendingCount} claim${activePendingCount === 1 ? "" : "s"}`
       : `Submit ${activePendingCount} pixel${activePendingCount === 1 ? "" : "s"}`;
-  }, [activeBuildMode, activePendingCount, placementBusy]);
+  }, [activeBuildMode, activePendingCount, claimTool, placementBusy]);
 
   const selectedCellLabel = useMemo(() => {
     if (selectedPixel === null) {
@@ -6461,6 +7047,22 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const placementHelpText = useMemo(() => {
     if (currentUser === null) {
       return "Login required to use the build tools.";
+    }
+
+    if (activeBuildMode === "claim" && claimTool === "overlay") {
+      if (claimAreaMode !== "new") {
+        return "Overlay creates a new Claim Area. Finish or close extend mode before creating an overlay claim.";
+      }
+
+      if (pendingOverlayDraft === null) {
+        return "Upload an image, position it on the world, then create the Claim Area and private pixel template together.";
+      }
+
+      if (pendingOverlayDraft.renderMessage !== null) {
+        return pendingOverlayDraft.renderMessage;
+      }
+
+      return "Drag the overlay on the canvas, resize it from the edges or corners, then submit to claim the generated template pixels.";
     }
 
     if (!semanticZoomMode) {
@@ -6569,6 +7171,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     paintTool,
     rectangleAnchor,
     rectanglePlacementBusy,
+    pendingOverlayDraft,
     semanticZoomMode,
     selectedPendingPaint,
     selectedPixel,
@@ -6887,6 +7490,16 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     if (activeMode === "claim") {
+      if (claimToolRef.current === "overlay") {
+        if (!options?.quiet) {
+          setPlacementMessage({
+            tone: "info",
+            text: "Overlay mode uses the uploaded template instead of single-cell staging.",
+          });
+        }
+        return false;
+      }
+
       const targetState = getPlacementState(targetPixel);
       const activeClaimMode = claimAreaModeRef.current;
       const activeClaimTargetAreaId = claimTargetAreaIdRef.current;
@@ -7682,6 +8295,301 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     event.target.value = "";
   }
 
+  function getCenteredOverlayTransform(sourceWidth: number, sourceHeight: number): ClaimOverlayTransform {
+    const maxInitialCells = Math.min(CLAIM_OVERLAY_TEMPLATE_PIXEL_LIMIT, CLAIM_BATCH_PIXEL_LIMIT);
+    const sourceCells = sourceWidth * sourceHeight;
+    const scale = sourceCells > maxInitialCells
+      ? Math.sqrt(maxInitialCells / sourceCells)
+      : 1;
+    const width = Math.max(1, Math.round(sourceWidth * scale));
+    const height = Math.max(1, Math.round(sourceHeight * scale));
+    const centerX = viewportSize.width > 0
+      ? (viewportSize.width / 2 - cameraRef.current.x) / cameraRef.current.zoom
+      : activeWorldBounds.centerX;
+    const centerY = viewportSize.height > 0
+      ? (cameraRef.current.y - viewportSize.height / 2) / cameraRef.current.zoom
+      : activeWorldBounds.centerY;
+
+    return normalizeOverlayTransform(
+      {
+        originX: Math.round(centerX - width / 2),
+        originY: Math.round(centerY + height / 2),
+        width,
+        height,
+      },
+      activeWorldBounds,
+    );
+  }
+
+  function setPendingOverlayTransform(nextTransform: ClaimOverlayTransform, options?: { snap?: boolean }): void {
+    const bounds = activeWorldBoundsRef.current;
+
+    if (bounds === null) {
+      return;
+    }
+
+    const normalized = normalizeOverlayTransform(nextTransform, bounds);
+    const snapped = options?.snap === false
+      ? normalized
+      : normalizeOverlayTransform(
+          snapOverlayTransformToClaims(normalized, claimContextPixelIndexRef.current.values()),
+          bounds,
+        );
+
+    setPendingOverlayDraft((current) => current === null
+      ? current
+      : {
+          ...current,
+          transform: snapped,
+        });
+  }
+
+  function updatePendingOverlayDraft(
+    updater: (current: ClaimOverlayDraft) => ClaimOverlayDraft,
+  ): void {
+    setPendingOverlayDraft((current) => current === null ? current : updater(current));
+  }
+
+  function handleOverlayUploadClick(): void {
+    overlayFileInputRef.current?.click();
+  }
+
+  async function loadOverlayFile(file: File): Promise<void> {
+    if (!file.type.startsWith("image/")) {
+      setPlacementMessage({
+        tone: "error",
+        text: "Overlay upload expects an image file.",
+      });
+      return;
+    }
+
+    const objectUrl = URL.createObjectURL(file);
+    const image = new window.Image();
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error("Image could not be loaded."));
+        image.src = objectUrl;
+      });
+    } catch (error) {
+      setPlacementMessage({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Overlay image could not be loaded.",
+      });
+      URL.revokeObjectURL(objectUrl);
+      return;
+    }
+
+    URL.revokeObjectURL(objectUrl);
+
+    if (image.naturalWidth > CLAIM_OVERLAY_MAX_SIDE || image.naturalHeight > CLAIM_OVERLAY_MAX_SIDE) {
+      setPlacementMessage({
+        tone: "error",
+        text: `Overlay source images are limited to ${formatCount(CLAIM_OVERLAY_MAX_SIDE)} pixels per side.`,
+      });
+      return;
+    }
+
+    const sourceVersion = Date.now();
+    overlaySourceRef.current = {
+      image,
+      imageName: file.name || "overlay",
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+      version: sourceVersion,
+    };
+    setPendingOverlayDraft({
+      sourceVersion,
+      imageName: file.name || "overlay",
+      sourceWidth: image.naturalWidth,
+      sourceHeight: image.naturalHeight,
+      transform: getCenteredOverlayTransform(image.naturalWidth, image.naturalHeight),
+      colorMode: "perceptual",
+      colorPalette: "all",
+      dithering: false,
+      flipX: false,
+      flipY: false,
+      enabledColorIds: CLAIM_OVERLAY_DEFAULT_COLOR_IDS,
+      templatePixels: [],
+      previewDataUrl: null,
+      renderMessage: "Preparing overlay template...",
+    });
+    setClaimTool("overlay");
+    setPlacementMessage({
+      tone: "info",
+      text: "Overlay loaded. Drag it on the canvas, resize it, then submit the generated claim.",
+    });
+  }
+
+  async function handleOverlayFileChange(event: React.ChangeEvent<HTMLInputElement>): Promise<void> {
+    const file = event.target.files?.[0] ?? null;
+
+    if (file !== null) {
+      await loadOverlayFile(file);
+    }
+
+    event.target.value = "";
+  }
+
+  function handleOverlayDragOver(event: React.DragEvent<HTMLDivElement>): void {
+    event.preventDefault();
+  }
+
+  function handleOverlayDrop(event: React.DragEvent<HTMLDivElement>): void {
+    event.preventDefault();
+    const file = event.dataTransfer.files?.[0] ?? null;
+
+    if (file !== null) {
+      void loadOverlayFile(file);
+    }
+  }
+
+  function handleOverlayCenter(): void {
+    const draft = pendingOverlayDraftRef.current;
+
+    if (draft === null) {
+      return;
+    }
+
+    setPendingOverlayTransform(getCenteredOverlayTransform(draft.transform.width, draft.transform.height), {
+      snap: false,
+    });
+  }
+
+  function handleOverlayRestoreRatio(): void {
+    const draft = pendingOverlayDraftRef.current;
+
+    if (draft === null) {
+      return;
+    }
+
+    const aspectRatio = draft.sourceWidth / draft.sourceHeight;
+    const width = Math.max(1, Math.round(draft.transform.width));
+    const height = Math.max(1, Math.round(width / aspectRatio));
+
+    setPendingOverlayTransform({
+      ...draft.transform,
+      width,
+      height,
+    }, { snap: false });
+  }
+
+  function handleOverlayPointerDown(event: ReactPointerEvent<HTMLDivElement>): void {
+    const draft = pendingOverlayDraftRef.current;
+
+    if (draft === null || event.button !== 0) {
+      return;
+    }
+
+    overlayPointerDragRef.current = {
+      pointerId: event.pointerId,
+      mode: "move",
+      handle: null,
+      startX: event.clientX,
+      startY: event.clientY,
+      startTransform: draft.transform,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.stopPropagation();
+    event.preventDefault();
+  }
+
+  function handleOverlayHandlePointerDown(
+    event: ReactPointerEvent<HTMLButtonElement>,
+    handle: OverlayResizeHandle,
+  ): void {
+    const draft = pendingOverlayDraftRef.current;
+
+    if (draft === null || event.button !== 0) {
+      return;
+    }
+
+    overlayPointerDragRef.current = {
+      pointerId: event.pointerId,
+      mode: "resize",
+      handle,
+      startX: event.clientX,
+      startY: event.clientY,
+      startTransform: draft.transform,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.stopPropagation();
+    event.preventDefault();
+  }
+
+  function getResizedOverlayTransform(
+    drag: OverlayPointerDragState,
+    deltaWorldX: number,
+    deltaWorldY: number,
+  ): ClaimOverlayTransform {
+    if (drag.mode === "move") {
+      return {
+        ...drag.startTransform,
+        originX: drag.startTransform.originX + deltaWorldX,
+        originY: drag.startTransform.originY + deltaWorldY,
+      };
+    }
+
+    const handle = drag.handle;
+    let { originX, originY, width, height } = drag.startTransform;
+
+    if (handle?.includes("east")) {
+      width += deltaWorldX;
+    }
+
+    if (handle?.includes("west")) {
+      originX += deltaWorldX;
+      width -= deltaWorldX;
+    }
+
+    if (handle?.includes("north")) {
+      originY += deltaWorldY;
+      height += deltaWorldY;
+    }
+
+    if (handle?.includes("south")) {
+      height -= deltaWorldY;
+    }
+
+    return {
+      originX,
+      originY,
+      width,
+      height,
+    };
+  }
+
+  function handleOverlayPointerMove(event: ReactPointerEvent<HTMLDivElement>): void {
+    const drag = overlayPointerDragRef.current;
+
+    if (drag === null || drag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const deltaWorldX = Math.round((event.clientX - drag.startX) / Math.max(cameraRef.current.zoom, ABSOLUTE_MIN_ZOOM));
+    const deltaWorldY = Math.round((drag.startY - event.clientY) / Math.max(cameraRef.current.zoom, ABSOLUTE_MIN_ZOOM));
+    setPendingOverlayTransform(getResizedOverlayTransform(drag, deltaWorldX, deltaWorldY));
+    event.stopPropagation();
+    event.preventDefault();
+  }
+
+  function handleOverlayPointerUp(event: ReactPointerEvent<HTMLDivElement>): void {
+    const drag = overlayPointerDragRef.current;
+
+    if (drag === null || drag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    overlayPointerDragRef.current = null;
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    event.stopPropagation();
+  }
+
   const applySavedPaints = useCallback((savedPaints: PendingPaint[], nextUser: AuthUser): void => {
     const nextPixels = [...visiblePixelsRef.current];
     const pixelIndex = new Map(nextPixels.map((pixel, index) => [getPixelKey(pixel), index]));
@@ -7756,6 +8664,24 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setPlacementMessage(null);
 
     if (activeBuildMode === "claim") {
+      if (claimToolRef.current === "overlay") {
+        const draft = pendingOverlayDraftRef.current;
+        const saved = await submitPendingOverlayClaim(draft);
+
+        if (saved) {
+          setPendingOverlayDraft(null);
+          overlaySourceRef.current = null;
+          setOverlayPaletteOpen(false);
+          setPlacementMessage({
+            tone: "success",
+            text: "Overlay Claim Area saved. The private template is now attached to this area.",
+          });
+        }
+
+        setPlacementBusy(false);
+        return;
+      }
+
       const pendingClaimCountToSubmit = getPendingClaimCount(
         pendingClaimPixelsRef.current,
         pendingClaimRectanglesRef.current,
@@ -7796,6 +8722,148 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     setPlacementBusy(false);
+  }
+
+  async function submitPendingOverlayClaim(draft: ClaimOverlayDraft | null): Promise<boolean> {
+    const source = overlaySourceRef.current;
+    const overlayUser = currentUserRef.current;
+
+    if (overlayUser === null) {
+      setPlacementMessage({ tone: "error", text: "Login required to create an overlay claim." });
+      return false;
+    }
+
+    if (!canStartNewAreaRef.current) {
+      setPlacementMessage({
+        tone: "error",
+        text: newAreaBlockedReasonRef.current ?? "Finish or extend your current active area before starting an overlay claim.",
+      });
+      return false;
+    }
+
+    if (draft === null || source === null || source.version !== draft.sourceVersion) {
+      setPlacementMessage({
+        tone: "error",
+        text: "Upload an overlay image before submitting.",
+      });
+      return false;
+    }
+
+    const normalizedTransform = normalizeOverlayTransform(draft.transform, activeWorldBoundsRef.current ?? activeWorldBounds);
+    const normalizedDraft = {
+      ...draft,
+      transform: normalizedTransform,
+    };
+    let render: ClaimOverlayRenderResult;
+
+    try {
+      render = buildClaimOverlayRender(source, normalizedDraft);
+    } catch (error) {
+      setPlacementMessage({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Overlay template generation failed.",
+      });
+      return false;
+    }
+
+    if (render.templatePixels.length === 0) {
+      setPlacementMessage({
+        tone: "error",
+        text: "The overlay has no visible template pixels.",
+      });
+      return false;
+    }
+
+    if (render.templatePixels.length > getCurrentDisplayedHolders(overlayUser)) {
+      setPlacementMessage({
+        tone: "error",
+        text: `This overlay needs ${formatCount(render.templatePixels.length)} Holders.`,
+      });
+      return false;
+    }
+
+    const startedAt = performance.now();
+    emitDebugEvent(
+      "network",
+      "Overlay claim submit start",
+      `${render.templatePixels.length} template pixel${render.templatePixels.length === 1 ? "" : "s"}`,
+    );
+
+    const result = await claimWorldPixels({
+      pixels: render.templatePixels.map((pixel) => ({ x: pixel.x, y: pixel.y })),
+      claimMode: "new",
+      targetAreaId: null,
+      overlay: {
+        image_name: draft.imageName,
+        image_width: draft.sourceWidth,
+        image_height: draft.sourceHeight,
+        origin_x: normalizedTransform.originX,
+        origin_y: normalizedTransform.originY,
+        width: normalizedTransform.width,
+        height: normalizedTransform.height,
+        color_mode: draft.colorMode,
+        color_palette: draft.colorPalette,
+        dithering: draft.dithering,
+        flip_x: draft.flipX,
+        flip_y: draft.flipY,
+        template_pixels: render.templatePixels.map((pixel) => ({
+          x: pixel.x,
+          y: pixel.y,
+          color_id: pixel.colorId,
+        })),
+      },
+    });
+
+    if (!result.ok || result.user === null || result.area === null) {
+      setPlacementMessage({
+        tone: "error",
+        text: result.error ?? "Overlay claim submission failed. The template stayed local.",
+      });
+      emitDebugEvent(
+        "warning",
+        "Overlay claim submit failed",
+        result.error ?? "Unknown overlay claim submit failure",
+        performance.now() - startedAt,
+      );
+      return false;
+    }
+
+    setAuthStatus((current) => ({
+      ...current,
+      user: result.user,
+    }));
+    markWorldTilesDirty(result.claim_tiles);
+    applyAreaSelection(cacheClaimAreaSummary(result.area));
+
+    void (async () => {
+      const refreshStartedAt = performance.now();
+      emitDebugEvent("network", "Overlay follow-up refresh start", "pixels, outline, areas, overview");
+      const overviewRefresh = async (): Promise<void> => {
+        setWorld(await fetchWorldOverview());
+      };
+      const results = await Promise.allSettled([
+        refreshVisiblePixelWindow({ force: true }),
+        refreshClaimOutlineNow({ force: true }),
+        refreshOwnedAreas(),
+        overviewRefresh(),
+      ]);
+      const failedCount = results.filter((refreshResult) => refreshResult.status === "rejected").length;
+
+      emitDebugEvent(
+        failedCount > 0 ? "warning" : "network",
+        failedCount > 0 ? "Overlay follow-up refresh partially failed" : "Overlay follow-up refresh done",
+        `${failedCount} failed refresh${failedCount === 1 ? "" : "es"}`,
+        performance.now() - refreshStartedAt,
+      );
+    })();
+
+    emitDebugEvent(
+      "network",
+      "Overlay claim submit done",
+      `area ${result.area.id} with ${result.claim_tiles.length} claim tile${result.claim_tiles.length === 1 ? "" : "s"}; refresh queued`,
+      performance.now() - startedAt,
+    );
+    return true;
   }
 
   async function submitPendingClaims(
@@ -8258,6 +9326,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     if (nextTool !== "rectangle") {
       setRectangleAnchor(null);
     }
+
+    if (nextTool !== "overlay") {
+      setOverlayPaletteOpen(false);
+    }
   }
 
   function handlePaintToolChange(nextTool: PaintTool): void {
@@ -8281,7 +9353,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setRectangleAnchor(null);
     buildPanelDragState.current = null;
 
-    if (pendingClaimCount === 0) {
+    if (pendingClaimCount === 0 && pendingOverlayDraftRef.current === null) {
       setClaimAreaMode("new");
       setClaimTargetAreaId(null);
     }
@@ -8294,7 +9366,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }
 
   function handleClearActivePending(): void {
-    if (activeBuildMode === "claim") {
+    if (activeBuildMode === "claim" && claimTool === "overlay") {
+      setPendingOverlayDraft(null);
+      overlaySourceRef.current = null;
+      setOverlayPaletteOpen(false);
+    } else if (activeBuildMode === "claim") {
       syncPendingClaims([], []);
       setRectangleAnchor(null);
     } else {
@@ -8933,11 +10009,178 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                 >
                   Rectangle
                 </button>
+                <button
+                  className={`claim-tool-button ${claimTool === "overlay" ? "is-active" : ""}`}
+                  disabled={claimAreaMode !== "new"}
+                  onClick={() => handleClaimToolChange("overlay")}
+                  title={claimAreaMode !== "new" ? "Overlay creates a new Claim Area." : "Upload an image overlay"}
+                  type="button"
+                >
+                  Overlay
+                </button>
                 {rectanglePlacementBusy ? (
                   <span>Checking...</span>
                 ) : rectangleAnchor ? (
                   <span>{rectangleAnchor.x} : {rectangleAnchor.y}</span>
                 ) : null}
+              </div>
+            ) : null}
+            {activeBuildMode === "claim" && claimTool === "overlay" ? (
+              <div className="claim-overlay-tool" onDragOver={handleOverlayDragOver} onDrop={handleOverlayDrop}>
+                <input
+                  accept="image/png,image/webp,image/jpeg,image/gif,image/*"
+                  className="overlay-file-input"
+                  onChange={(event) => void handleOverlayFileChange(event)}
+                  ref={overlayFileInputRef}
+                  type="file"
+                />
+                <button className="overlay-drop-zone" onClick={handleOverlayUploadClick} type="button">
+                  <strong>{pendingOverlayDraft?.imageName ?? "Upload overlay image"}</strong>
+                  <span>
+                    {pendingOverlayDraft
+                      ? `${pendingOverlayDraft.sourceWidth} x ${pendingOverlayDraft.sourceHeight} source`
+                      : "Drop PNG, WEBP or another image here"}
+                  </span>
+                </button>
+                <div className="overlay-control-grid">
+                  <label className="overlay-control">
+                    <span>Color Mode</span>
+                    <select
+                      disabled={pendingOverlayDraft === null}
+                      onChange={(event) => updatePendingOverlayDraft((current) => ({
+                        ...current,
+                        colorMode: event.target.value as OverlayColorMode,
+                      }))}
+                      value={pendingOverlayDraft?.colorMode ?? "perceptual"}
+                    >
+                      <option value="perceptual">Perceptual</option>
+                      <option value="rgb">RGB</option>
+                    </select>
+                  </label>
+                  <label className="overlay-control">
+                    <span>Color Palette</span>
+                    <button
+                      className="overlay-select-button"
+                      disabled={pendingOverlayDraft === null}
+                      onClick={() => setOverlayPaletteOpen((current) => !current)}
+                      type="button"
+                    >
+                      {pendingOverlayDraft
+                        ? `${pendingOverlayDraft.enabledColorIds.length} colors`
+                        : "All colors"}
+                    </button>
+                  </label>
+                </div>
+                <label className="overlay-toggle">
+                  <input
+                    checked={pendingOverlayDraft?.dithering ?? false}
+                    disabled={pendingOverlayDraft === null}
+                    onChange={(event) => updatePendingOverlayDraft((current) => ({
+                      ...current,
+                      dithering: event.target.checked,
+                    }))}
+                    type="checkbox"
+                  />
+                  <span>Dithering</span>
+                </label>
+                <div className="overlay-action-row">
+                  <button
+                    className="pixel-clear-button"
+                    disabled={pendingOverlayDraft === null}
+                    onClick={() => updatePendingOverlayDraft((current) => ({ ...current, flipX: !current.flipX }))}
+                    type="button"
+                  >
+                    Flip X
+                  </button>
+                  <button
+                    className="pixel-clear-button"
+                    disabled={pendingOverlayDraft === null}
+                    onClick={() => updatePendingOverlayDraft((current) => ({ ...current, flipY: !current.flipY }))}
+                    type="button"
+                  >
+                    Flip Y
+                  </button>
+                  <button
+                    className="pixel-clear-button"
+                    disabled={pendingOverlayDraft === null}
+                    onClick={handleOverlayCenter}
+                    type="button"
+                  >
+                    Center
+                  </button>
+                  <button
+                    className="pixel-clear-button"
+                    disabled={pendingOverlayDraft === null}
+                    onClick={handleOverlayRestoreRatio}
+                    type="button"
+                  >
+                    Restore Ratio
+                  </button>
+                </div>
+                {pendingOverlayDraft ? (
+                  <div className="overlay-meta-row">
+                    <span>{pendingOverlayDraft.transform.width} x {pendingOverlayDraft.transform.height}</span>
+                    <strong>{formatCount(pendingOverlayPixelCount)} pixels</strong>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {activeBuildMode === "claim" && claimTool === "overlay" && overlayPaletteOpen && pendingOverlayDraft ? (
+              <div className="overlay-palette-window">
+                <div className="overlay-palette-header">
+                  <strong>Color Plate</strong>
+                  <div>
+                    <button
+                      className="pixel-clear-button"
+                      onClick={() => updatePendingOverlayDraft((current) => ({
+                        ...current,
+                        enabledColorIds: CLAIM_OVERLAY_DEFAULT_COLOR_IDS,
+                      }))}
+                      type="button"
+                    >
+                      All
+                    </button>
+                    <button
+                      className="pixel-clear-button"
+                      onClick={() => updatePendingOverlayDraft((current) => ({
+                        ...current,
+                        enabledColorIds: [],
+                      }))}
+                      type="button"
+                    >
+                      None
+                    </button>
+                  </div>
+                </div>
+                <div className="overlay-palette-colors">
+                  {CLAIM_OVERLAY_VISIBLE_PALETTE.map((color) => {
+                    const enabled = pendingOverlayDraft.enabledColorIds.includes(color.id);
+
+                    return (
+                      <label className="overlay-color-toggle" key={color.id} title={color.name}>
+                        <input
+                          checked={enabled}
+                          onChange={(event) => updatePendingOverlayDraft((current) => {
+                            const colorIds = new Set(current.enabledColorIds);
+
+                            if (event.target.checked) {
+                              colorIds.add(color.id);
+                            } else {
+                              colorIds.delete(color.id);
+                            }
+
+                            return {
+                              ...current,
+                              enabledColorIds: CLAIM_OVERLAY_DEFAULT_COLOR_IDS.filter((colorId) => colorIds.has(colorId)),
+                            };
+                          })}
+                          type="checkbox"
+                        />
+                        <span style={{ backgroundColor: color.hex }} />
+                      </label>
+                    );
+                  })}
+                </div>
               </div>
             ) : null}
             {activeBuildMode === "paint" ? (
@@ -9093,6 +10336,31 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           worldOutsideMaskId={worldOutsideMaskId}
           worldOutsidePatternId={worldOutsidePatternId}
         />
+        {selectedAreaOverlay && selectedAreaOverlayTransform && selectedAreaOverlayPreviewDataUrl ? (
+          <ClaimOverlaySurface
+            camera={camera}
+            editable={false}
+            imageName={selectedAreaOverlay.image_name}
+            previewDataUrl={selectedAreaOverlayPreviewDataUrl}
+            templatePixelCount={selectedAreaOverlay.template_pixels.length}
+            transform={selectedAreaOverlayTransform}
+          />
+        ) : null}
+        {pendingOverlayDraft ? (
+          <ClaimOverlaySurface
+            camera={camera}
+            editable
+            imageName={pendingOverlayDraft.imageName}
+            onHandlePointerDown={handleOverlayHandlePointerDown}
+            onMovePointerDown={handleOverlayPointerDown}
+            onPointerCancel={handleOverlayPointerUp}
+            onPointerMove={handleOverlayPointerMove}
+            onPointerUp={handleOverlayPointerUp}
+            previewDataUrl={pendingOverlayDraft.previewDataUrl}
+            templatePixelCount={pendingOverlayPixelCount}
+            transform={pendingOverlayDraft.transform}
+          />
+        ) : null}
       </div>
 
       {activeModal === "info" ? (

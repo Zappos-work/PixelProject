@@ -2,6 +2,20 @@
 
 Player-facing release notes for PixelProject.
 
+## 0.1.12 - Apr 24, 2026
+
+### New Features
+
+- Claim Area now includes an Overlay tool for uploading an image, placing it on the world, resizing it from edges or corners, flipping it, centering it and restoring its source ratio.
+- Overlay images are converted into deterministic palette template pixels with RGB or perceptual color matching, optional dithering and a Color Plate window for toggling available colors.
+- Submitting an overlay now creates the Claim Area and stores the generated pixel template privately on that area, so only the owner and invited players can receive it through Area Info.
+- Saved private templates render back on the world for players with area access, giving contributors a shared placement guide after they are invited.
+
+### Improvements
+
+- Overlay movement snaps to already preloaded claim pixels so new templates can line up against existing zones before submission.
+- Overlay conversion uses fixed sRGB palette math in the client instead of browser-dependent CSS color rendering, keeping generated template colors consistent across browsers.
+
 ## 0.1.11 - Apr 24, 2026
 
 ### Improvements

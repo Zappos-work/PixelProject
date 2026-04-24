@@ -226,6 +226,7 @@ async def claim_pixels(
             ],
             claim_mode=payload.claim_mode,
             target_area_id=payload.target_area_id,
+            overlay=payload.overlay,
         )
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
