@@ -466,7 +466,6 @@ const CLAIM_OUTLINE_FETCH_REPEAT_CACHE_MS = 1000;
 const CLAIM_OUTLINE_FETCH_MARGIN = 2;
 const CLAIM_OUTLINE_FETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
 const CLAIM_OUTLINE_MAX_FREE_FETCH_CELLS = 200_000;
-const CLAIM_OUTLINE_MAX_FOCUSED_FETCH_CELLS = 90_000;
 const VISIBLE_AREA_PREFETCH_DEBOUNCE_MS = 180;
 const VISIBLE_AREA_POLL_INTERVAL_MS = 5000;
 const VISIBLE_AREA_PREFETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
@@ -4917,7 +4916,29 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return null;
     }
 
-    if (focusedClaimOutlineAreaId === null && (!semanticZoomMode || fetchWorldTileDetailScale !== 1)) {
+    if (focusedClaimOutlineAreaId !== null) {
+      if (focusedClaimOutlineAreaBounds === null) {
+        return null;
+      }
+
+      const focusedAreaBounds = {
+        minX: Math.max(activeWorldBounds.minX, focusedClaimOutlineAreaBounds.min_x - 1),
+        maxX: Math.min(activeWorldBounds.maxX - 1, focusedClaimOutlineAreaBounds.max_x + 1),
+        minY: Math.max(activeWorldBounds.minY, focusedClaimOutlineAreaBounds.min_y - 1),
+        maxY: Math.min(activeWorldBounds.maxY - 1, focusedClaimOutlineAreaBounds.max_y + 1),
+      };
+
+      if (
+        focusedAreaBounds.minX > focusedAreaBounds.maxX ||
+        focusedAreaBounds.minY > focusedAreaBounds.maxY
+      ) {
+        return null;
+      }
+
+      return focusedAreaBounds;
+    }
+
+    if (!semanticZoomMode || fetchWorldTileDetailScale !== 1) {
       return null;
     }
 
@@ -4961,43 +4982,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       ),
     };
 
-    if (focusedClaimOutlineAreaId === null) {
-      if (getWorldWindowCellCount(viewportBounds) > CLAIM_OUTLINE_MAX_FREE_FETCH_CELLS) {
-        return null;
-      }
-
-      return viewportBounds;
-    }
-
-    if (focusedClaimOutlineAreaBounds === null) {
+    if (getWorldWindowCellCount(viewportBounds) > CLAIM_OUTLINE_MAX_FREE_FETCH_CELLS) {
       return null;
     }
 
-    const focusedAreaBounds = {
-      minX: Math.max(activeWorldBounds.minX, focusedClaimOutlineAreaBounds.min_x - 1),
-      maxX: Math.min(activeWorldBounds.maxX - 1, focusedClaimOutlineAreaBounds.max_x + 1),
-      minY: Math.max(activeWorldBounds.minY, focusedClaimOutlineAreaBounds.min_y - 1),
-      maxY: Math.min(activeWorldBounds.maxY - 1, focusedClaimOutlineAreaBounds.max_y + 1),
-    };
-    const focusedWindowBounds = {
-      minX: Math.max(viewportBounds.minX, focusedAreaBounds.minX),
-      maxX: Math.min(viewportBounds.maxX, focusedAreaBounds.maxX),
-      minY: Math.max(viewportBounds.minY, focusedAreaBounds.minY),
-      maxY: Math.min(viewportBounds.maxY, focusedAreaBounds.maxY),
-    };
-
-    if (
-      focusedWindowBounds.minX > focusedWindowBounds.maxX ||
-      focusedWindowBounds.minY > focusedWindowBounds.maxY
-    ) {
-      return null;
-    }
-
-    if (getWorldWindowCellCount(focusedWindowBounds) > CLAIM_OUTLINE_MAX_FOCUSED_FETCH_CELLS) {
-      return null;
-    }
-
-    return focusedWindowBounds;
+    return viewportBounds;
   }, [
     activeWorldBounds.maxX,
     activeWorldBounds.maxY,

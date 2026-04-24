@@ -2,20 +2,6 @@
 
 Player-facing release notes for PixelProject.
 
-## 0.1.12 - Apr 24, 2026
-
-### Improvements
-
-- Area Info opened from the world now receives the full area summary in the inspection response, avoiding the extra detail hydrate request.
-- Focused finished-area outlines now use the public Area # in requests and clamp to the selected area's bounds instead of the whole zoomed-out viewport.
-- Claim outlines now stay off in visual-only zoom, and large focused Area Info outlines wait until the player zooms closer.
-- World pixel window reads now use a slimmer backend projection and a y/x window index for faster high-zoom fetches.
-
-### Bug Fixes
-
-- Pending Claim Area fills are merged into union rectangles before rendering, preventing row seams when a new rectangle overlaps already staged claim cells.
-- Pending Claim Area fills no longer draw their own animated internal border; the shared union outline is the only border.
-
 ## 0.1.11 - Apr 24, 2026
 
 ### Improvements
@@ -24,6 +10,10 @@ Player-facing release notes for PixelProject.
 - Local Docker Compose now keeps hot-reload development containers, while production Docker builds use dedicated runtime stages.
 - Production frontend containers now run `next start`, and production backend containers run Uvicorn without reload and with worker support.
 - Large world-window API reads and tile requests outside the active world are now rejected before they can create expensive database or cache work.
+- Area Info opened from the world now receives the full area summary in the inspection response, avoiding the extra detail hydrate request.
+- Focused Area Info borders now load through the selected area's bounds, so they stay visible across visual and semantic zoom levels without huge viewport outline requests.
+- Claim borders around the player now stay off in visual-only zoom and load only in semantic detail mode.
+- World pixel window reads now use a slimmer backend projection and a y/x window index for faster high-zoom fetches.
 
 ### Security
 
@@ -32,6 +22,11 @@ Player-facing release notes for PixelProject.
 - Missing Discord webhook configuration no longer turns an otherwise completed deploy notification step into a workflow failure.
 - Banned accounts can no longer mutate profile, world, paint or area state.
 - Avatar uploads now reject oversized pixel dimensions and decompression-bomb style images, even when the uploaded file is small.
+
+### Bug Fixes
+
+- Pending Claim Area fills are merged into union rectangles before rendering, preventing row seams when a new rectangle overlaps already staged claim cells.
+- Pending Claim Area fills no longer draw their own animated internal border; the shared union outline is the only border.
 
 ### Developer & Tooling
 
