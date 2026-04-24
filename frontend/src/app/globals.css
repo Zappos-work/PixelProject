@@ -91,6 +91,10 @@ select {
   touch-action: none;
 }
 
+.world-viewport.is-color-picking {
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Cpath d='M22 3l7 7-3 3-2-2L11 24l-8 3 3-8L19 6l-2-2 3-3z' fill='%23f8fbff' stroke='%23081220' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M6 19l7 7' stroke='%237dd3a5' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E") 5 27, pointer;
+}
+
 .world-backdrop-glow {
   position: absolute;
   inset: 0;
@@ -314,12 +318,12 @@ select {
   width: 100%;
   height: 100%;
   image-rendering: pixelated;
-  opacity: 0.72;
+  opacity: 0.94;
   pointer-events: none;
 }
 
 .claim-template-overlay.is-saved .claim-template-overlay-image {
-  opacity: 0.54;
+  opacity: 0.82;
 }
 
 .claim-template-overlay-border {
@@ -1536,6 +1540,16 @@ select {
   font-weight: 800;
 }
 
+.overlay-control select {
+  color-scheme: dark;
+  padding: 0 0.65rem;
+}
+
+.overlay-control select option {
+  background: #0b1220;
+  color: #f8fbff;
+}
+
 .overlay-select-button {
   cursor: pointer;
 }
@@ -1590,6 +1604,8 @@ select {
 .overlay-palette-header div {
   display: flex;
   gap: 0.4rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .overlay-palette-colors {

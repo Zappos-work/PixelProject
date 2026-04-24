@@ -6,7 +6,7 @@ The repository is no longer just a planning sandbox. It already contains a worki
 
 ## Current Status
 
-- Current frontend build marker: `0.1.12`
+- Current frontend build marker: `0.2.0`
 - Production URL: `https://pixel.zappos-dev.work`
 - Local frontend: `http://localhost:3000`
 - Local backend API docs: `http://localhost:8000/docs`

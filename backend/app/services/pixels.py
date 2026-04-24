@@ -1986,6 +1986,13 @@ def _iter_coordinate_chunks(
         yield coordinates[index:index + chunk_size]
 
 
+def _coordinates_json_payload(coordinates: list[tuple[int, int]]) -> str:
+    return json.dumps(
+        [{"x": x, "y": y} for x, y in coordinates],
+        separators=(",", ":"),
+    )
+
+
 def _validate_connected_pixels(pixels: list[tuple[int, int]]) -> None:
     pixel_set = set(pixels)
     visited: set[tuple[int, int]] = set()
@@ -2136,10 +2143,35 @@ async def _get_existing_pixels_at(
     if not coordinates:
         return []
 
-    result = await session.scalars(
-        select(WorldPixel).where(tuple_(WorldPixel.x, WorldPixel.y).in_(coordinates))
-    )
-    return result.all()
+    pixels: list[WorldPixel] = []
+
+    for coordinate_chunk in _iter_coordinate_chunks(coordinates, CLAIM_EXISTING_QUERY_BATCH_SIZE):
+        result = await session.execute(
+            text(
+                """
+                SELECT
+                    wp.id,
+                    wp.x,
+                    wp.y,
+                    wp.chunk_x,
+                    wp.chunk_y,
+                    wp.color_id,
+                    wp.owner_user_id,
+                    wp.area_id,
+                    wp.is_starter,
+                    wp.created_at,
+                    wp.updated_at
+                FROM world_pixels AS wp
+                JOIN jsonb_to_recordset(CAST(:coordinates AS jsonb)) AS requested(x integer, y integer)
+                  ON wp.x = requested.x
+                 AND wp.y = requested.y
+                """
+            ),
+            {"coordinates": _coordinates_json_payload(coordinate_chunk)},
+        )
+        pixels.extend(WorldPixel(**row) for row in result.mappings())
+
+    return pixels
 
 
 async def _get_existing_pixels_map_at(
@@ -2149,10 +2181,6 @@ async def _get_existing_pixels_map_at(
     if not coordinates:
         return {}
 
-    payload = json.dumps(
-        [{"x": x, "y": y} for x, y in coordinates],
-        separators=(",", ":"),
-    )
     result = await session.execute(
         text(
             """
@@ -2171,7 +2199,7 @@ async def _get_existing_pixels_map_at(
              AND wp.y = requested.y
             """
         ),
-        {"coordinates": payload},
+        {"coordinates": _coordinates_json_payload(coordinates)},
     )
 
     pixels: dict[tuple[int, int], PaintPixelSnapshot] = {}
@@ -2254,9 +2282,17 @@ async def _has_existing_pixels_at(
 ) -> bool:
     for coordinate_chunk in _iter_coordinate_chunks(coordinates, CLAIM_EXISTING_QUERY_BATCH_SIZE):
         result = await session.scalar(
-            select(WorldPixel.id)
-            .where(tuple_(WorldPixel.x, WorldPixel.y).in_(coordinate_chunk))
-            .limit(1)
+            text(
+                """
+                SELECT wp.id
+                FROM world_pixels AS wp
+                JOIN jsonb_to_recordset(CAST(:coordinates AS jsonb)) AS requested(x integer, y integer)
+                  ON wp.x = requested.x
+                 AND wp.y = requested.y
+                LIMIT 1
+                """
+            ),
+            {"coordinates": _coordinates_json_payload(coordinate_chunk)},
         )
         if result is not None:
             return True

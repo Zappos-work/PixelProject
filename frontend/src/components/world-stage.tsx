@@ -539,7 +539,10 @@ const VISIBLE_AREA_PREFETCH_CACHE_MS = 3000;
 const CLAIM_BATCH_PIXEL_LIMIT = 500_000;
 const CLAIM_OVERLAY_TEMPLATE_PIXEL_LIMIT = 200_000;
 const CLAIM_OVERLAY_MAX_SIDE = 4096;
-const CLAIM_OVERLAY_SNAP_DISTANCE = 4;
+const CLAIM_OVERLAY_SNAP_DISTANCE = 24;
+const CLAIM_OVERLAY_PREVIEW_PIXEL_SCALE = 3;
+const CLAIM_OVERLAY_PREVIEW_PIXEL_CENTER = Math.floor(CLAIM_OVERLAY_PREVIEW_PIXEL_SCALE / 2);
+const CLAIM_OVERLAY_PREVIEW_PIXEL_ALPHA = 235;
 const BULK_PENDING_CLAIM_THRESHOLD = 20_000;
 const PENDING_PAINT_CANVAS_TILE_SIZE = 128;
 const PENDING_PAINT_CANVAS_MAX_CELL_SIZE = 16;
@@ -895,6 +898,33 @@ function clampColorChannel(value: number): number {
   return Math.max(0, Math.min(255, value));
 }
 
+function buildClaimOverlayDraftColorMap(templatePixels: readonly ClaimOverlayTemplatePixel[]): Map<string, number> {
+  return new Map(templatePixels.map((pixel) => [getPixelKey(pixel), pixel.colorId]));
+}
+
+function buildClaimOverlayRecordColorMap(
+  templatePixels: ClaimAreaOverlayRecord["template_pixels"],
+): Map<string, number> {
+  return new Map(templatePixels.map((pixel) => [getPixelKey(pixel), pixel.color_id]));
+}
+
+function paintClaimOverlayPreviewPixel(
+  imageData: ImageData,
+  pixelX: number,
+  pixelY: number,
+  canvasWidth: number,
+  color: Pick<ClaimOverlayPaletteColor, "r" | "g" | "b">,
+): void {
+  const outputX = pixelX * CLAIM_OVERLAY_PREVIEW_PIXEL_SCALE + CLAIM_OVERLAY_PREVIEW_PIXEL_CENTER;
+  const outputY = pixelY * CLAIM_OVERLAY_PREVIEW_PIXEL_SCALE + CLAIM_OVERLAY_PREVIEW_PIXEL_CENTER;
+  const outputIndex = (outputY * canvasWidth + outputX) * 4;
+
+  imageData.data[outputIndex] = color.r;
+  imageData.data[outputIndex + 1] = color.g;
+  imageData.data[outputIndex + 2] = color.b;
+  imageData.data[outputIndex + 3] = CLAIM_OVERLAY_PREVIEW_PIXEL_ALPHA;
+}
+
 function buildClaimOverlayRender(
   source: ClaimOverlaySource,
   draft: ClaimOverlayDraft,
@@ -939,7 +969,19 @@ function buildClaimOverlayRender(
   sourceContext.restore();
 
   const sourceImageData = sourceContext.getImageData(0, 0, width, height);
-  const outputImageData = sourceContext.createImageData(width, height);
+  const previewCanvas = document.createElement("canvas");
+  const previewWidth = width * CLAIM_OVERLAY_PREVIEW_PIXEL_SCALE;
+  const previewHeight = height * CLAIM_OVERLAY_PREVIEW_PIXEL_SCALE;
+  previewCanvas.width = previewWidth;
+  previewCanvas.height = previewHeight;
+  const previewContext = previewCanvas.getContext("2d");
+
+  if (previewContext === null) {
+    throw new Error("Could not prepare the overlay preview.");
+  }
+
+  previewContext.imageSmoothingEnabled = false;
+  const outputImageData = previewContext.createImageData(previewWidth, previewHeight);
   const templatePixels: ClaimOverlayTemplatePixel[] = [];
   const errorPixels = draft.dithering ? new Float32Array(cellCount * 3) : null;
 
@@ -973,7 +1015,6 @@ function buildClaimOverlayRender(
       const worldY = draft.transform.originY - pixelY;
 
       if (alpha < 16) {
-        outputImageData.data[sourceIndex + 3] = 0;
         continue;
       }
 
@@ -988,10 +1029,7 @@ function buildClaimOverlayRender(
         draft.colorMode,
       );
 
-      outputImageData.data[sourceIndex] = nearest.r;
-      outputImageData.data[sourceIndex + 1] = nearest.g;
-      outputImageData.data[sourceIndex + 2] = nearest.b;
-      outputImageData.data[sourceIndex + 3] = 188;
+      paintClaimOverlayPreviewPixel(outputImageData, pixelX, pixelY, previewWidth, nearest);
       templatePixels.push({
         x: worldX,
         y: worldY,
@@ -1010,10 +1048,10 @@ function buildClaimOverlayRender(
     }
   }
 
-  sourceContext.putImageData(outputImageData, 0, 0);
+  previewContext.putImageData(outputImageData, 0, 0);
 
   return {
-    previewDataUrl: sourceCanvas.toDataURL("image/png"),
+    previewDataUrl: previewCanvas.toDataURL("image/png"),
     templatePixels,
   };
 }
@@ -1024,15 +1062,18 @@ function buildClaimOverlayRecordPreview(overlay: ClaimAreaOverlayRecord): string
   }
 
   const canvas = document.createElement("canvas");
-  canvas.width = overlay.width;
-  canvas.height = overlay.height;
+  const previewWidth = overlay.width * CLAIM_OVERLAY_PREVIEW_PIXEL_SCALE;
+  const previewHeight = overlay.height * CLAIM_OVERLAY_PREVIEW_PIXEL_SCALE;
+  canvas.width = previewWidth;
+  canvas.height = previewHeight;
   const context = canvas.getContext("2d");
 
   if (context === null) {
     return null;
   }
 
-  const imageData = context.createImageData(overlay.width, overlay.height);
+  context.imageSmoothingEnabled = false;
+  const imageData = context.createImageData(previewWidth, previewHeight);
 
   for (const pixel of overlay.template_pixels) {
     const color = CLAIM_OVERLAY_PALETTE_RGB.find((paletteColor) => paletteColor.id === pixel.color_id);
@@ -1048,11 +1089,7 @@ function buildClaimOverlayRecordPreview(overlay: ClaimAreaOverlayRecord): string
       continue;
     }
 
-    const index = (y * overlay.width + x) * 4;
-    imageData.data[index] = color.r;
-    imageData.data[index + 1] = color.g;
-    imageData.data[index + 2] = color.b;
-    imageData.data[index + 3] = 174;
+    paintClaimOverlayPreviewPixel(imageData, x, y, previewWidth, color);
   }
 
   context.putImageData(imageData, 0, 0);
@@ -3898,6 +3935,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const pendingClaimRectanglesRef = useRef<PendingClaimRectangle[]>([]);
   const pendingPaintsRef = useRef<PendingPaint[]>([]);
   const pendingPaintMapRef = useRef<Map<string, PendingPaint>>(new Map());
+  const pendingOverlayColorMapRef = useRef<Map<string, number>>(new Map());
+  const selectedAreaOverlayColorMapRef = useRef<Map<string, number>>(new Map());
   const claimOutlineSegmentsRef = useRef<ClaimOutlineSegment[]>([]);
   const renderedWorldTilesRef = useRef<WorldTile[]>([]);
   const selectedPixelSnapshotRef = useRef<PixelCoordinate | null>(null);
@@ -4863,6 +4902,17 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         height: selectedAreaOverlay.height,
       }
     : null;
+  const pendingOverlayColorMap = useMemo(
+    () => buildClaimOverlayDraftColorMap(pendingOverlayDraft?.templatePixels ?? []),
+    [pendingOverlayDraft?.templatePixels],
+  );
+  const selectedAreaOverlayColorMap = useMemo(
+    () => buildClaimOverlayRecordColorMap(selectedAreaOverlay?.template_pixels ?? []),
+    [selectedAreaOverlay?.template_pixels],
+  );
+
+  pendingOverlayColorMapRef.current = pendingOverlayColorMap;
+  selectedAreaOverlayColorMapRef.current = selectedAreaOverlayColorMap;
 
   useEffect(() => {
     const renderDraft = pendingOverlayDraftRef.current;
@@ -7130,7 +7180,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     if (paintTool === "picker") {
-      return "Picker copies a painted color from the canvas. Click a painted cell with the picker.";
+      return "Picker samples exact pixel colors from the canvas or overlay. Middle-click triggers it too.";
     }
 
     if (paintTool === "eraser") {
@@ -7255,6 +7305,17 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     };
   }, []);
 
+  const getOverlayColorIdAtPixel = useCallback((targetPixel: PixelCoordinate): number | null => {
+    const pixelKey = getPixelKey(targetPixel);
+    const pendingOverlayColorId = pendingOverlayColorMapRef.current.get(pixelKey);
+
+    if (pendingOverlayColorId !== undefined) {
+      return pendingOverlayColorId;
+    }
+
+    return selectedAreaOverlayColorMapRef.current.get(pixelKey) ?? null;
+  }, []);
+
   const pickPaintColorAtPixel = useCallback((
     targetPixel: PixelCoordinate,
     options?: { activateBrush?: boolean; quiet?: boolean },
@@ -7277,13 +7338,17 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         : targetPixel
     ));
 
-    const pickedColorId = targetState.pendingPaint?.colorId ?? targetState.pixelRecord?.color_id ?? null;
+    const pickedColorId =
+      getOverlayColorIdAtPixel(targetPixel) ??
+      targetState.pendingPaint?.colorId ??
+      targetState.pixelRecord?.color_id ??
+      null;
 
     if (pickedColorId === null) {
       if (!options?.quiet) {
         setPlacementMessage({
           tone: "error",
-          text: "This cell has no painted color to pick.",
+          text: "This spot has no overlay or painted color to pick.",
         });
       }
       return false;
@@ -7305,13 +7370,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       setPlacementMessage({
         tone: "info",
         text: options?.activateBrush
-          ? `${pickedColorName} picked from the canvas. Brush is ready.`
-          : `${pickedColorName} picked from the canvas.`,
+          ? `${pickedColorName} picked from the canvas or overlay. Brush is ready.`
+          : `${pickedColorName} picked from the canvas or overlay.`,
       });
     }
 
     return true;
-  }, [getPlacementState]);
+  }, [getOverlayColorIdAtPixel, getPlacementState]);
 
   const stagePaintBrushPixels = useCallback((
     targetPixels: PixelCoordinate[],
@@ -8002,6 +8067,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>): void {
     if (event.button === 1 && buildPanelOpenRef.current && activeBuildModeRef.current === "paint") {
       updatePointer(event);
+      const targetPixel = getEventPixel(event);
+
+      if (isPixelInsideActiveWorld(targetPixel)) {
+        pickPaintColorAtPixel(targetPixel, { activateBrush: true });
+      }
+
       event.preventDefault();
       return;
     }
@@ -10150,6 +10221,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                     >
                       None
                     </button>
+                    <button
+                      className="pixel-clear-button"
+                      onClick={() => setOverlayPaletteOpen(false)}
+                      type="button"
+                    >
+                      Close
+                    </button>
                   </div>
                 </div>
                 <div className="overlay-palette-colors">
@@ -10204,7 +10282,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                   <button
                     className={`claim-tool-button paint-tool-button ${paintTool === "picker" ? "is-active" : ""}`}
                     onClick={() => handlePaintToolChange("picker")}
-                    title="Pick a painted color from the canvas, then return to Brush."
+                    title="Pick the exact color from the canvas or overlay. Middle-click triggers the picker too."
                     type="button"
                   >
                     <svg aria-hidden="true" className="paint-tool-button-icon" viewBox="0 0 24 24">
@@ -10300,7 +10378,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       ) : null}
 
       <div
-        className={`world-viewport immersive ${gridVisible ? "grid-visible" : "grid-hidden"}`}
+        className={`world-viewport immersive ${gridVisible ? "grid-visible" : "grid-hidden"} ${paintTool === "picker" ? "is-color-picking" : ""}`}
         onAuxClick={handleViewportAuxClick}
         onContextMenu={handleViewportContextMenu}
         onPointerDown={handlePointerDown}
@@ -10349,7 +10427,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         {pendingOverlayDraft ? (
           <ClaimOverlaySurface
             camera={camera}
-            editable
+            editable={activeBuildMode === "claim" && claimTool === "overlay"}
             imageName={pendingOverlayDraft.imageName}
             onHandlePointerDown={handleOverlayHandlePointerDown}
             onMovePointerDown={handleOverlayPointerDown}
