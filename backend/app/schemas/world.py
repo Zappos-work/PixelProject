@@ -111,6 +111,23 @@ class WorldPixelWindow(BaseModel):
     pixels: list[WorldPixelSummary]
 
 
+class ClaimContextPixelSummary(BaseModel):
+    x: int
+    y: int
+    owner_user_id: UUID | None
+    area_id: UUID | None
+    is_starter: bool
+
+
+class ClaimContextPixelWindow(BaseModel):
+    min_x: int
+    max_x: int
+    min_y: int
+    max_y: int
+    truncated: bool
+    pixels: list[ClaimContextPixelSummary]
+
+
 class ClaimOutlineSegment(BaseModel):
     orientation: str
     line: int
@@ -195,12 +212,15 @@ class AreaOwnerSummary(BaseModel):
     id: UUID
     public_id: int
     display_name: str
+    avatar_url: str | None
 
 
 class AreaContributorSummary(BaseModel):
     id: UUID
     public_id: int
     display_name: str
+    avatar_url: str | None
+    role: str
 
 
 class ClaimAreaPreview(BaseModel):
@@ -268,6 +288,11 @@ class ClaimAreaListItem(BaseModel):
 
 class ClaimAreaListResponse(BaseModel):
     areas: list[ClaimAreaListItem]
+
+
+class ClaimAreaMutationResponse(BaseModel):
+    area: ClaimAreaSummary
+    claim_tiles: list[WorldTileCoordinate]
 
 
 class PixelBatchClaimResponse(BaseModel):

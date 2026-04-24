@@ -17,6 +17,7 @@ import {
 
 import {
   claimWorldPixels,
+  fetchClaimContextPixels,
   fetchClaimOutlinePixels,
   fetchClaimArea,
   fetchClaimAreaAtPixel,
@@ -30,12 +31,16 @@ import {
   inviteAreaContributor,
   logoutAuthSession,
   paintWorldPixels,
+  promoteAreaContributor,
+  removeAreaContributor,
   updateClaimArea,
   updateDisplayName,
   uploadAvatar,
   type AuthUser,
   type AuthSessionStatus,
+  type AreaContributorSummary,
   type ClaimAreaClaimMode,
+  type ClaimContextPixel,
   type ClaimAreaPreview,
   type ClaimAreaRecord,
   type ClaimAreaSummary,
@@ -148,6 +153,8 @@ type PendingClaimRectangle = {
   maxY: number;
 };
 
+type ClaimContextPixelRecord = ClaimContextPixel;
+
 type ProfileMessage = {
   tone: "error" | "success" | "info";
   text: string;
@@ -155,7 +162,16 @@ type ProfileMessage = {
 
 type AreaOptionsMenuState = {
   publicId: number;
+  canEdit: boolean;
   messageTarget: "area" | "areas-list";
+  left: number;
+  top: number;
+};
+
+type AreaPlayerOptionsMenuState = {
+  publicId: number;
+  displayName: string;
+  role: "member" | "admin";
   left: number;
   top: number;
 };
@@ -184,12 +200,22 @@ type VisibleAreaBounds = {
   key: string;
 };
 
+type ClaimRectanglePlacementEvaluation = {
+  blockedReason: "outside-world" | "claimed-territory" | null;
+  unresolvedNeighborCount: number;
+  newPixelCount: number;
+  overlapsPendingClaim: boolean;
+  touchesClaimRoute: boolean;
+};
+
 type PlacementState = {
   pixelRecord: WorldPixel | null;
   isInsideWorld: boolean;
   canClaim: boolean;
   canPaint: boolean;
   isPendingClaim: boolean;
+  optimisticPaintAreaId: string | null;
+  optimisticPaintAreaName: string | null;
   pendingPaint: PendingPaint | null;
 };
 
@@ -200,6 +226,12 @@ type SpaceStrokeState = {
 
 type RightEraseStrokeState = SpaceStrokeState & {
   pointerId: number;
+};
+
+type StagePixelOptions = {
+  allowPicker?: boolean;
+  quiet?: boolean;
+  updateSelection?: boolean;
 };
 
 type BuildPanelPosition = {
@@ -223,6 +255,8 @@ const EMPTY_PLACEMENT_STATE: PlacementState = {
   canClaim: false,
   canPaint: false,
   isPendingClaim: false,
+  optimisticPaintAreaId: null,
+  optimisticPaintAreaName: null,
   pendingPaint: null,
 };
 
@@ -327,6 +361,7 @@ type DebugWorldSnapshot = {
   buildPanelOpen: boolean;
   areaPanelBusy: boolean;
   areaDetailsBusy: boolean;
+  rectanglePlacementBusy: boolean;
   visual: DebugTileLayerSnapshot;
   claims: DebugTileLayerSnapshot;
   paint: DebugTileLayerSnapshot;
@@ -341,9 +376,11 @@ type PendingClaimSegment = {
   isBulk: boolean;
 };
 
-type PendingPaintSegment = PendingClaimSegment & {
-  color: string;
-  isTransparent: boolean;
+type PendingPaintCanvasTile = {
+  key: string;
+  originX: number;
+  originY: number;
+  paints: PendingPaint[];
 };
 
 type ClaimOverlayStatus = "owner" | "contributor" | "blocked" | "starter";
@@ -364,6 +401,11 @@ type HoverPixelOverlay = SelectedPixelOverlay & {
   key: string;
 };
 
+type PaintCursorOverlay = HoverPixelOverlay & {
+  color: string;
+  isTransparent: boolean;
+};
+
 type GridLineSet = {
   vertical: GridLine[];
   horizontal: GridLine[];
@@ -382,11 +424,13 @@ type WorldViewportCanvasProps = {
   onTileDebugSignal?: (signal: DebugTileSignal) => void;
   onTileLoaded?: (layer: DebugTileLayer, tileKey: string, src: string) => void;
   outsideArtPatternImages: ReactNode;
+  pendingPaintTiles: PendingPaintCanvasTile[];
   renderedPendingClaims: PendingClaimSegment[];
-  renderedPendingPaints: PendingPaintSegment[];
   renderedWorldTiles: WorldTile[];
   retainedVisualTileSrcs: Map<string, string>;
+  camera: CameraState;
   hoverPixelOverlay: HoverPixelOverlay | null;
+  paintCursorOverlay: PaintCursorOverlay | null;
   selectedPixelOverlay: SelectedPixelOverlay | null;
   viewportSize: ViewportSize;
   worldOutsideMaskId: string;
@@ -409,21 +453,28 @@ const AUTH_REFRESH_INTERVAL_MS = 60000;
 const WORLD_OVERVIEW_REFRESH_INTERVAL_MS = 60000;
 const HOLDER_TICK_MS = 1000;
 const PIXEL_FETCH_DEBOUNCE_MS = 120;
+const PIXEL_FETCH_REPEAT_CACHE_MS = 500;
 const SELECTED_PIXEL_FETCH_DEBOUNCE_MS = 120;
 const SELECTED_PIXEL_FETCH_MISS_COOLDOWN_MS = 1500;
 const CAMERA_FETCH_SETTLE_MS = 180;
 const PIXEL_FETCH_MARGIN = 2;
-const CLAIM_OUTLINE_FETCH_DEBOUNCE_MS = 40;
+const RECTANGLE_ANCHOR_PREFETCH_RADIUS = 72;
+const CLAIM_OUTLINE_FETCH_DEBOUNCE_MS = 120;
+const CLAIM_OUTLINE_FETCH_REPEAT_CACHE_MS = 1000;
 const CLAIM_OUTLINE_FETCH_MARGIN = 2;
 const CLAIM_OUTLINE_FETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
 const VISIBLE_AREA_PREFETCH_DEBOUNCE_MS = 180;
 const VISIBLE_AREA_POLL_INTERVAL_MS = 5000;
 const VISIBLE_AREA_PREFETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
 const VISIBLE_AREA_PREFETCH_SNAP_WORLD_UNITS = 16;
-const VISIBLE_AREA_PREFETCH_CACHE_MS = 1200;
+const VISIBLE_AREA_PREFETCH_CACHE_MS = 3000;
 const CLAIM_BATCH_PIXEL_LIMIT = 500_000;
 const BULK_PENDING_CLAIM_THRESHOLD = 20_000;
+const PENDING_PAINT_CANVAS_TILE_SIZE = 128;
+const PENDING_PAINT_CANVAS_MAX_CELL_SIZE = 16;
 const CLAIM_AREA_CACHE_LIMIT = 128;
+const AREA_NAME_MAX_LENGTH = 20;
+const AREA_DESCRIPTION_MAX_LENGTH = 250;
 const PERF_EVENT_NAME = "pixelproject:perf-event";
 const DEBUG_EVENT_NAME = "pixelproject:debug-event";
 const PERF_FRAME_GAP_THRESHOLD_MS = 42;
@@ -439,13 +490,14 @@ const DEBUG_MEASURE_THRESHOLD_MS = 8;
 const WORLD_TILE_SIZE = 1000;
 const WORLD_LOW_TILE_DETAIL_SCALE = 2;
 const WORLD_LOW_TILE_SIZE = WORLD_TILE_SIZE * WORLD_LOW_TILE_DETAIL_SCALE;
-const WORLD_DETAIL_TILE_MIN_SCREEN_SIZE = 300;
+const WORLD_DETAIL_TILE_MIN_SCREEN_SIZE = 200;
 const WORLD_TILE_MARGIN = 1;
 const WORLD_TILE_OVERSCAN_VIEWPORT_FACTOR = 0.35;
 const WORLD_LOW_TILE_MARGIN = 0;
 const WORLD_LOW_TILE_OVERSCAN_VIEWPORT_FACTOR = 0.08;
 const TRANSPARENT_COLOR_ID = 31;
 const PIXEL_PALETTE_NAME_BY_ID = new Map<number, string>(PIXEL_PALETTE.map((color) => [color.id, color.name]));
+const PIXEL_PALETTE_COLOR_BY_ID = new Map<number, string>(PIXEL_PALETTE.map((color) => [color.id, color.hex]));
 const BUILD_MODE_LABEL: Record<BuildMode, string> = {
   claim: "Claim Area",
   paint: "Color Pixel",
@@ -454,6 +506,16 @@ const BUILD_MODE_HELP: Record<BuildMode, string> = {
   claim: "Claim Area only. Uses Holders and has no color palette.",
   paint: "Color Pixel only. You can only pixel in areas you own or where you were added.",
 };
+const DEV_BUNDLE_RECOVERY_NOTICE =
+  "Local development bundle is out of sync. Close this browser tab and reopen PixelProject. If it stays broken, restart the frontend container.";
+const DEV_BUNDLE_ERROR_PATTERNS = [
+  "__webpack_modules__",
+  "React Client Manifest",
+  "Cannot find module './",
+  "ChunkLoadError",
+  "Loading chunk",
+  "module factory is not available",
+];
 const CLAIM_OUTLINE_COLORS: Record<ClaimOverlayStatus, string> = {
   owner: "rgba(118, 255, 228, 0.9)",
   contributor: "rgba(255, 183, 95, 0.9)",
@@ -511,6 +573,29 @@ function isPerfDebugEnabled(): boolean {
     perfDebugEnabledCache = false;
     return false;
   }
+}
+
+function stringifyUnknownError(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (value instanceof Error) {
+    return `${value.name}: ${value.message}\n${value.stack ?? ""}`;
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function getDevBundleRecoveryNotice(value: unknown): string | null {
+  const message = stringifyUnknownError(value);
+  return DEV_BUNDLE_ERROR_PATTERNS.some((pattern) => message.includes(pattern))
+    ? DEV_BUNDLE_RECOVERY_NOTICE
+    : null;
 }
 
 function markPerfEvent(label: string, detail?: string): void {
@@ -657,6 +742,97 @@ function getPixelKey(pixel: PixelCoordinate): string {
   return `${pixel.x}:${pixel.y}`;
 }
 
+function toClaimContextPixelRecord(
+  pixel: Pick<WorldPixel, "x" | "y" | "owner_user_id" | "area_id" | "is_starter">,
+): ClaimContextPixelRecord {
+  return {
+    x: pixel.x,
+    y: pixel.y,
+    owner_user_id: pixel.owner_user_id,
+    area_id: pixel.area_id,
+    is_starter: pixel.is_starter,
+  };
+}
+
+function areClaimContextPixelsEqual(
+  left: ClaimContextPixelRecord,
+  right: ClaimContextPixelRecord,
+): boolean {
+  return (
+    left.x === right.x &&
+    left.y === right.y &&
+    left.owner_user_id === right.owner_user_id &&
+    left.area_id === right.area_id &&
+    left.is_starter === right.is_starter
+  );
+}
+
+function mergeClaimContextPixels(
+  currentPixels: Map<string, ClaimContextPixelRecord>,
+  fetchedPixels: readonly ClaimContextPixelRecord[],
+): Map<string, ClaimContextPixelRecord> {
+  if (fetchedPixels.length === 0) {
+    return currentPixels;
+  }
+
+  let changed = false;
+  const nextPixels = new Map(currentPixels);
+
+  for (const pixel of fetchedPixels) {
+    const pixelKey = getPixelKey(pixel);
+    const previousPixel = nextPixels.get(pixelKey);
+
+    if (previousPixel && areClaimContextPixelsEqual(previousPixel, pixel)) {
+      continue;
+    }
+
+    nextPixels.set(pixelKey, pixel);
+    changed = true;
+  }
+
+  return changed ? nextPixels : currentPixels;
+}
+
+function syncClaimContextPixelsForWindow(
+  currentPixels: Map<string, ClaimContextPixelRecord>,
+  bounds: Pick<VisibleAreaBounds, "minX" | "maxX" | "minY" | "maxY">,
+  fetchedPixels: readonly ClaimContextPixelRecord[],
+): Map<string, ClaimContextPixelRecord> {
+  const nextPixels = new Map(currentPixels);
+  const visibleKeys = new Set<string>();
+  let changed = false;
+
+  for (const pixel of fetchedPixels) {
+    const pixelKey = getPixelKey(pixel);
+    visibleKeys.add(pixelKey);
+    const previousPixel = nextPixels.get(pixelKey);
+
+    if (previousPixel && areClaimContextPixelsEqual(previousPixel, pixel)) {
+      continue;
+    }
+
+    nextPixels.set(pixelKey, pixel);
+    changed = true;
+  }
+
+  for (const [pixelKey, pixel] of currentPixels.entries()) {
+    if (
+      pixel.x < bounds.minX ||
+      pixel.x > bounds.maxX ||
+      pixel.y < bounds.minY ||
+      pixel.y > bounds.maxY ||
+      visibleKeys.has(pixelKey)
+    ) {
+      continue;
+    }
+
+    nextPixels.delete(pixelKey);
+    changed = true;
+  }
+
+  return changed ? nextPixels : currentPixels;
+}
+
 function getWorldTileKey(tileX: number, tileY: number, detailScale = 1): string {
   return detailScale === 1 ? `${tileX}:${tileY}` : `low-${detailScale}:${tileX}:${tileY}`;
 }
@@ -674,6 +850,10 @@ function snapVisibleAreaMax(value: number): number {
     Math.ceil((value + 1) / VISIBLE_AREA_PREFETCH_SNAP_WORLD_UNITS) *
       VISIBLE_AREA_PREFETCH_SNAP_WORLD_UNITS
   ) - 1;
+}
+
+function getFetchBoundsKey(bounds: Pick<VisibleAreaBounds, "minX" | "maxX" | "minY" | "maxY">): string {
+  return `${bounds.minX}:${bounds.minY}:${bounds.maxX}:${bounds.maxY}`;
 }
 
 function getPixelTileCoordinate(pixel: PixelCoordinate): { tileX: number; tileY: number } {
@@ -702,6 +882,33 @@ function formatClaimAreaId(publicId: number): string {
   return `#${publicId}`;
 }
 
+function isPixelInsideAreaBounds(pixel: PixelCoordinate, area: ClaimAreaListItem): boolean {
+  return (
+    pixel.x >= area.bounds.min_x &&
+    pixel.x <= area.bounds.max_x &&
+    pixel.y >= area.bounds.min_y &&
+    pixel.y <= area.bounds.max_y
+  );
+}
+
+function isPixelInsideActiveWorldBounds(
+  pixel: PixelCoordinate,
+  bounds: ActiveWorldBounds,
+  activeChunks: WorldOverview["chunks"],
+): boolean {
+  return activeChunks.length === 0
+    ? pixel.x >= bounds.minX &&
+      pixel.x < bounds.maxX &&
+      pixel.y >= bounds.minY &&
+      pixel.y < bounds.maxY
+    : activeChunks.some((chunk) => (
+      pixel.x >= chunk.origin_x &&
+      pixel.x < chunk.origin_x + chunk.width &&
+      pixel.y >= chunk.origin_y &&
+      pixel.y < chunk.origin_y + chunk.height
+    ));
+}
+
 function buildAreaSelectionSignature(area: ClaimAreaRecord | null): string {
   if (area === null) {
     return "none";
@@ -715,6 +922,7 @@ function buildAreaSelectionSignature(area: ClaimAreaRecord | null): string {
     area.status,
     area.owner.public_id,
     area.owner.display_name,
+    area.owner.avatar_url ?? "",
     area.claimed_pixels_count,
     area.painted_pixels_count,
     area.contributor_count,
@@ -727,7 +935,9 @@ function buildAreaSelectionSignature(area: ClaimAreaRecord | null): string {
   if (isClaimAreaSummary(area)) {
     base.push(
       area.contributors
-        .map((contributor) => `${contributor.id}:${contributor.public_id}:${contributor.display_name}`)
+        .map((contributor) => (
+          `${contributor.id}:${contributor.public_id}:${contributor.display_name}:${contributor.avatar_url ?? ""}:${contributor.role}`
+        ))
         .join(","),
     );
   }
@@ -985,6 +1195,27 @@ function buildPendingPaintMap(paints: PendingPaint[]): Map<string, PendingPaint>
   return new Map(paints.map((paint) => [getPixelKey(paint), paint]));
 }
 
+function buildPendingPaintCanvasTiles(paints: PendingPaint[]): PendingPaintCanvasTile[] {
+  const tiles = new Map<string, PendingPaintCanvasTile>();
+
+  for (const paint of paints) {
+    const tileX = Math.floor(paint.x / PENDING_PAINT_CANVAS_TILE_SIZE);
+    const tileY = Math.floor(paint.y / PENDING_PAINT_CANVAS_TILE_SIZE);
+    const key = `${tileX}:${tileY}`;
+    const tile = tiles.get(key) ?? {
+      key,
+      originX: tileX * PENDING_PAINT_CANVAS_TILE_SIZE,
+      originY: tileY * PENDING_PAINT_CANVAS_TILE_SIZE,
+      paints: [],
+    };
+
+    tile.paints.push(paint);
+    tiles.set(key, tile);
+  }
+
+  return [...tiles.values()];
+}
+
 function clampPanelPosition(
   x: number,
   y: number,
@@ -1062,6 +1293,30 @@ function createPendingClaimRectangle(
   };
 }
 
+function getClaimRectangleFetchBounds(
+  rectangle: PendingClaimRectangle,
+  bounds: ActiveWorldBounds,
+): Pick<VisibleAreaBounds, "minX" | "maxX" | "minY" | "maxY"> {
+  return {
+    minX: Math.max(bounds.minX, rectangle.minX - 1),
+    maxX: Math.min(bounds.maxX - 1, rectangle.maxX + 1),
+    minY: Math.max(bounds.minY, rectangle.minY - 1),
+    maxY: Math.min(bounds.maxY - 1, rectangle.maxY + 1),
+  };
+}
+
+function getRectangleAnchorPrefetchBounds(
+  anchor: PixelCoordinate,
+  bounds: ActiveWorldBounds,
+): Pick<VisibleAreaBounds, "minX" | "maxX" | "minY" | "maxY"> {
+  return {
+    minX: Math.max(bounds.minX, anchor.x - RECTANGLE_ANCHOR_PREFETCH_RADIUS),
+    maxX: Math.min(bounds.maxX - 1, anchor.x + RECTANGLE_ANCHOR_PREFETCH_RADIUS),
+    minY: Math.max(bounds.minY, anchor.y - RECTANGLE_ANCHOR_PREFETCH_RADIUS),
+    maxY: Math.min(bounds.maxY - 1, anchor.y + RECTANGLE_ANCHOR_PREFETCH_RADIUS),
+  };
+}
+
 function getPendingClaimRectanglePixelCount(rectangle: PendingClaimRectangle): number {
   return (rectangle.maxX - rectangle.minX + 1) * (rectangle.maxY - rectangle.minY + 1);
 }
@@ -1098,6 +1353,148 @@ function hasPendingClaimAtPixel(
   }
 
   return pendingClaimRectangles.some((rectangle) => isPixelInsidePendingClaimRectangle(pixel, rectangle));
+}
+
+function evaluateClaimRectanglePlacement(input: {
+  rectangle: PendingClaimRectangle;
+  pixelMap: Map<string, ClaimContextPixelRecord>;
+  bounds: ActiveWorldBounds;
+  activeChunks: WorldOverview["chunks"];
+  pendingClaimPixelMap: Set<string>;
+  pendingClaimRectangles: PendingClaimRectangle[];
+  activeClaimMode: ClaimAreaClaimMode;
+  activeClaimTargetAreaId: string | null;
+  currentUserId: string;
+  startPixel?: PixelCoordinate | null;
+  resolvedBounds?: Pick<VisibleAreaBounds, "minX" | "maxX" | "minY" | "maxY"> | null;
+}): ClaimRectanglePlacementEvaluation {
+  const {
+    rectangle,
+    pixelMap,
+    bounds,
+    activeChunks,
+    pendingClaimPixelMap,
+    pendingClaimRectangles,
+    activeClaimMode,
+    activeClaimTargetAreaId,
+    currentUserId,
+    startPixel = null,
+    resolvedBounds = null,
+  } = input;
+  let newPixelCount = 0;
+  let overlapsPendingClaim = false;
+  let touchesClaimRoute = false;
+  const unresolvedNeighborKeys = new Set<string>();
+  const iterateForwardX = startPixel === null || startPixel.x === rectangle.minX;
+  const iterateForwardY = startPixel === null || startPixel.y === rectangle.minY;
+  const startX = iterateForwardX ? rectangle.minX : rectangle.maxX;
+  const endX = iterateForwardX ? rectangle.maxX : rectangle.minX;
+  const stepX = iterateForwardX ? 1 : -1;
+  const startY = iterateForwardY ? rectangle.minY : rectangle.maxY;
+  const endY = iterateForwardY ? rectangle.maxY : rectangle.minY;
+  const stepY = iterateForwardY ? 1 : -1;
+
+  for (let y = startY; iterateForwardY ? y <= endY : y >= endY; y += stepY) {
+    for (let x = startX; iterateForwardX ? x <= endX : x >= endX; x += stepX) {
+      const pixel = { x, y };
+
+      if (!isPixelInsideActiveWorldBounds(pixel, bounds, activeChunks)) {
+        return {
+          blockedReason: "outside-world",
+          unresolvedNeighborCount: unresolvedNeighborKeys.size,
+          newPixelCount,
+          overlapsPendingClaim,
+          touchesClaimRoute,
+        };
+      }
+
+      const pixelKey = getPixelKey(pixel);
+      if (pixelMap.has(pixelKey)) {
+        return {
+          blockedReason: "claimed-territory",
+          unresolvedNeighborCount: unresolvedNeighborKeys.size,
+          newPixelCount,
+          overlapsPendingClaim,
+          touchesClaimRoute,
+        };
+      }
+
+      if (hasPendingClaimAtPixel(pixel, pendingClaimPixelMap, pendingClaimRectangles)) {
+        overlapsPendingClaim = true;
+        continue;
+      }
+
+      newPixelCount += 1;
+
+      if (touchesClaimRoute) {
+        continue;
+      }
+
+      const neighborPixels = [
+        { x: pixel.x - 1, y: pixel.y },
+        { x: pixel.x + 1, y: pixel.y },
+        { x: pixel.x, y: pixel.y - 1 },
+        { x: pixel.x, y: pixel.y + 1 },
+      ];
+
+      for (const neighborPixel of neighborPixels) {
+        if (isPixelInsidePendingClaimRectangle(neighborPixel, rectangle)) {
+          continue;
+        }
+
+        if (hasPendingClaimAtPixel(neighborPixel, pendingClaimPixelMap, pendingClaimRectangles)) {
+          touchesClaimRoute = true;
+          break;
+        }
+
+        if (!isPixelInsideActiveWorldBounds(neighborPixel, bounds, activeChunks)) {
+          continue;
+        }
+
+        const neighborKey = getPixelKey(neighborPixel);
+        const neighbor = pixelMap.get(neighborKey);
+
+        if (!neighbor) {
+          const isNeighborResolved =
+            resolvedBounds !== null &&
+            neighborPixel.x >= resolvedBounds.minX &&
+            neighborPixel.x <= resolvedBounds.maxX &&
+            neighborPixel.y >= resolvedBounds.minY &&
+            neighborPixel.y <= resolvedBounds.maxY;
+
+          if (!isNeighborResolved) {
+            unresolvedNeighborKeys.add(neighborKey);
+          }
+          continue;
+        }
+
+        if (activeClaimMode === "expand") {
+          if (
+            neighbor.owner_user_id === currentUserId &&
+            neighbor.area_id === activeClaimTargetAreaId
+          ) {
+            touchesClaimRoute = true;
+            break;
+          }
+
+          continue;
+        }
+
+        if (neighbor.is_starter || neighbor.owner_user_id !== null) {
+          touchesClaimRoute = true;
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    blockedReason: null,
+    unresolvedNeighborCount: unresolvedNeighborKeys.size,
+    newPixelCount,
+    overlapsPendingClaim,
+    touchesClaimRoute,
+  };
 }
 
 function splitPendingClaimRectangleAtPixel(
@@ -1207,22 +1604,6 @@ function buildPendingClaimSegments(
   }
 
   return segments;
-}
-
-function buildPendingPaintSegments(
-  pendingPaints: PendingPaint[],
-  camera: CameraState,
-): PendingPaintSegment[] {
-  return pendingPaints.map((pixel) => ({
-    key: `pending-paint-${pixel.x}-${pixel.y}-${pixel.colorId}`,
-    left: camera.x + pixel.x * camera.zoom,
-    top: worldPixelScreenTop(pixel.y, camera),
-    width: camera.zoom,
-    height: camera.zoom,
-    isBulk: false,
-    color: PIXEL_PALETTE[pixel.colorId]?.hex ?? "#ffffff",
-    isTransparent: pixel.colorId === TRANSPARENT_COLOR_ID,
-  }));
 }
 
 function snapSvgLine(value: number): number {
@@ -1339,6 +1720,35 @@ function areWorldPixelRecordsEqual(
   );
 }
 
+function mergeWorldPixels(currentPixels: WorldPixel[], fetchedPixels: WorldPixel[]): WorldPixel[] {
+  if (fetchedPixels.length === 0) {
+    return currentPixels;
+  }
+
+  const next = [...currentPixels];
+  const index = new Map(next.map((pixel, currentIndex) => [getPixelKey(pixel), currentIndex]));
+  let changed = false;
+
+  for (const pixel of fetchedPixels) {
+    const pixelKey = getPixelKey(pixel);
+    const existingIndex = index.get(pixelKey);
+
+    if (existingIndex === undefined) {
+      index.set(pixelKey, next.length);
+      next.push(pixel);
+      changed = true;
+      continue;
+    }
+
+    if (!areWorldPixelRecordsEqual(next[existingIndex], pixel)) {
+      next[existingIndex] = pixel;
+      changed = true;
+    }
+  }
+
+  return changed ? next : currentPixels;
+}
+
 function arePendingPaintEntriesEqual(
   left: PendingPaint | null,
   right: PendingPaint | null,
@@ -1368,6 +1778,8 @@ function arePlacementStatesEqual(
     left.canClaim === right.canClaim &&
     left.canPaint === right.canPaint &&
     left.isPendingClaim === right.isPendingClaim &&
+    left.optimisticPaintAreaId === right.optimisticPaintAreaId &&
+    left.optimisticPaintAreaName === right.optimisticPaintAreaName &&
     arePendingPaintEntriesEqual(left.pendingPaint, right.pendingPaint)
   );
 }
@@ -1583,10 +1995,119 @@ function useProjectedNormalPixelState(
   return projection;
 }
 
+const PendingPaintTileCanvas = memo(function PendingPaintTileCanvas({
+  camera,
+  tile,
+}: {
+  camera: CameraState;
+  tile: PendingPaintCanvasTile;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const devicePixelRatio = typeof window === "undefined" ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+  const cellSize = Math.max(
+    1,
+    Math.min(PENDING_PAINT_CANVAS_MAX_CELL_SIZE, Math.ceil(camera.zoom * devicePixelRatio)),
+  );
+  const canvasSize = PENDING_PAINT_CANVAS_TILE_SIZE * cellSize;
+
+  useLayoutEffect(() => {
+    const canvas = canvasRef.current;
+
+    if (canvas === null) {
+      return;
+    }
+
+    if (canvas.width !== canvasSize) {
+      canvas.width = canvasSize;
+    }
+
+    if (canvas.height !== canvasSize) {
+      canvas.height = canvasSize;
+    }
+
+    const context = canvas.getContext("2d");
+
+    if (context === null) {
+      return;
+    }
+
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.clearRect(0, 0, canvasSize, canvasSize);
+    context.imageSmoothingEnabled = false;
+
+    for (const paint of tile.paints) {
+      const left = (paint.x - tile.originX) * cellSize;
+      const top = (tile.originY + PENDING_PAINT_CANVAS_TILE_SIZE - 1 - paint.y) * cellSize;
+      const color = PIXEL_PALETTE_COLOR_BY_ID.get(paint.colorId) ?? "#ffffff";
+      const isTransparent = paint.colorId === TRANSPARENT_COLOR_ID;
+
+      if (isTransparent) {
+        context.fillStyle = "rgba(255, 255, 255, 0.9)";
+        context.fillRect(left, top, cellSize, cellSize);
+
+        const checkerSize = Math.max(2, Math.min(8, Math.floor(cellSize / 2)));
+        context.fillStyle = "rgba(0, 0, 0, 0.1)";
+
+        for (let y = 0; y < cellSize; y += checkerSize) {
+          for (let x = 0; x < cellSize; x += checkerSize) {
+            if (((x / checkerSize) + (y / checkerSize)) % 2 === 0) {
+              context.fillRect(left + x, top + y, checkerSize, checkerSize);
+            }
+          }
+        }
+      } else {
+        context.fillStyle = color;
+        context.fillRect(left, top, cellSize, cellSize);
+      }
+
+      if (cellSize >= 2) {
+        const borderSize = Math.max(1, Math.round(devicePixelRatio));
+        const borderOffset = borderSize / 2;
+        context.strokeStyle = "rgba(255, 255, 255, 0.78)";
+        context.lineWidth = borderSize;
+        context.strokeRect(
+          left + borderOffset,
+          top + borderOffset,
+          Math.max(0, cellSize - borderSize),
+          Math.max(0, cellSize - borderSize),
+        );
+      }
+
+      if (cellSize >= 4) {
+        const insetSize = Math.max(1, Math.round(devicePixelRatio));
+        const insetOffset = insetSize + insetSize / 2;
+        context.strokeStyle = "rgba(6, 12, 18, 0.38)";
+        context.lineWidth = insetSize;
+        context.strokeRect(
+          left + insetOffset,
+          top + insetOffset,
+          Math.max(0, cellSize - insetSize * 3),
+          Math.max(0, cellSize - insetSize * 3),
+        );
+      }
+    }
+  }, [canvasSize, cellSize, devicePixelRatio, tile]);
+
+  return (
+    <canvas
+      aria-hidden="true"
+      className="world-pending-paint-canvas"
+      ref={canvasRef}
+      style={{
+        left: `${camera.x + tile.originX * camera.zoom}px`,
+        top: `${worldRangeScreenTop(tile.originY + PENDING_PAINT_CANVAS_TILE_SIZE, camera)}px`,
+        width: `${PENDING_PAINT_CANVAS_TILE_SIZE * camera.zoom}px`,
+        height: `${PENDING_PAINT_CANVAS_TILE_SIZE * camera.zoom}px`,
+      }}
+    />
+  );
+});
+
 const WorldViewportCanvas = memo(function WorldViewportCanvas({
   activeChunkBoundaryRects,
   activeChunkViewportRects,
   bulkPendingClaimOverlay,
+  camera,
   claimOutlinePaths,
   crosshairHorizontalRef,
   crosshairVerticalRef,
@@ -1596,11 +2117,12 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
   onTileDebugSignal,
   onTileLoaded,
   outsideArtPatternImages,
+  pendingPaintTiles,
   renderedPendingClaims,
-  renderedPendingPaints,
   renderedWorldTiles,
   retainedVisualTileSrcs,
   hoverPixelOverlay,
+  paintCursorOverlay,
   selectedPixelOverlay,
   viewportSize,
   worldOutsideMaskId,
@@ -1747,18 +2269,8 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
         ))}
       </div>
       <div className="world-pixel-layer" aria-hidden="true">
-        {renderedPendingPaints.map((pixel) => (
-          <span
-            className={`world-pending-paint ${pixel.isTransparent ? "is-transparent" : ""}`}
-            key={pixel.key}
-            style={{
-              left: `${pixel.left}px`,
-              top: `${pixel.top}px`,
-              width: `${pixel.width}px`,
-              height: `${pixel.height}px`,
-              ...(pixel.isTransparent ? {} : { backgroundColor: pixel.color }),
-            }}
-          />
+        {pendingPaintTiles.map((tile) => (
+          <PendingPaintTileCanvas camera={camera} key={tile.key} tile={tile} />
         ))}
       </div>
       {hoverPixelOverlay ? (
@@ -1771,6 +2283,20 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
             top: `${hoverPixelOverlay.top}px`,
             width: `${hoverPixelOverlay.size}px`,
             height: `${hoverPixelOverlay.size}px`,
+          }}
+        />
+      ) : null}
+      {paintCursorOverlay ? (
+        <div
+          aria-hidden="true"
+          className={`world-paint-cursor ${paintCursorOverlay.isTransparent ? "is-transparent" : ""}`}
+          key={`paint-cursor-${paintCursorOverlay.key}-${paintCursorOverlay.color}`}
+          style={{
+            left: `${paintCursorOverlay.left}px`,
+            top: `${paintCursorOverlay.top}px`,
+            width: `${paintCursorOverlay.size}px`,
+            height: `${paintCursorOverlay.size}px`,
+            ...(paintCursorOverlay.isTransparent ? {} : { backgroundColor: paintCursorOverlay.color }),
           }}
         />
       ) : null}
@@ -1949,6 +2475,7 @@ function NormalPixelAccountStatus({ user }: { user: AuthUser }) {
 
 function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
   const [enabled, setEnabled] = useState(false);
+  const [isMinimized, setIsMinimized] = useState(true);
   const [recording, setRecording] = useState(true);
   const [events, setEvents] = useState<PerfEventRecord[]>([]);
   const [latestSnapshot, setLatestSnapshot] = useState<DebugWorldSnapshot | null>(null);
@@ -1985,7 +2512,7 @@ function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
     }
 
     const panelWidth = panelRef.current?.offsetWidth ?? 380;
-    const panelHeight = panelRef.current?.offsetHeight ?? 520;
+    const panelHeight = panelRef.current?.offsetHeight ?? (isMinimized ? 58 : 520);
     const padding = 12;
 
     return {
@@ -1998,7 +2525,7 @@ function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
         Math.max(padding, window.innerHeight - panelHeight - padding),
       ),
     };
-  }, []);
+  }, [isMinimized]);
 
   const handlePanelDragStart = useCallback((event: React.PointerEvent<HTMLElement>): void => {
     if (event.button !== 0 || panelRef.current === null) {
@@ -2165,13 +2692,19 @@ function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
           `claims ${snapshot.claims.loaded}/${snapshot.claims.active} loaded (${snapshot.claims.loading} loading, ${snapshot.claims.fallbackVisible} fallback)`,
         ];
 
-    return [
+    const detailParts = [
       `${formatGrowthStageLabel(snapshot.growth)}, filled ${formatCount(snapshot.growth.painted_pixels)} / ${formatCount(snapshot.growth.capacity_pixels)} px (${formatPercent(snapshot.growth.filled_percent)})`,
       `cam ${Math.round(snapshot.cameraX)}:${Math.round(snapshot.cameraY)} @ ${snapshot.zoom.toFixed(2)}x`,
       `layer ${formatDebugLayerLabel(snapshot)}`,
       ...layers,
       `pixels ${snapshot.visiblePixels}, outlines ${snapshot.claimOutlineSegments}, pending ${snapshot.pendingClaims}/${snapshot.pendingPaints}`,
-    ].join(" | ");
+    ];
+
+    if (snapshot.rectanglePlacementBusy) {
+      detailParts.push("rectangle check running");
+    }
+
+    return detailParts.join(" | ");
   }, []);
 
   const pushWarning = useCallback((key: string, label: string, detail: string): void => {
@@ -2507,7 +3040,7 @@ function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
 
   return (
     <aside
-      className={`perf-debug-panel ${isDraggingPanel ? "is-dragging" : ""}`}
+      className={`perf-debug-panel ${isDraggingPanel ? "is-dragging" : ""} ${isMinimized ? "is-minimized" : ""}`}
       ref={panelRef}
       style={panelPosition ? {
         left: `${panelPosition.left}px`,
@@ -2519,9 +3052,21 @@ function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
         className="perf-debug-header"
         onPointerDown={handlePanelDragStart}
       >
-        <strong>Debug probe</strong>
-        <span>?debug=1</span>
+        <div>
+          <strong>Debug probe</strong>
+          <span>?debug=1</span>
+        </div>
+        <button
+          className="perf-debug-button"
+          onClick={() => setIsMinimized((current) => !current)}
+          onPointerDown={(event) => event.stopPropagation()}
+          type="button"
+        >
+          {isMinimized ? "Open" : "Minimize"}
+        </button>
       </div>
+      {isMinimized ? null : (
+        <>
       <div className="perf-debug-controls">
         <button
           className={`perf-debug-button ${recording ? "is-active" : ""}`}
@@ -2588,7 +3133,7 @@ function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
             Pixels {latestSnapshot.visiblePixels}, outline {latestSnapshot.claimOutlineSegments}, pending {latestSnapshot.pendingClaims}/{latestSnapshot.pendingPaints}
           </span>
           <span>
-            Selected {latestSnapshot.selectedPixel ?? "--"} | Area {latestSnapshot.selectedAreaId ?? "--"} | Panels {latestSnapshot.buildPanelOpen ? "build" : "closed"} / {latestSnapshot.areaPanelBusy || latestSnapshot.areaDetailsBusy ? "busy" : "idle"}
+            Selected {latestSnapshot.selectedPixel ?? "--"} | Area {latestSnapshot.selectedAreaId ?? "--"} | Panels {latestSnapshot.buildPanelOpen ? "build" : "closed"} / {latestSnapshot.areaPanelBusy || latestSnapshot.areaDetailsBusy ? "busy" : "idle"} | Rectangle {latestSnapshot.rectanglePlacementBusy ? "checking" : "idle"}
           </span>
         </div>
       ) : null}
@@ -2604,6 +3149,8 @@ function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
           ))
         )}
       </div>
+        </>
+      )}
     </aside>
   );
 }
@@ -2616,6 +3163,28 @@ function DefaultAvatarIcon() {
         fill="currentColor"
       />
     </svg>
+  );
+}
+
+function AreaParticipantAvatar({ participant }: {
+  participant: { avatar_url: string | null; display_name: string };
+}) {
+  if (participant.avatar_url) {
+    return (
+      <Image
+        alt=""
+        className="area-participant-avatar"
+        height={30}
+        src={participant.avatar_url}
+        width={30}
+      />
+    );
+  }
+
+  return (
+    <div className="area-participant-avatar area-participant-avatar-fallback" aria-hidden="true">
+      <DefaultAvatarIcon />
+    </div>
   );
 }
 
@@ -2660,6 +3229,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const currentUserRef = useRef<AuthUser | null>(null);
   const visiblePixelsRef = useRef<WorldPixel[]>([]);
   const pixelIndexRef = useRef<Map<string, WorldPixel>>(new Map());
+  const claimContextPixelIndexRef = useRef<Map<string, ClaimContextPixelRecord>>(new Map());
   const activeWorldBoundsRef = useRef<ActiveWorldBounds | null>(null);
   const activeChunksRef = useRef<WorldOverview["chunks"]>([]);
   const pendingClaimPixelsRef = useRef<PixelCoordinate[]>([]);
@@ -2671,6 +3241,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const renderedWorldTilesRef = useRef<WorldTile[]>([]);
   const selectedPixelSnapshotRef = useRef<PixelCoordinate | null>(null);
   const selectedPixelFetchKeyRef = useRef<string | null>(null);
+  const selectedPixelFetchAbortRef = useRef<AbortController | null>(null);
   const selectedPixelFetchMissesRef = useRef<Map<string, number>>(new Map());
   const semanticZoomModeRef = useRef(false);
   const inspectedPixelSnapshotRef = useRef<PixelCoordinate | null>(null);
@@ -2678,6 +3249,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const buildPanelOpenRef = useRef(false);
   const areaPanelBusyRef = useRef(false);
   const areaDetailsBusyRef = useRef(false);
+  const rectanglePlacementBusyRef = useRef(false);
   const lastWorldRenderMarkAtRef = useRef(0);
   const lastWheelZoomMarkAtRef = useRef(0);
   const debugTileStatesRef = useRef<Record<DebugTileLayer, Map<string, DebugTileState>>>({
@@ -2712,15 +3284,24 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const visibleAreaFetchKeyRef = useRef<string | null>(null);
   const visibleAreaLastSuccessRef = useRef<{ key: string; at: number } | null>(null);
   const pixelFetchAbortRef = useRef<AbortController | null>(null);
+  const pixelFetchKeyRef = useRef<string | null>(null);
+  const pixelFetchLastSuccessRef = useRef<{ key: string; at: number } | null>(null);
+  const rectangleAnchorPrefetchAbortRef = useRef<AbortController | null>(null);
+  const rectangleAnchorPrefetchKeyRef = useRef<string | null>(null);
   const claimOutlineFetchAbortRef = useRef<AbortController | null>(null);
+  const claimOutlineFetchKeyRef = useRef<string | null>(null);
+  const claimOutlineFetchLastSuccessRef = useRef<{ key: string; at: number } | null>(null);
   const syncSelectedPlacementStateRef = useRef<(pixel: PixelCoordinate | null) => void>(() => undefined);
   const syncInspectedPixelRecordRef = useRef<() => void>(() => undefined);
   const rightEraseStrokeRef = useRef<RightEraseStrokeState | null>(null);
   const cameraFetchGenerationRef = useRef(0);
   const claimAreaCacheRef = useRef<Map<string, ClaimAreaRecord>>(new Map());
   const claimAreaDetailCacheRef = useRef<Map<string, ClaimAreaSummary>>(new Map());
+  const ownedAreasRef = useRef<ClaimAreaListItem[]>([]);
   const knownPaintableAreaIdsRef = useRef<Set<string>>(new Set());
   const selectedColorIdRef = useRef(DEFAULT_COLOR_ID);
+  const lastPaintBlockedMissingPixelAtRef = useRef(0);
+  const lastOptimisticPaintDebugAtRef = useRef(0);
   const zoomRef = useRef(DEFAULT_ZOOM);
   const cameraRef = useRef<CameraState>({
     x: 0,
@@ -2765,6 +3346,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [claimTool, setClaimTool] = useState<ClaimTool>("brush");
   const [paintTool, setPaintTool] = useState<PaintTool>("brush");
   const [rectangleAnchor, setRectangleAnchor] = useState<PixelCoordinate | null>(null);
+  const [rectanglePlacementBusy, setRectanglePlacementBusy] = useState(false);
   const [buildPanelOpen, setBuildPanelOpen] = useState(false);
   const [buildPanelMinimized, setBuildPanelMinimized] = useState(false);
   const [buildPanelPosition, setBuildPanelPosition] = useState<BuildPanelPosition | null>(null);
@@ -2773,6 +3355,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [pendingPaints, setPendingPaints] = useState<PendingPaint[]>([]);
   const [placementBusy, setPlacementBusy] = useState(false);
   const [placementMessage, setPlacementMessage] = useState<ProfileMessage | null>(null);
+  const [devRecoveryNotice, setDevRecoveryNotice] = useState<string | null>(null);
   const [selectedPlacementState, setSelectedPlacementState] = useState<PlacementState>(EMPTY_PLACEMENT_STATE);
   const [claimOutlineSegments, setClaimOutlineSegments] = useState<ClaimOutlineSegment[]>([]);
   const [visualTileRevisions, setVisualTileRevisions] = useState<Record<string, number>>({});
@@ -2785,12 +3368,19 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [areaDraftName, setAreaDraftName] = useState("");
   const [areaDraftDescription, setAreaDraftDescription] = useState("");
   const [areaInvitePublicId, setAreaInvitePublicId] = useState("");
+  const [areaEditorOpen, setAreaEditorOpen] = useState(false);
   const [areaMessage, setAreaMessage] = useState<ProfileMessage | null>(null);
   const [areaOptionsMenu, setAreaOptionsMenu] = useState<AreaOptionsMenuState | null>(null);
+  const [areaPlayerOptionsMenu, setAreaPlayerOptionsMenu] = useState<AreaPlayerOptionsMenuState | null>(null);
   const [ownedAreas, setOwnedAreas] = useState<ClaimAreaListItem[]>([]);
   const [ownedAreasLoaded, setOwnedAreasLoaded] = useState(false);
   const [ownedAreasLoading, setOwnedAreasLoading] = useState(false);
   const [ownedAreasMessage, setOwnedAreasMessage] = useState<ProfileMessage | null>(null);
+
+  const setRectanglePlacementBusyState = useCallback((nextBusy: boolean): void => {
+    rectanglePlacementBusyRef.current = nextBusy;
+    setRectanglePlacementBusy(nextBusy);
+  }, []);
 
   const scheduleCameraUpdate = useCallback((nextCamera: CameraState): void => {
     pendingCameraUpdateRef.current = nextCamera;
@@ -2834,6 +3424,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   buildPanelOpenRef.current = buildPanelOpen;
   areaPanelBusyRef.current = areaPanelBusy;
   areaDetailsBusyRef.current = areaDetailsBusy;
+  rectanglePlacementBusyRef.current = rectanglePlacementBusy;
+  ownedAreasRef.current = ownedAreas;
   const worldOutsidePatternId = `${outsidePatternIdBase}-outside-pattern`;
   const worldOutsideMaskId = `${outsidePatternIdBase}-outside-mask`;
 
@@ -2868,13 +3460,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return;
     }
 
-    for (const area of result.areas) {
-      if (area.viewer_can_paint) {
-        knownPaintableAreaIdsRef.current.add(area.id);
-      } else {
-        knownPaintableAreaIdsRef.current.delete(area.id);
-      }
-    }
+    knownPaintableAreaIdsRef.current = new Set(
+      result.areas
+        .filter((area) => area.status === "active" && area.viewer_can_paint)
+        .map((area) => area.id),
+    );
 
     setOwnedAreas(result.areas);
     setOwnedAreasLoaded(true);
@@ -2922,6 +3512,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     event: ReactMouseEvent<HTMLButtonElement>,
     publicId: number,
     messageTarget: "area" | "areas-list",
+    canEdit = false,
   ): void => {
     event.stopPropagation();
     const rect = event.currentTarget.getBoundingClientRect();
@@ -2930,9 +3521,32 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     const left = Math.max(12, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 12));
     const top = Math.max(12, Math.min(rect.bottom + menuGap, window.innerHeight - 132));
 
+    setAreaPlayerOptionsMenu(null);
     setAreaOptionsMenu({
       publicId,
+      canEdit,
       messageTarget,
+      left,
+      top,
+    });
+  }, []);
+
+  const openAreaPlayerOptionsMenu = useCallback((
+    event: ReactMouseEvent<HTMLButtonElement>,
+    contributor: AreaContributorSummary,
+  ): void => {
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const menuWidth = 220;
+    const menuGap = 8;
+    const left = Math.max(12, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 12));
+    const top = Math.max(12, Math.min(rect.bottom + menuGap, window.innerHeight - 132));
+
+    setAreaOptionsMenu(null);
+    setAreaPlayerOptionsMenu({
+      publicId: contributor.public_id,
+      displayName: contributor.display_name,
+      role: contributor.role,
       left,
       top,
     });
@@ -2964,6 +3578,35 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }, [darkMode]);
 
   useEffect(() => {
+    if (process.env.NODE_ENV !== "development") {
+      return;
+    }
+
+    const showRecoverableDevNotice = (value: unknown): void => {
+      const notice = getDevBundleRecoveryNotice(value);
+      if (notice !== null) {
+        setDevRecoveryNotice(notice);
+      }
+    };
+
+    const handleError = (event: ErrorEvent): void => {
+      showRecoverableDevNotice(`${event.message}\n${stringifyUnknownError(event.error)}`);
+    };
+
+    const handleUnhandledRejection = (event: PromiseRejectionEvent): void => {
+      showRecoverableDevNotice(event.reason);
+    };
+
+    window.addEventListener("error", handleError);
+    window.addEventListener("unhandledrejection", handleUnhandledRejection);
+
+    return () => {
+      window.removeEventListener("error", handleError);
+      window.removeEventListener("unhandledrejection", handleUnhandledRejection);
+    };
+  }, []);
+
+  useEffect(() => {
     if (areaOptionsMenu === null) {
       return;
     }
@@ -2986,6 +3629,30 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       window.removeEventListener("scroll", closeMenu, true);
     };
   }, [areaOptionsMenu]);
+
+  useEffect(() => {
+    if (areaPlayerOptionsMenu === null) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        setAreaPlayerOptionsMenu(null);
+      }
+    };
+
+    const closeMenu = (): void => setAreaPlayerOptionsMenu(null);
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", closeMenu);
+    window.addEventListener("scroll", closeMenu, true);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", closeMenu);
+      window.removeEventListener("scroll", closeMenu, true);
+    };
+  }, [areaPlayerOptionsMenu]);
 
   useEffect(() => {
     void refreshAuthStatus();
@@ -3229,6 +3896,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     if (area === null) {
       setAreaInvitePublicId("");
+      setAreaEditorOpen(false);
+      setAreaOptionsMenu(null);
+      setAreaPlayerOptionsMenu(null);
       if (syncDrafts) {
         setAreaDraftName("");
         setAreaDraftDescription("");
@@ -3241,6 +3911,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     setAreaInvitePublicId("");
+    setAreaEditorOpen(false);
     setAreaDraftName(area.name);
     setAreaDraftDescription(area.description);
   }, []);
@@ -3457,10 +4128,32 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     cameraFetchGenerationRef.current += 1;
     pixelFetchAbortRef.current?.abort();
     pixelFetchAbortRef.current = null;
+    pixelFetchKeyRef.current = null;
     claimOutlineFetchAbortRef.current?.abort();
     claimOutlineFetchAbortRef.current = null;
+    claimOutlineFetchKeyRef.current = null;
     visibleAreaFetchAbortRef.current?.abort();
     visibleAreaFetchAbortRef.current = null;
+    visibleAreaFetchKeyRef.current = null;
+
+    const zoomedOutForPaint =
+      buildPanelOpen &&
+      activeBuildMode === "paint" &&
+      camera.zoom < fetchCamera.zoom;
+
+    if (zoomedOutForPaint) {
+      emitDebugEvent(
+        "network",
+        "Pixel fetch camera updated immediately",
+        `zoom-out paint ${fetchCamera.zoom.toFixed(2)}x -> ${camera.zoom.toFixed(2)}x`,
+      );
+      setFetchCamera({
+        x: camera.x,
+        y: camera.y,
+        zoom: camera.zoom,
+      });
+      return;
+    }
 
     const settleTimeout = window.setTimeout(() => {
       setFetchCamera({
@@ -3473,7 +4166,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return () => {
       window.clearTimeout(settleTimeout);
     };
-  }, [camera.x, camera.y, camera.zoom]);
+  }, [activeBuildMode, buildPanelOpen, camera.x, camera.y, camera.zoom, fetchCamera.zoom]);
 
   useEffect(() => {
     setSemanticZoomMode((current) => {
@@ -4107,26 +4800,47 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     viewportSize.width,
   ]);
 
-  const refreshVisiblePixelWindow = useCallback(async (): Promise<void> => {
+  const refreshVisiblePixelWindow = useCallback(async (options?: { force?: boolean }): Promise<void> => {
     if (pixelFetchBounds === null) {
       return;
+    }
+
+    const bounds = pixelFetchBounds;
+    const requestKey = getFetchBoundsKey(bounds);
+    const now = performance.now();
+    const force = options?.force === true;
+    const cacheHit = pixelFetchLastSuccessRef.current;
+
+    if (!force) {
+      if (pixelFetchKeyRef.current === requestKey) {
+        return;
+      }
+
+      if (
+        cacheHit !== null &&
+        cacheHit.key === requestKey &&
+        now - cacheHit.at < PIXEL_FETCH_REPEAT_CACHE_MS
+      ) {
+        return;
+      }
     }
 
     pixelFetchAbortRef.current?.abort();
     const abortController = new AbortController();
     pixelFetchAbortRef.current = abortController;
-    const startedAt = performance.now();
+    pixelFetchKeyRef.current = requestKey;
+    const startedAt = now;
     markPerfEvent("pixel fetch start");
     emitDebugEvent(
       "network",
       "Pixel window fetch start",
-      `${pixelFetchBounds.minX}:${pixelFetchBounds.minY} -> ${pixelFetchBounds.maxX}:${pixelFetchBounds.maxY}`,
+      `${bounds.minX}:${bounds.minY} -> ${bounds.maxX}:${bounds.maxY}`,
     );
     const result = await fetchVisibleWorldPixels(
-      pixelFetchBounds.minX,
-      pixelFetchBounds.maxX,
-      pixelFetchBounds.minY,
-      pixelFetchBounds.maxY,
+      bounds.minX,
+      bounds.maxX,
+      bounds.minY,
+      bounds.maxY,
       abortController.signal,
     );
 
@@ -4136,7 +4850,14 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     if (pixelFetchAbortRef.current === abortController) {
       pixelFetchAbortRef.current = null;
+      if (pixelFetchKeyRef.current === requestKey) {
+        pixelFetchKeyRef.current = null;
+      }
     }
+    pixelFetchLastSuccessRef.current = {
+      key: requestKey,
+      at: performance.now(),
+    };
 
     measureDebugWork("Apply pixel window", () => {
       if (areWorldPixelsEqual(visiblePixelsRef.current, result.pixels)) {
@@ -4145,6 +4866,19 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
       visiblePixelsRef.current = result.pixels;
       pixelIndexRef.current = new Map(result.pixels.map((pixel) => [`${pixel.x}:${pixel.y}`, pixel]));
+      const claimContextPixels = result.pixels.map((pixel) => toClaimContextPixelRecord(pixel));
+      claimContextPixelIndexRef.current = result.truncated
+        ? mergeClaimContextPixels(claimContextPixelIndexRef.current, claimContextPixels)
+        : syncClaimContextPixelsForWindow(
+          claimContextPixelIndexRef.current,
+          {
+            minX: result.min_x,
+            maxX: result.max_x,
+            minY: result.min_y,
+            maxY: result.max_y,
+          },
+          claimContextPixels,
+        );
       syncSelectedPlacementStateRef.current(selectedPixelSnapshotRef.current);
       syncInspectedPixelRecordRef.current();
       return true;
@@ -4158,30 +4892,52 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     );
   }, [pixelFetchBounds]);
 
-  const refreshClaimOutlineNow = useCallback(async (): Promise<void> => {
+  const refreshClaimOutlineNow = useCallback(async (options?: { force?: boolean }): Promise<void> => {
     if (claimOutlineFetchBounds === null) {
       claimOutlineFetchAbortRef.current?.abort();
       claimOutlineFetchAbortRef.current = null;
+      claimOutlineFetchKeyRef.current = null;
       claimOutlineSegmentsRef.current = [];
       setClaimOutlineSegments((current) => current.length === 0 ? current : []);
       return;
     }
 
+    const bounds = claimOutlineFetchBounds;
+    const requestKey = getFetchBoundsKey(bounds);
+    const now = performance.now();
+    const force = options?.force === true;
+    const cacheHit = claimOutlineFetchLastSuccessRef.current;
+
+    if (!force) {
+      if (claimOutlineFetchKeyRef.current === requestKey) {
+        return;
+      }
+
+      if (
+        cacheHit !== null &&
+        cacheHit.key === requestKey &&
+        now - cacheHit.at < CLAIM_OUTLINE_FETCH_REPEAT_CACHE_MS
+      ) {
+        return;
+      }
+    }
+
     claimOutlineFetchAbortRef.current?.abort();
     const abortController = new AbortController();
     claimOutlineFetchAbortRef.current = abortController;
-    const startedAt = performance.now();
+    claimOutlineFetchKeyRef.current = requestKey;
+    const startedAt = now;
     markPerfEvent("claim outline fetch start");
     emitDebugEvent(
       "network",
       "Claim outline fetch start",
-      `${claimOutlineFetchBounds.minX}:${claimOutlineFetchBounds.minY} -> ${claimOutlineFetchBounds.maxX}:${claimOutlineFetchBounds.maxY}`,
+      `${bounds.minX}:${bounds.minY} -> ${bounds.maxX}:${bounds.maxY}`,
     );
     const result = await fetchClaimOutlinePixels(
-      claimOutlineFetchBounds.minX,
-      claimOutlineFetchBounds.maxX,
-      claimOutlineFetchBounds.minY,
-      claimOutlineFetchBounds.maxY,
+      bounds.minX,
+      bounds.maxX,
+      bounds.minY,
+      bounds.maxY,
       abortController.signal,
     );
 
@@ -4191,7 +4947,14 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     if (claimOutlineFetchAbortRef.current === abortController) {
       claimOutlineFetchAbortRef.current = null;
+      if (claimOutlineFetchKeyRef.current === requestKey) {
+        claimOutlineFetchKeyRef.current = null;
+      }
     }
+    claimOutlineFetchLastSuccessRef.current = {
+      key: requestKey,
+      at: performance.now(),
+    };
 
     measureDebugWork("Apply claim outline segments", () => {
       if (areClaimOutlineSegmentsEqual(claimOutlineSegmentsRef.current, result.segments)) {
@@ -4215,6 +4978,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     if (pixelFetchBounds === null) {
       pixelFetchAbortRef.current?.abort();
       pixelFetchAbortRef.current = null;
+      pixelFetchKeyRef.current = null;
       return;
     }
 
@@ -4224,24 +4988,27 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       "pixel fetch scheduled",
       `${pixelFetchBounds.minX}:${pixelFetchBounds.minY} -> ${pixelFetchBounds.maxX}:${pixelFetchBounds.maxY}`,
     );
+    const fetchDelay = buildPanelOpen && activeBuildMode === "paint" ? 30 : PIXEL_FETCH_DEBOUNCE_MS;
     const fetchTimeout = window.setTimeout(async () => {
       if (!cancelled && fetchGeneration === cameraFetchGenerationRef.current) {
         await refreshVisiblePixelWindow();
       }
-    }, PIXEL_FETCH_DEBOUNCE_MS);
+    }, fetchDelay);
 
     return () => {
       cancelled = true;
       window.clearTimeout(fetchTimeout);
       pixelFetchAbortRef.current?.abort();
       pixelFetchAbortRef.current = null;
+      pixelFetchKeyRef.current = null;
     };
-  }, [pixelFetchBounds, refreshVisiblePixelWindow]);
+  }, [activeBuildMode, buildPanelOpen, pixelFetchBounds, refreshVisiblePixelWindow]);
 
   useEffect(() => {
     if (claimOutlineFetchBounds === null) {
       claimOutlineFetchAbortRef.current?.abort();
       claimOutlineFetchAbortRef.current = null;
+      claimOutlineFetchKeyRef.current = null;
       claimOutlineSegmentsRef.current = [];
       setClaimOutlineSegments((current) => current.length === 0 ? current : []);
       return;
@@ -4264,13 +5031,16 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       window.clearTimeout(fetchTimeout);
       claimOutlineFetchAbortRef.current?.abort();
       claimOutlineFetchAbortRef.current = null;
+      claimOutlineFetchKeyRef.current = null;
     };
   }, [claimOutlineFetchBounds, refreshClaimOutlineNow]);
 
   useEffect(() => {
     return () => {
       pixelFetchAbortRef.current?.abort();
+      pixelFetchKeyRef.current = null;
       claimOutlineFetchAbortRef.current?.abort();
+      claimOutlineFetchKeyRef.current = null;
     };
   }, []);
 
@@ -4282,19 +5052,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     ),
     [pendingClaimPixels],
   );
-  const pendingPaintMap = useMemo(
-    () => measureDebugWork(
-      "Build pending paint index",
-      () => buildPendingPaintMap(pendingPaints),
-      `${pendingPaints.length} pixels`,
-    ),
-    [pendingPaints],
-  );
   pendingClaimPixelsRef.current = pendingClaimPixels;
   pendingClaimPixelMapRef.current = pendingClaimPixelMap;
   pendingClaimRectanglesRef.current = pendingClaimRectangles;
   pendingPaintsRef.current = pendingPaints;
-  pendingPaintMapRef.current = pendingPaintMap;
 
   const syncPendingClaims = useCallback((
     nextPixels: PixelCoordinate[],
@@ -4311,9 +5072,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setPendingClaimRectangles(nextRectangles);
   }, []);
 
-  const syncPendingPaints = useCallback((nextPaints: PendingPaint[]): void => {
+  const syncPendingPaints = useCallback((
+    nextPaints: PendingPaint[],
+    nextPaintMap?: Map<string, PendingPaint>,
+  ): void => {
     pendingPaintsRef.current = nextPaints;
-    pendingPaintMapRef.current = measureDebugWork(
+    pendingPaintMapRef.current = nextPaintMap ?? measureDebugWork(
       "Sync pending paint index",
       () => buildPendingPaintMap(nextPaints),
       `${nextPaints.length} pixels`,
@@ -4321,15 +5085,41 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setPendingPaints(nextPaints);
   }, []);
 
+  const isPixelInsideActiveWorld = useCallback((pixel: PixelCoordinate | null): boolean => {
+    if (pixel === null) {
+      return false;
+    }
+
+    const bounds = activeWorldBoundsRef.current;
+
+    if (bounds === null) {
+      return false;
+    }
+
+    return isPixelInsideActiveWorldBounds(pixel, bounds, activeChunksRef.current);
+  }, []);
+
   const removePendingPaintAtPixel = useCallback((
     targetPixel: PixelCoordinate,
-    options?: { quiet?: boolean },
+    options?: { quiet?: boolean; updateSelection?: boolean },
   ): boolean => {
-    setSelectedPixel((current) => (
-      current !== null && current.x === targetPixel.x && current.y === targetPixel.y
-        ? current
-        : targetPixel
-    ));
+    if (!isPixelInsideActiveWorld(targetPixel)) {
+      if (!options?.quiet) {
+        setPlacementMessage({
+          tone: "error",
+          text: "This cell is outside the active world.",
+        });
+      }
+      return false;
+    }
+
+    if (options?.updateSelection !== false) {
+      setSelectedPixel((current) => (
+        current !== null && current.x === targetPixel.x && current.y === targetPixel.y
+          ? current
+          : targetPixel
+      ));
+    }
 
     const targetKey = getPixelKey(targetPixel);
     const hasPendingPaint = pendingPaintMapRef.current.has(targetKey);
@@ -4345,7 +5135,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     const nextPaints = pendingPaintsRef.current.filter((paint) => getPixelKey(paint) !== targetKey);
-    syncPendingPaints(nextPaints);
+    const nextPaintMap = new Map(pendingPaintMapRef.current);
+    nextPaintMap.delete(targetKey);
+    syncPendingPaints(nextPaints, nextPaintMap);
 
     if (!options?.quiet) {
       setPlacementMessage({
@@ -4355,7 +5147,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     return true;
-  }, [syncPendingPaints]);
+  }, [isPixelInsideActiveWorld, syncPendingPaints]);
 
   const cacheClaimAreaPreview = useCallback((area: ClaimAreaPreview): ClaimAreaRecord => {
     const cachedDetail = claimAreaDetailCacheRef.current.get(area.id) ?? null;
@@ -4377,7 +5169,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       }
     }
 
-    if (nextArea.viewer_can_paint) {
+    if (nextArea.status === "active" && nextArea.viewer_can_paint) {
       knownPaintableAreaIdsRef.current.add(nextArea.id);
     } else {
       knownPaintableAreaIdsRef.current.delete(nextArea.id);
@@ -4490,6 +5282,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       buildPanelOpen: buildPanelOpenRef.current,
       areaPanelBusy: areaPanelBusyRef.current,
       areaDetailsBusy: areaDetailsBusyRef.current,
+      rectanglePlacementBusy: rectanglePlacementBusyRef.current,
       visual: buildDebugTileLayerSnapshot("visual"),
       claims: buildDebugTileLayerSnapshot("claims"),
       paint: buildDebugTileLayerSnapshot("paint"),
@@ -4564,7 +5357,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     const startedAt = performance.now();
     const existingRequestKey = visibleAreaFetchKeyRef.current;
     const cacheHit = visibleAreaLastSuccessRef.current;
-    const requestKey = `${triggerLiveRefresh ? "poll" : "prefetch"}:${bounds.key}`;
+    const requestKey = bounds.key;
 
     if (existingRequestKey === requestKey) {
       return;
@@ -4602,15 +5395,20 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     );
 
     if (abortController.signal.aborted) {
-      if (visibleAreaFetchKeyRef.current === requestKey) {
+      if (visibleAreaFetchAbortRef.current === abortController) {
+        visibleAreaFetchAbortRef.current = null;
+      }
+      if (visibleAreaFetchAbortRef.current === null && visibleAreaFetchKeyRef.current === requestKey) {
         visibleAreaFetchKeyRef.current = null;
       }
       return;
     }
 
-    visibleAreaFetchAbortRef.current = null;
-    if (visibleAreaFetchKeyRef.current === requestKey) {
-      visibleAreaFetchKeyRef.current = null;
+    if (visibleAreaFetchAbortRef.current === abortController) {
+      visibleAreaFetchAbortRef.current = null;
+      if (visibleAreaFetchKeyRef.current === requestKey) {
+        visibleAreaFetchKeyRef.current = null;
+      }
     }
 
     if (!result.ok) {
@@ -4655,12 +5453,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         canClaim: false,
         canPaint: false,
         isPendingClaim: false,
+        optimisticPaintAreaId: null,
+        optimisticPaintAreaName: null,
         pendingPaint: null,
       };
     }
 
     const bounds = activeWorldBoundsRef.current;
-    const activeChunks = activeChunksRef.current;
     const pixelMap = pixelIndexRef.current;
     const pendingClaimPixelMap = pendingClaimPixelMapRef.current;
     const pendingClaimRectangles = pendingClaimRectanglesRef.current;
@@ -4677,28 +5476,26 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         canClaim: false,
         canPaint: false,
         isPendingClaim: false,
+        optimisticPaintAreaId: null,
+        optimisticPaintAreaName: null,
         pendingPaint: null,
       };
     }
 
-    const isInsideWorld = activeChunks.length === 0
-      ? pixel.x >= bounds.minX &&
-        pixel.x < bounds.maxX &&
-        pixel.y >= bounds.minY &&
-        pixel.y < bounds.maxY
-      : activeChunks.some((chunk) => (
-        pixel.x >= chunk.origin_x &&
-        pixel.x < chunk.origin_x + chunk.width &&
-        pixel.y >= chunk.origin_y &&
-        pixel.y < chunk.origin_y + chunk.height
-      ));
+    const isInsideWorld = isPixelInsideActiveWorld(pixel);
     const pixelRecord = pixelMap.get(pixelKey) ?? null;
     const isPendingClaim = hasPendingClaimAtPixel(pixel, pendingClaimPixelMap, pendingClaimRectangles);
     const pendingPaint = pendingPaintsMap.get(pixelKey) ?? null;
+    const optimisticPaintArea = pixelRecord === null
+      ? ownedAreasRef.current.find((area) => (
+        area.status === "active" &&
+        area.viewer_can_paint &&
+        isPixelInsideAreaBounds(pixel, area)
+      )) ?? null
+      : null;
 
     if (
       nextUser === null ||
-      !semanticZoomModeRef.current ||
       !isInsideWorld
     ) {
       return {
@@ -4707,17 +5504,37 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         canClaim: false,
         canPaint: false,
         isPendingClaim,
+        optimisticPaintAreaId: null,
+        optimisticPaintAreaName: null,
         pendingPaint,
       };
     }
 
     const canPaint =
-      pixelRecord !== null &&
-      !pixelRecord.is_starter &&
-      pixelRecord.area_id !== null &&
-      knownPaintableAreaIdsRef.current.has(pixelRecord.area_id) &&
-      !isPendingClaim;
+      !isPendingClaim &&
+      (
+        pixelRecord !== null
+          ? (
+            !pixelRecord.is_starter &&
+            pixelRecord.area_id !== null &&
+            knownPaintableAreaIdsRef.current.has(pixelRecord.area_id)
+          )
+          : optimisticPaintArea !== null
+      );
     let canClaim = false;
+
+    if (!semanticZoomModeRef.current) {
+      return {
+        pixelRecord,
+        isInsideWorld,
+        canClaim: false,
+        canPaint,
+        isPendingClaim,
+        optimisticPaintAreaId: optimisticPaintArea?.id ?? null,
+        optimisticPaintAreaName: optimisticPaintArea?.name ?? null,
+        pendingPaint,
+      };
+    }
 
     if (pixelRecord === null && !isPendingClaim) {
       if (activeClaimMode === "new" && !canStartNewAreaRef.current) {
@@ -4727,6 +5544,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           canClaim: false,
           canPaint,
           isPendingClaim,
+          optimisticPaintAreaId: optimisticPaintArea?.id ?? null,
+          optimisticPaintAreaName: optimisticPaintArea?.name ?? null,
           pendingPaint,
         };
       }
@@ -4738,6 +5557,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           canClaim: false,
           canPaint,
           isPendingClaim,
+          optimisticPaintAreaId: optimisticPaintArea?.id ?? null,
+          optimisticPaintAreaName: optimisticPaintArea?.name ?? null,
           pendingPaint,
         };
       }
@@ -4774,9 +5595,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       canClaim,
       canPaint,
       isPendingClaim,
+      optimisticPaintAreaId: optimisticPaintArea?.id ?? null,
+      optimisticPaintAreaName: optimisticPaintArea?.name ?? null,
       pendingPaint,
     };
-  }, []);
+  }, [isPixelInsideActiveWorld]);
 
   const syncSelectedPlacementState = useCallback((pixel: PixelCoordinate | null): void => {
     const nextState = getPlacementState(pixel);
@@ -4800,6 +5623,180 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   syncSelectedPlacementStateRef.current = syncSelectedPlacementState;
   syncInspectedPixelRecordRef.current = syncInspectedPixelRecord;
 
+  const mergeFetchedPixelsIntoVisibleWindow = useCallback((
+    fetchedPixels: WorldPixel[],
+    bounds: Pick<VisibleAreaBounds, "minX" | "maxX" | "minY" | "maxY">,
+    truncated: boolean,
+    debugLabel: string,
+  ): boolean => {
+    return measureDebugWork(debugLabel, () => {
+      const next = mergeWorldPixels(visiblePixelsRef.current, fetchedPixels);
+
+      if (next === visiblePixelsRef.current) {
+        return false;
+      }
+
+      visiblePixelsRef.current = next;
+      pixelIndexRef.current = new Map(next.map((pixel) => [getPixelKey(pixel), pixel]));
+      const claimContextPixels = fetchedPixels.map((pixel) => toClaimContextPixelRecord(pixel));
+      claimContextPixelIndexRef.current = truncated
+        ? mergeClaimContextPixels(claimContextPixelIndexRef.current, claimContextPixels)
+        : syncClaimContextPixelsForWindow(
+          claimContextPixelIndexRef.current,
+          bounds,
+          claimContextPixels,
+        );
+      syncSelectedPlacementStateRef.current(selectedPixelSnapshotRef.current);
+      syncInspectedPixelRecordRef.current();
+      return true;
+    }, (applied) => `${fetchedPixels.length} fetched, ${visiblePixelsRef.current.length} current${applied ? "" : " unchanged"}`);
+  }, []);
+
+  const mergeFetchedPixelsIntoClaimContext = useCallback((
+    fetchedPixels: ClaimContextPixelRecord[],
+    debugLabel: string,
+  ): boolean => {
+    return measureDebugWork(debugLabel, () => {
+      const next = mergeClaimContextPixels(claimContextPixelIndexRef.current, fetchedPixels);
+
+      if (next === claimContextPixelIndexRef.current) {
+        return false;
+      }
+
+      claimContextPixelIndexRef.current = next;
+      return true;
+    }, (applied) => `${fetchedPixels.length} fetched, ${claimContextPixelIndexRef.current.size} current${applied ? "" : " unchanged"}`);
+  }, []);
+
+  const hydrateClaimRectanglePixelWindow = useCallback(async (
+    rectangle: PendingClaimRectangle,
+  ): Promise<{ pixelCount: number; truncated: boolean }> => {
+    const bounds = activeWorldBoundsRef.current;
+
+    if (bounds === null) {
+      return { pixelCount: 0, truncated: false };
+    }
+
+    const fetchBounds = getClaimRectangleFetchBounds(rectangle, bounds);
+    const startedAt = performance.now();
+    emitDebugEvent(
+      "network",
+      "Rectangle claim fetch start",
+      `${fetchBounds.minX}:${fetchBounds.minY} -> ${fetchBounds.maxX}:${fetchBounds.maxY}`,
+    );
+    const result = await fetchClaimContextPixels(
+      fetchBounds.minX,
+      fetchBounds.maxX,
+      fetchBounds.minY,
+      fetchBounds.maxY,
+    );
+
+    mergeFetchedPixelsIntoClaimContext(result.pixels, "Apply rectangle claim fetch");
+    emitDebugEvent(
+      "network",
+      "Rectangle claim fetch done",
+      `${result.pixels.length} pixels${result.truncated ? " (truncated)" : ""}`,
+      performance.now() - startedAt,
+    );
+
+    return {
+      pixelCount: result.pixels.length,
+      truncated: result.truncated,
+    };
+  }, [mergeFetchedPixelsIntoClaimContext]);
+
+  const prefetchRectangleAnchorWindow = useCallback(async (
+    anchor: PixelCoordinate,
+  ): Promise<void> => {
+    const nextUser = currentUserRef.current;
+    const bounds = activeWorldBoundsRef.current;
+
+    if (nextUser === null || bounds === null) {
+      return;
+    }
+
+    const activeClaimMode = claimAreaModeRef.current;
+    const activeClaimTargetAreaId = claimTargetAreaIdRef.current;
+    const anchorRectangle = createPendingClaimRectangle(anchor, anchor);
+    const anchorEvaluation = evaluateClaimRectanglePlacement({
+      rectangle: anchorRectangle,
+      pixelMap: claimContextPixelIndexRef.current,
+      bounds,
+      activeChunks: activeChunksRef.current,
+      pendingClaimPixelMap: pendingClaimPixelMapRef.current,
+      pendingClaimRectangles: pendingClaimRectanglesRef.current,
+      activeClaimMode,
+      activeClaimTargetAreaId,
+      currentUserId: nextUser.id,
+      startPixel: anchor,
+    });
+
+    if (
+      anchorEvaluation.blockedReason !== null ||
+      anchorEvaluation.touchesClaimRoute ||
+      anchorEvaluation.unresolvedNeighborCount === 0
+    ) {
+      emitDebugEvent(
+        "action",
+        "Rectangle anchor prefetch skipped",
+        anchorEvaluation.blockedReason
+          ? `${anchor.x}:${anchor.y}; ${anchorEvaluation.blockedReason}`
+          : `${anchor.x}:${anchor.y}; resolved locally`,
+      );
+      return;
+    }
+
+    const fetchBounds = getRectangleAnchorPrefetchBounds(anchor, bounds);
+    const requestKey = `${fetchBounds.minX}:${fetchBounds.minY}:${fetchBounds.maxX}:${fetchBounds.maxY}`;
+
+    if (rectangleAnchorPrefetchKeyRef.current === requestKey) {
+      emitDebugEvent("action", "Rectangle anchor prefetch skipped", `${requestKey}; already running`);
+      return;
+    }
+
+    rectangleAnchorPrefetchAbortRef.current?.abort();
+    const abortController = new AbortController();
+    rectangleAnchorPrefetchAbortRef.current = abortController;
+    rectangleAnchorPrefetchKeyRef.current = requestKey;
+    const startedAt = performance.now();
+
+    emitDebugEvent(
+      "network",
+      "Rectangle anchor prefetch start",
+      `${requestKey}; unresolved neighbors ${anchorEvaluation.unresolvedNeighborCount}`,
+    );
+
+    try {
+      const result = await fetchClaimContextPixels(
+        fetchBounds.minX,
+        fetchBounds.maxX,
+        fetchBounds.minY,
+        fetchBounds.maxY,
+        abortController.signal,
+      );
+
+      if (abortController.signal.aborted) {
+        return;
+      }
+
+      mergeFetchedPixelsIntoClaimContext(result.pixels, "Apply rectangle anchor prefetch");
+      emitDebugEvent(
+        "network",
+        "Rectangle anchor prefetch done",
+        `${result.pixels.length} pixels${result.truncated ? " (truncated)" : ""}`,
+        performance.now() - startedAt,
+      );
+    } finally {
+      if (rectangleAnchorPrefetchAbortRef.current === abortController) {
+        rectangleAnchorPrefetchAbortRef.current = null;
+      }
+
+      if (rectangleAnchorPrefetchKeyRef.current === requestKey) {
+        rectangleAnchorPrefetchKeyRef.current = null;
+      }
+    }
+  }, [mergeFetchedPixelsIntoClaimContext]);
+
   useEffect(() => {
     syncSelectedPlacementState(selectedPixel);
   }, [
@@ -4822,18 +5819,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   const selectedPixelRecord = selectedPlacementState.pixelRecord;
   const selectedPendingPaint = selectedPlacementState.pendingPaint;
-  const canFetchSelectedPixelRecord = semanticZoomMode;
-
-  useEffect(() => {
-    if (selectedPendingPaint) {
-      setSelectedColorId(selectedPendingPaint.colorId);
-      return;
-    }
-
-    if (selectedPixelRecord?.color_id !== null && selectedPixelRecord?.color_id !== undefined) {
-      setSelectedColorId(selectedPixelRecord.color_id);
-    }
-  }, [selectedPendingPaint, selectedPixelRecord]);
+  const canFetchSelectedPixelRecord = semanticZoomMode && (
+    activeBuildMode !== "paint" ||
+    (
+      selectedPlacementState.optimisticPaintAreaId === null &&
+      selectedPendingPaint === null
+    )
+  );
 
   useEffect(() => {
     if (selectedArea !== null) {
@@ -4850,6 +5842,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       areaInspectionAbortRef.current?.abort();
       areaDetailsAbortRef.current?.abort();
       visibleAreaFetchAbortRef.current?.abort();
+      visibleAreaFetchKeyRef.current = null;
+      selectedPixelFetchAbortRef.current?.abort();
+      rectangleAnchorPrefetchAbortRef.current?.abort();
     };
   }, []);
 
@@ -4902,7 +5897,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }, [fetchVisibleAreaPreviewWindow, visibleAreaPrefetchBounds]);
 
   useEffect(() => {
-    if (selectedArea === null || !selectedArea.viewer_can_edit || isClaimAreaSummary(selectedArea)) {
+    if (selectedArea === null || isClaimAreaSummary(selectedArea)) {
       areaDetailsAbortRef.current?.abort();
       areaDetailsAbortRef.current = null;
       setAreaDetailsBusy(false);
@@ -4966,22 +5961,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return;
     }
 
-    const isInsideWorld = activeChunks.length === 0
-      ? selectedPixel.x >= activeWorldBounds.minX &&
-        selectedPixel.x < activeWorldBounds.maxX &&
-        selectedPixel.y >= activeWorldBounds.minY &&
-        selectedPixel.y < activeWorldBounds.maxY
-      : activeChunks.some((chunk) => (
-        selectedPixel.x >= chunk.origin_x &&
-        selectedPixel.x < chunk.origin_x + chunk.width &&
-        selectedPixel.y >= chunk.origin_y &&
-        selectedPixel.y < chunk.origin_y + chunk.height
-      ));
+    const isInsideWorld = isPixelInsideActiveWorldBounds(selectedPixel, activeWorldBounds, activeChunks);
 
     if (!isInsideWorld) {
       return;
     }
 
+    let abortController: AbortController | null = null;
     let cancelled = false;
     const pixelKey = getPixelKey(selectedPixel);
     const now = performance.now();
@@ -5008,6 +5994,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         return;
       }
 
+      selectedPixelFetchAbortRef.current?.abort();
+      abortController = new AbortController();
+      selectedPixelFetchAbortRef.current = abortController;
       markPerfEvent("selected pixel fetch start", pixelKey);
 
       void fetchVisibleWorldPixels(
@@ -5015,7 +6004,16 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         selectedPixel.x,
         selectedPixel.y,
         selectedPixel.y,
+        abortController.signal,
       ).then((result) => {
+        if (abortController?.signal.aborted) {
+          return;
+        }
+
+        if (selectedPixelFetchAbortRef.current === abortController) {
+          selectedPixelFetchAbortRef.current = null;
+        }
+
         if (selectedPixelFetchKeyRef.current === pixelKey) {
           selectedPixelFetchKeyRef.current = null;
         }
@@ -5032,48 +6030,33 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
         selectedPixelFetchMissesRef.current.delete(pixelKey);
         markPerfEvent("selected pixel fetch done", pixelKey);
-        measureDebugWork("Apply selected pixel fetch", () => {
-          const next = [...visiblePixelsRef.current];
-          const index = new Map(next.map((pixel, currentIndex) => [getPixelKey(pixel), currentIndex]));
-
-          for (const pixel of result.pixels) {
-            const pixelKeyValue = getPixelKey(pixel);
-            const existingIndex = index.get(pixelKeyValue);
-
-            if (existingIndex === undefined) {
-              index.set(pixelKeyValue, next.length);
-              next.push(pixel);
-            } else {
-              next[existingIndex] = pixel;
-            }
-          }
-
-          visiblePixelsRef.current = next;
-          pixelIndexRef.current = new Map(next.map((pixel) => [getPixelKey(pixel), pixel]));
-          syncSelectedPlacementState(selectedPixelSnapshotRef.current);
-          syncInspectedPixelRecord();
-        }, `${result.pixels.length} fetched, ${visiblePixelsRef.current.length} current`);
+        mergeFetchedPixelsIntoVisibleWindow(result.pixels, {
+          minX: result.min_x,
+          maxX: result.max_x,
+          minY: result.min_y,
+          maxY: result.max_y,
+        }, result.truncated, "Apply selected pixel fetch");
       });
     }, SELECTED_PIXEL_FETCH_DEBOUNCE_MS);
 
     return () => {
       cancelled = true;
       window.clearTimeout(timeoutId);
+      abortController?.abort();
+      if (selectedPixelFetchAbortRef.current === abortController) {
+        selectedPixelFetchAbortRef.current = null;
+      }
       if (selectedPixelFetchKeyRef.current === pixelKey) {
         selectedPixelFetchKeyRef.current = null;
       }
     };
   }, [
     activeChunks,
-    activeWorldBounds.maxX,
-    activeWorldBounds.maxY,
-    activeWorldBounds.minX,
-    activeWorldBounds.minY,
+    activeWorldBounds,
     canFetchSelectedPixelRecord,
+    mergeFetchedPixelsIntoVisibleWindow,
     selectedPixel,
     selectedPixelRecord,
-    syncInspectedPixelRecord,
-    syncSelectedPlacementState,
   ]);
 
   const renderedPendingClaims = useMemo(() => {
@@ -5095,16 +6078,16 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     );
   }, [camera, claimOutlineSegments]);
 
-  const renderedPendingPaints = useMemo(() => {
+  const pendingPaintTiles = useMemo(() => {
     return measureDebugWork(
-      "Compute pending paint overlay",
-      () => buildPendingPaintSegments(pendingPaints, camera),
-      (segments) => `${segments.length} segments from ${pendingPaints.length} pixels`,
+      "Compute pending paint canvas tiles",
+      () => buildPendingPaintCanvasTiles(pendingPaints),
+      (tiles) => `${tiles.length} tiles from ${pendingPaints.length} pixels`,
     );
-  }, [camera, pendingPaints]);
+  }, [pendingPaints]);
 
   const selectedPixelOverlay = useMemo(() => {
-    if (selectedPixel === null) {
+    if (selectedPixel === null || !selectedPlacementState.isInsideWorld) {
       return null;
     }
 
@@ -5113,7 +6096,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       top: worldPixelScreenTop(selectedPixel.y, camera),
       size: camera.zoom,
     };
-  }, [camera, selectedPixel]);
+  }, [camera, selectedPixel, selectedPlacementState.isInsideWorld]);
 
   const hoverPixelOverlay = useMemo(() => {
     if (
@@ -5130,6 +6113,26 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       size: camera.zoom,
     };
   }, [camera, hoveredPixel, selectedPixel]);
+
+  const paintCursorOverlay = useMemo<PaintCursorOverlay | null>(() => {
+    if (
+      hoveredPixel === null ||
+      !buildPanelOpen ||
+      activeBuildMode !== "paint" ||
+      paintTool !== "brush"
+    ) {
+      return null;
+    }
+
+    return {
+      key: getPixelKey(hoveredPixel),
+      left: camera.x + hoveredPixel.x * camera.zoom,
+      top: worldPixelScreenTop(hoveredPixel.y, camera),
+      size: camera.zoom,
+      color: PIXEL_PALETTE_COLOR_BY_ID.get(selectedColorId) ?? "#ffffff",
+      isTransparent: selectedColorId === TRANSPARENT_COLOR_ID,
+    };
+  }, [activeBuildMode, buildPanelOpen, camera, hoveredPixel, paintTool, selectedColorId]);
 
   const canClaimSelectedPixel = selectedPlacementState.canClaim;
   const canPaintSelectedPixel = selectedPlacementState.canPaint;
@@ -5200,6 +6203,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return "Zoom in until the pixel grid is visible before staging changes.";
     }
 
+    if (activeBuildMode === "claim" && claimTool === "rectangle" && rectanglePlacementBusy) {
+      return "Checking nearby claims for the current rectangle before staging it.";
+    }
+
     if (selectedPixel === null) {
       if (activeBuildMode === "claim") {
         if (claimAreaMode === "new" && currentUser !== null && newAreaBlockedReason !== null) {
@@ -5257,7 +6264,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     if (paintTool === "picker") {
-      return "Picker copies a painted color from the canvas. Click a painted cell with the picker, or press the middle mouse button for a quick pick.";
+      return "Picker copies a painted color from the canvas. Click a painted cell with the picker.";
     }
 
     if (paintTool === "eraser") {
@@ -5273,7 +6280,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     if (canPaintSelectedPixel) {
-      return "Color Pixel mode paints owned or contributed territory. Choose a palette color or Transparent, press Space over cells, then submit. Saved pixels use your Color Pixel balance.";
+      return "Color Pixel mode stages instantly with the selected brush color. Submit validates access and saves owned or contributed territory.";
     }
 
     if (selectedPixelRecord === null || selectedPlacementState.isPendingClaim) {
@@ -5297,6 +6304,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     newAreaBlockedReason,
     paintTool,
     rectangleAnchor,
+    rectanglePlacementBusy,
     semanticZoomMode,
     selectedPendingPaint,
     selectedPixel,
@@ -5323,17 +6331,29 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     const hoverPixel = screenPointToWorldPixel(nextPointer.x, nextPointer.y, cameraRef.current);
+    const isInsideWorld = isPixelInsideActiveWorld(hoverPixel);
+    const crosshairColor = isInsideWorld ? "var(--crosshair)" : "var(--crosshair-outside)";
+
+    horizontalLine.style.background = crosshairColor;
+    verticalLine.style.background = crosshairColor;
+    horizontalLine.style.display = "block";
+    verticalLine.style.display = "block";
+    horizontalLine.style.transform = `translateY(${Math.round(nextPointer.y)}px)`;
+    verticalLine.style.transform = `translateX(${Math.round(nextPointer.x)}px)`;
+
+    if (!isInsideWorld) {
+      hoverValue.textContent = "-- : --";
+      setHoveredPixel((current) => (current === null ? current : null));
+      return;
+    }
+
     setHoveredPixel((current) => (
       current !== null && current.x === hoverPixel.x && current.y === hoverPixel.y
         ? current
         : hoverPixel
     ));
-    horizontalLine.style.display = "block";
-    verticalLine.style.display = "block";
-    horizontalLine.style.transform = `translateY(${Math.round(nextPointer.y)}px)`;
-    verticalLine.style.transform = `translateX(${Math.round(nextPointer.x)}px)`;
     hoverValue.textContent = `${hoverPixel.x} : ${hoverPixel.y}`;
-  }, []);
+  }, [isPixelInsideActiveWorld]);
 
   const schedulePointerVisual = useCallback((): void => {
     if (pointerVisualFrameRef.current !== null) {
@@ -5348,7 +6368,17 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   useEffect(() => {
     schedulePointerVisual();
-  }, [camera.x, camera.y, camera.zoom, schedulePointerVisual]);
+  }, [
+    activeChunks,
+    activeWorldBounds.maxX,
+    activeWorldBounds.maxY,
+    activeWorldBounds.minX,
+    activeWorldBounds.minY,
+    camera.x,
+    camera.y,
+    camera.zoom,
+    schedulePointerVisual,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -5362,12 +6392,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     targetPixel: PixelCoordinate,
     options?: { activateBrush?: boolean; quiet?: boolean },
   ): boolean => {
-    setSelectedPixel((current) => (
-      current !== null && current.x === targetPixel.x && current.y === targetPixel.y
-        ? current
-        : targetPixel
-    ));
-
     const targetState = getPlacementState(targetPixel);
 
     if (!targetState.isInsideWorld) {
@@ -5379,6 +6403,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       }
       return false;
     }
+
+    setSelectedPixel((current) => (
+      current !== null && current.x === targetPixel.x && current.y === targetPixel.y
+        ? current
+        : targetPixel
+    ));
 
     const pickedColorId = targetState.pendingPaint?.colorId ?? targetState.pixelRecord?.color_id ?? null;
 
@@ -5393,6 +6423,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     setSelectedColorId(pickedColorId);
+    emitDebugEvent(
+      "action",
+      "Brush color picked",
+      `${targetPixel.x}:${targetPixel.y} -> #${pickedColorId}${options?.activateBrush ? " and brush activated" : ""}`,
+    );
 
     if (options?.activateBrush) {
       setPaintTool("brush");
@@ -5411,19 +6446,176 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return true;
   }, [getPlacementState]);
 
+  const stagePaintBrushPixels = useCallback((
+    targetPixels: PixelCoordinate[],
+    options?: Pick<StagePixelOptions, "quiet" | "updateSelection">,
+  ): Set<string> => {
+    const stagedKeys = new Set<string>();
+
+    if (targetPixels.length === 0) {
+      return stagedKeys;
+    }
+
+    if (options?.updateSelection !== false) {
+      const lastPixel = targetPixels[targetPixels.length - 1];
+      setSelectedPixel((current) => (
+        current !== null && current.x === lastPixel.x && current.y === lastPixel.y
+          ? current
+          : lastPixel
+      ));
+    }
+
+    const nextUser = currentUserRef.current;
+
+    if (nextUser === null) {
+      if (!options?.quiet) {
+        setPlacementMessage({ tone: "error", text: "Login required to use the build tools." });
+      }
+      return stagedKeys;
+    }
+
+    const selectedColorIdValue = selectedColorIdRef.current;
+    const nextPaints = [...pendingPaintsRef.current];
+    const paintIndexByKey = new Map<string, number>();
+    const nextPaintMap = new Map<string, PendingPaint>();
+    const availablePixels = getCurrentDisplayedNormalPixels(nextUser);
+    let changed = false;
+    let blockedOutsidePaintableArea = false;
+    let notEnoughPixels = false;
+    let optimisticPaintDetail: string | null = null;
+
+    for (let index = 0; index < nextPaints.length; index += 1) {
+      const paint = nextPaints[index];
+      const paintKey = getPixelKey(paint);
+      paintIndexByKey.set(paintKey, index);
+      nextPaintMap.set(paintKey, paint);
+    }
+
+    for (const targetPixel of targetPixels) {
+      const targetState = getPlacementState(targetPixel);
+
+      if (!targetState.canPaint) {
+        blockedOutsidePaintableArea = true;
+
+        if (targetState.pixelRecord === null && targetState.isInsideWorld) {
+          const now = performance.now();
+
+          if (now - lastPaintBlockedMissingPixelAtRef.current > 1000) {
+            lastPaintBlockedMissingPixelAtRef.current = now;
+            emitDebugEvent(
+              "warning",
+              "Paint blocked outside active paintable area",
+              `${targetPixel.x}:${targetPixel.y}; visible records ${visiblePixelsRef.current.length}; active paintable areas ${ownedAreasRef.current.filter((area) => area.status === "active" && area.viewer_can_paint).length}`,
+            );
+          }
+        }
+
+        continue;
+      }
+
+      const paintKey = getPixelKey(targetPixel);
+      const existingPaintIndex = paintIndexByKey.get(paintKey);
+
+      if (
+        existingPaintIndex !== undefined &&
+        nextPaints[existingPaintIndex].colorId === selectedColorIdValue
+      ) {
+        stagedKeys.add(paintKey);
+        continue;
+      }
+
+      if (existingPaintIndex === undefined && nextPaints.length >= availablePixels) {
+        notEnoughPixels = true;
+        break;
+      }
+
+      const nextPaint: PendingPaint = {
+        ...targetPixel,
+        colorId: selectedColorIdValue,
+      };
+
+      if (existingPaintIndex === undefined) {
+        paintIndexByKey.set(paintKey, nextPaints.length);
+        nextPaints.push(nextPaint);
+      } else {
+        nextPaints[existingPaintIndex] = nextPaint;
+      }
+
+      nextPaintMap.set(paintKey, nextPaint);
+
+      stagedKeys.add(paintKey);
+      changed = true;
+
+      if (targetState.pixelRecord === null && optimisticPaintDetail === null) {
+        optimisticPaintDetail =
+          `${targetPixel.x}:${targetPixel.y} in ${targetState.optimisticPaintAreaName ?? targetState.optimisticPaintAreaId ?? "active paintable area"}; backend validates exact claimed pixel on submit`;
+      }
+    }
+
+    if (changed) {
+      syncPendingPaints(nextPaints, nextPaintMap);
+    }
+
+    if (optimisticPaintDetail !== null) {
+      const now = performance.now();
+
+      if (now - lastOptimisticPaintDebugAtRef.current > 2500) {
+        lastOptimisticPaintDebugAtRef.current = now;
+        emitDebugEvent("action", "Paint staged optimistically", optimisticPaintDetail);
+      }
+    }
+
+    if (!options?.quiet) {
+      if (notEnoughPixels) {
+        setPlacementMessage({
+          tone: "error",
+          text: "Not enough Color Pixels for more pending paint.",
+        });
+      } else if (stagedKeys.size > 0) {
+        setPlacementMessage({
+          tone: "info",
+          text: `${nextPaints.length} pixel${nextPaints.length === 1 ? "" : "s"} staged locally.`,
+        });
+      } else if (blockedOutsidePaintableArea) {
+        setPlacementMessage({
+          tone: "error",
+          text: "Color Pixel mode only paints territory you own or were invited into.",
+        });
+      }
+    }
+
+    return stagedKeys;
+  }, [getPlacementState, syncPendingPaints]);
+
   const stageActiveToolPixel = useCallback((
     targetPixel: PixelCoordinate,
-    options?: { quiet?: boolean },
+    options?: StagePixelOptions,
   ): boolean => {
-    setSelectedPixel((current) => (
-      current !== null && current.x === targetPixel.x && current.y === targetPixel.y
-        ? current
-        : targetPixel
-    ));
+    if (!isPixelInsideActiveWorld(targetPixel)) {
+      if (!options?.quiet) {
+        setPlacementMessage({
+          tone: "error",
+          text: "This cell is outside the active world.",
+        });
+      }
+      return false;
+    }
+
+    if (options?.updateSelection !== false) {
+      setSelectedPixel((current) => (
+        current !== null && current.x === targetPixel.x && current.y === targetPixel.y
+          ? current
+          : targetPixel
+      ));
+    }
 
     const activeMode = activeBuildModeRef.current;
 
     if (activeMode === "paint" && paintToolRef.current === "picker") {
+      if (options?.allowPicker === false) {
+        return false;
+      }
+
       return pickPaintColorAtPixel(targetPixel, {
         activateBrush: true,
         quiet: options?.quiet,
@@ -5431,7 +6623,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     if (activeMode === "paint" && paintToolRef.current === "eraser") {
-      return removePendingPaintAtPixel(targetPixel, options);
+      return removePendingPaintAtPixel(targetPixel, {
+        quiet: options?.quiet,
+        updateSelection: options?.updateSelection,
+      });
     }
 
     const nextUser = currentUserRef.current;
@@ -5442,9 +6637,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return false;
     }
 
-    const targetState = getPlacementState(targetPixel);
-
     if (activeMode === "claim") {
+      const targetState = getPlacementState(targetPixel);
       const activeClaimMode = claimAreaModeRef.current;
       const activeClaimTargetAreaId = claimTargetAreaIdRef.current;
 
@@ -5523,43 +6717,23 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return true;
     }
 
-    if (!targetState.canPaint) {
-      if (!options?.quiet) {
-        setPlacementMessage({
-          tone: "error",
-          text: "Color Pixel mode only paints territory you own or were invited into.",
-        });
-      }
-      return false;
+    return stagePaintBrushPixels([targetPixel], {
+      quiet: options?.quiet,
+      updateSelection: false,
+    }).size > 0;
+  }, [
+    getPlacementState,
+    isPixelInsideActiveWorld,
+    pickPaintColorAtPixel,
+    removePendingPaintAtPixel,
+    stagePaintBrushPixels,
+    syncPendingClaims,
+  ]);
+
+  const stageClaimRectangle = useCallback(async (start: PixelCoordinate, end: PixelCoordinate): Promise<boolean> => {
+    if (isPixelInsideActiveWorld(end)) {
+      setSelectedPixel(end);
     }
-
-    const paintKey = getPixelKey(targetPixel);
-    const nextPaint: PendingPaint = {
-      ...targetPixel,
-      colorId: selectedColorIdRef.current,
-    };
-    const remainingPaints = pendingPaintsRef.current.filter((paint) => getPixelKey(paint) !== paintKey);
-    const updatedPaints = [...remainingPaints, nextPaint];
-    if (updatedPaints.length > getCurrentDisplayedNormalPixels(nextUser)) {
-      if (!options?.quiet) {
-        setPlacementMessage({
-          tone: "error",
-          text: "Not enough Color Pixels for more pending paint.",
-        });
-      }
-      return false;
-    }
-
-    syncPendingPaints(updatedPaints);
-    setPlacementMessage({
-      tone: "info",
-      text: `${updatedPaints.length} pixel${updatedPaints.length === 1 ? "" : "s"} staged locally.`,
-    });
-    return true;
-  }, [getPlacementState, pickPaintColorAtPixel, removePendingPaintAtPixel, syncPendingClaims, syncPendingPaints]);
-
-  const stageClaimRectangle = useCallback((start: PixelCoordinate, end: PixelCoordinate): boolean => {
-    setSelectedPixel(end);
 
     const nextUser = currentUserRef.current;
     if (nextUser === null) {
@@ -5588,97 +6762,89 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     const rectangle = createPendingClaimRectangle(start, end);
-    const pixelMap = pixelIndexRef.current;
+    const pixelMap = claimContextPixelIndexRef.current;
     const bounds = activeWorldBoundsRef.current;
     const activeChunks = activeChunksRef.current;
-    const pendingClaimPixels = pendingClaimPixelsRef.current;
-    const pendingClaimPixelMap = pendingClaimPixelMapRef.current;
-    const pendingClaimRectangles = pendingClaimRectanglesRef.current;
-    const currentPendingClaimCount = getPendingClaimCount(pendingClaimPixels, pendingClaimRectangles);
+    let pendingClaimPixels = pendingClaimPixelsRef.current;
+    let pendingClaimPixelMap = pendingClaimPixelMapRef.current;
+    let pendingClaimRectangles = pendingClaimRectanglesRef.current;
+    let currentPendingClaimCount = getPendingClaimCount(pendingClaimPixels, pendingClaimRectangles);
 
     const displayedHolders = getCurrentDisplayedHolders(nextUser);
-    let touchesClaimRoute = false;
 
     if (bounds === null) {
       setPlacementMessage({ tone: "error", text: "The active world is not ready yet." });
       return false;
     }
 
-    let newPixelCount = 0;
-    let overlapsPendingClaim = false;
+    let placementEvaluation = evaluateClaimRectanglePlacement({
+      rectangle,
+      pixelMap,
+      bounds,
+      activeChunks,
+      pendingClaimPixelMap,
+      pendingClaimRectangles,
+      activeClaimMode,
+      activeClaimTargetAreaId,
+      currentUserId: nextUser.id,
+      startPixel: start,
+    });
 
-    for (let y = rectangle.minY; y <= rectangle.maxY; y += 1) {
-      for (let x = rectangle.minX; x <= rectangle.maxX; x += 1) {
-        const pixel = { x, y };
-        const isInsideWorld = activeChunks.length === 0
-          ? pixel.x >= bounds.minX &&
-            pixel.x < bounds.maxX &&
-            pixel.y >= bounds.minY &&
-            pixel.y < bounds.maxY
-          : activeChunks.some((chunk) => (
-            pixel.x >= chunk.origin_x &&
-            pixel.x < chunk.origin_x + chunk.width &&
-            pixel.y >= chunk.origin_y &&
-            pixel.y < chunk.origin_y + chunk.height
-          ));
-
-        if (!isInsideWorld) {
-          setPlacementMessage({ tone: "error", text: "The rectangle leaves the active world." });
-          return false;
-        }
-
-        const pixelKey = getPixelKey(pixel);
-        if (pixelMap.has(pixelKey)) {
-          setPlacementMessage({
-            tone: "error",
-            text: "The rectangle includes already claimed territory.",
-          });
-          return false;
-        }
-
-        if (hasPendingClaimAtPixel(pixel, pendingClaimPixelMap, pendingClaimRectangles)) {
-          overlapsPendingClaim = true;
-          continue;
-        }
-
-        newPixelCount += 1;
-
-        if (!touchesClaimRoute) {
-          const neighborPixels = [
-            { x: pixel.x - 1, y: pixel.y },
-            { x: pixel.x + 1, y: pixel.y },
-            { x: pixel.x, y: pixel.y - 1 },
-            { x: pixel.x, y: pixel.y + 1 },
-          ];
-
-          touchesClaimRoute = neighborPixels.some((neighborPixel) => {
-            if (hasPendingClaimAtPixel(neighborPixel, pendingClaimPixelMap, pendingClaimRectangles)) {
-              return true;
-            }
-
-            const neighborKey = getPixelKey(neighborPixel);
-            const neighbor = pixelMap.get(neighborKey);
-
-            if (!neighbor) {
-              return false;
-            }
-
-            if (activeClaimMode === "expand") {
-              return neighbor.owner_user_id === nextUser.id && neighbor.area_id === activeClaimTargetAreaId;
-            }
-
-            return neighbor.is_starter || neighbor.owner_user_id !== null;
-          });
-        }
-      }
+    if (!placementEvaluation.touchesClaimRoute && placementEvaluation.unresolvedNeighborCount > 0) {
+      setPlacementMessage({
+        tone: "info",
+        text: "Checking nearby claims for this rectangle. This can take a moment while local claim data finishes loading.",
+      });
+      emitDebugEvent(
+        "action",
+        "Rectangle claim fetch fallback",
+        `${rectangle.minX}:${rectangle.minY} -> ${rectangle.maxX}:${rectangle.maxY}; unresolved neighbors ${placementEvaluation.unresolvedNeighborCount}`,
+      );
+      const resolvedBounds = getClaimRectangleFetchBounds(rectangle, bounds);
+      const fetchResult = await hydrateClaimRectanglePixelWindow(rectangle);
+      pendingClaimPixels = pendingClaimPixelsRef.current;
+      pendingClaimPixelMap = pendingClaimPixelMapRef.current;
+      pendingClaimRectangles = pendingClaimRectanglesRef.current;
+      currentPendingClaimCount = getPendingClaimCount(pendingClaimPixels, pendingClaimRectangles);
+      placementEvaluation = evaluateClaimRectanglePlacement({
+        rectangle,
+        pixelMap: claimContextPixelIndexRef.current,
+        bounds,
+        activeChunks,
+        pendingClaimPixelMap,
+        pendingClaimRectangles,
+        activeClaimMode,
+        activeClaimTargetAreaId,
+        currentUserId: nextUser.id,
+        startPixel: start,
+        resolvedBounds,
+      });
+      emitDebugEvent(
+        "action",
+        "Rectangle claim recheck",
+        `${fetchResult.pixelCount} pixels fetched${fetchResult.truncated ? " (truncated)" : ""}; touch ${placementEvaluation.touchesClaimRoute ? "yes" : "no"}; unresolved neighbors ${placementEvaluation.unresolvedNeighborCount}`,
+      );
     }
 
-    if (newPixelCount === 0) {
+    if (placementEvaluation.blockedReason === "outside-world") {
+      setPlacementMessage({ tone: "error", text: "The rectangle leaves the active world." });
+      return false;
+    }
+
+    if (placementEvaluation.blockedReason === "claimed-territory") {
+      setPlacementMessage({
+        tone: "error",
+        text: "The rectangle includes already claimed territory.",
+      });
+      return false;
+    }
+
+    if (placementEvaluation.newPixelCount === 0) {
       setPlacementMessage({ tone: "info", text: "This rectangle is already staged." });
       return false;
     }
 
-    if (!touchesClaimRoute) {
+    if (!placementEvaluation.touchesClaimRoute) {
       setPlacementMessage({
         tone: "error",
         text: activeClaimMode === "expand"
@@ -5688,7 +6854,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return false;
     }
 
-    if (currentPendingClaimCount + newPixelCount > displayedHolders) {
+    if (currentPendingClaimCount + placementEvaluation.newPixelCount > displayedHolders) {
       setPlacementMessage({
         tone: "error",
         text: "Not enough Holders for the new part of this rectangle.",
@@ -5696,7 +6862,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return false;
     }
 
-    if (currentPendingClaimCount + newPixelCount > CLAIM_BATCH_PIXEL_LIMIT) {
+    if (currentPendingClaimCount + placementEvaluation.newPixelCount > CLAIM_BATCH_PIXEL_LIMIT) {
       setPlacementMessage({
         tone: "error",
         text: `This rectangle would exceed the ${formatCount(CLAIM_BATCH_PIXEL_LIMIT)} pixel batch limit.`,
@@ -5704,7 +6870,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return false;
     }
 
-    if (!overlapsPendingClaim) {
+    if (!placementEvaluation.overlapsPendingClaim) {
       syncPendingClaims(pendingClaimPixels, [...pendingClaimRectangles, rectangle]);
     } else {
       const newPixels: PixelCoordinate[] = [];
@@ -5723,10 +6889,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     setPlacementMessage({
       tone: "info",
-      text: `${newPixelCount} rectangle claim${newPixelCount === 1 ? "" : "s"} staged locally.`,
+      text: `${placementEvaluation.newPixelCount} rectangle claim${placementEvaluation.newPixelCount === 1 ? "" : "s"} staged locally.`,
     });
     return true;
-  }, [syncPendingClaims]);
+  }, [hydrateClaimRectanglePixelWindow, isPixelInsideActiveWorld, syncPendingClaims]);
 
   const stageSpaceStroke = useCallback((targetPixel: PixelCoordinate): void => {
     if (activeBuildModeRef.current === "paint" && paintToolRef.current === "picker") {
@@ -5744,21 +6910,32 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     const linePixels = stroke.lastPixel ? getPixelLine(stroke.lastPixel, targetPixel) : [targetPixel];
+    const freshPixels = linePixels.filter((pixel) => !stroke.visitedKeys.has(getPixelKey(pixel)));
 
-    for (const pixel of linePixels) {
-      const pixelKey = getPixelKey(pixel);
+    if (activeBuildModeRef.current === "paint" && paintToolRef.current === "brush") {
+      const stagedKeys = stagePaintBrushPixels(freshPixels, {
+        quiet: true,
+        updateSelection: false,
+      });
 
-      if (stroke.visitedKeys.has(pixelKey)) {
-        continue;
+      for (const stagedKey of stagedKeys) {
+        stroke.visitedKeys.add(stagedKey);
       }
 
-      if (stageActiveToolPixel(pixel, { quiet: true })) {
+      stroke.lastPixel = targetPixel;
+      return;
+    }
+
+    for (const pixel of freshPixels) {
+      const pixelKey = getPixelKey(pixel);
+
+      if (stageActiveToolPixel(pixel, { allowPicker: false, quiet: true, updateSelection: false })) {
         stroke.visitedKeys.add(pixelKey);
       }
     }
 
     stroke.lastPixel = targetPixel;
-  }, [stageActiveToolPixel]);
+  }, [stageActiveToolPixel, stagePaintBrushPixels]);
 
   const stageRightEraseStroke = useCallback((targetPixel: PixelCoordinate): void => {
     const stroke = rightEraseStrokeRef.current;
@@ -5776,7 +6953,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         continue;
       }
 
-      if (removePendingPaintAtPixel(pixel, { quiet: true })) {
+      if (removePendingPaintAtPixel(pixel, { quiet: true, updateSelection: false })) {
         stroke.visitedKeys.add(pixelKey);
       }
     }
@@ -5866,6 +7043,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   function handleViewportContextMenu(event: React.MouseEvent<HTMLDivElement>): void {
     event.preventDefault();
     const targetPixel = getMouseEventPixel(event);
+
+    if (!isPixelInsideActiveWorld(targetPixel)) {
+      return;
+    }
 
     if (buildPanelOpenRef.current && activeBuildModeRef.current === "paint") {
       removePendingPaintAtPixel(targetPixel, { quiet: true });
@@ -5959,7 +7140,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>): void {
     if (event.button === 1 && buildPanelOpenRef.current && activeBuildModeRef.current === "paint") {
       updatePointer(event);
-      pickPaintColorAtPixel(getEventPixel(event));
       event.preventDefault();
       return;
     }
@@ -5967,6 +7147,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     if (event.button === 2 && buildPanelOpenRef.current && activeBuildModeRef.current === "paint") {
       updatePointer(event);
       const targetPixel = getEventPixel(event);
+
+      if (!isPixelInsideActiveWorld(targetPixel)) {
+        event.preventDefault();
+        return;
+      }
+
       rightEraseStrokeRef.current = {
         pointerId: event.pointerId,
         visitedKeys: new Set(),
@@ -6063,6 +7249,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) <= CLICK_DISTANCE) {
       const clickedPixel = getEventPixel(event);
+
+      if (!isPixelInsideActiveWorld(clickedPixel)) {
+        return;
+      }
+
       setSelectedPixel(clickedPixel);
       setPlacementMessage(null);
 
@@ -6088,17 +7279,62 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       ) {
         const anchor = rectangleAnchorRef.current;
 
+        if (rectanglePlacementBusyRef.current) {
+          emitDebugEvent("action", "Rectangle claim validation ignored", "busy");
+          setPlacementMessage({
+            tone: "info",
+            text: "Still checking nearby claims for the current rectangle. Please wait a moment.",
+          });
+          return;
+        }
+
         if (anchor === null) {
           setRectangleAnchor(clickedPixel);
           setPlacementMessage({
             tone: "info",
             text: "Rectangle start set. Click the opposite corner to stage the claim.",
           });
+          void prefetchRectangleAnchorWindow(clickedPixel);
           return;
         }
 
-        stageClaimRectangle(anchor, clickedPixel);
-        setRectangleAnchor(null);
+        const rectangleKey = `${anchor.x}:${anchor.y} -> ${clickedPixel.x}:${clickedPixel.y}`;
+        const validationStartedAt = performance.now();
+        setRectanglePlacementBusyState(true);
+        setPlacementMessage({
+          tone: "info",
+          text: "Checking nearby claims for this rectangle. This can take a moment while local claim data finishes loading.",
+        });
+        emitDebugEvent("action", "Rectangle claim validation start", rectangleKey);
+        void (async () => {
+          let outcome = "blocked";
+
+          try {
+            const staged = await stageClaimRectangle(anchor, clickedPixel);
+            outcome = staged ? "staged" : "blocked";
+          } catch (error) {
+            outcome = "error";
+            emitDebugEvent(
+              "warning",
+              "Rectangle claim validation failed",
+              error instanceof Error ? error.message : "Unknown error",
+            );
+            setPlacementMessage({
+              tone: "error",
+              text: "Rectangle validation failed. Please try again.",
+            });
+          } finally {
+            setRectangleAnchor(null);
+            setRectanglePlacementBusyState(false);
+            emitDebugEvent(
+              "action",
+              "Rectangle claim validation done",
+              `${rectangleKey}; ${outcome}`,
+              performance.now() - validationStartedAt,
+            );
+          }
+        })();
+        return;
       }
     }
   }
@@ -6231,6 +7467,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     visiblePixelsRef.current = nextPixels;
     pixelIndexRef.current = new Map(nextPixels.map((pixel) => [getPixelKey(pixel), pixel]));
+    claimContextPixelIndexRef.current = mergeClaimContextPixels(
+      claimContextPixelIndexRef.current,
+      nextPixels.map((pixel) => toClaimContextPixelRecord(pixel)),
+    );
     syncSelectedPlacementState(selectedPixelSnapshotRef.current);
     syncInspectedPixelRecord();
     currentUserRef.current = nextUser;
@@ -6353,18 +7593,36 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       user: result.user,
     }));
     markWorldTilesDirty(result.claim_tiles);
-    await refreshVisiblePixelWindow();
-    await refreshClaimOutlineNow();
-    await refreshOwnedAreas();
-
     applyAreaSelection(cacheClaimAreaSummary(result.area));
-    emitDebugEvent("network", "World overview refresh start", "after claim submit");
-    setWorld(await fetchWorldOverview());
-    emitDebugEvent("network", "World overview refresh done", "after claim submit");
+
+    void (async () => {
+      const refreshStartedAt = performance.now();
+      emitDebugEvent("network", "Claim follow-up refresh start", "pixels, outline, areas, overview");
+      const overviewRefresh = async (): Promise<void> => {
+        emitDebugEvent("network", "World overview refresh start", "after claim submit");
+        setWorld(await fetchWorldOverview());
+        emitDebugEvent("network", "World overview refresh done", "after claim submit");
+      };
+      const results = await Promise.allSettled([
+        refreshVisiblePixelWindow({ force: true }),
+        refreshClaimOutlineNow({ force: true }),
+        refreshOwnedAreas(),
+        overviewRefresh(),
+      ]);
+      const failedCount = results.filter((refreshResult) => refreshResult.status === "rejected").length;
+
+      emitDebugEvent(
+        failedCount > 0 ? "warning" : "network",
+        failedCount > 0 ? "Claim follow-up refresh partially failed" : "Claim follow-up refresh done",
+        `${failedCount} failed refresh${failedCount === 1 ? "" : "es"}`,
+        performance.now() - refreshStartedAt,
+      );
+    })();
+
     emitDebugEvent(
       "network",
       "Claim submit done",
-      `area ${result.area.id} with ${result.claim_tiles.length} claim tiles`,
+      `area ${result.area.id} with ${result.claim_tiles.length} claim tile${result.claim_tiles.length === 1 ? "" : "s"}; refresh queued`,
       performance.now() - startedAt,
     );
     return -1;
@@ -6399,21 +7657,55 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }));
     markWorldTilesDirty(result.paint_tiles);
     applySavedPaints(paintsToSubmit, result.user);
-    await refreshClaimOutlineNow();
-    await refreshOwnedAreas();
-    setWorld(await fetchWorldOverview());
     emitDebugEvent(
       "network",
-      "Paint submit done",
+      "Paint submit saved",
       `${result.paint_tiles.length} paint tiles, ${result.claim_tiles.length} claim tiles`,
       performance.now() - startedAt,
     );
+
+    void (async () => {
+      const refreshStartedAt = performance.now();
+      emitDebugEvent("network", "Paint follow-up refresh start", "outline, areas, overview");
+      const overviewRefresh = async (): Promise<void> => {
+        setWorld(await fetchWorldOverview());
+      };
+      const results = await Promise.allSettled([
+        refreshClaimOutlineNow({ force: true }),
+        refreshOwnedAreas(),
+        overviewRefresh(),
+      ]);
+      const failedCount = results.filter((refreshResult) => refreshResult.status === "rejected").length;
+
+      emitDebugEvent(
+        failedCount > 0 ? "warning" : "network",
+        failedCount > 0 ? "Paint follow-up refresh partially failed" : "Paint follow-up refresh done",
+        `${failedCount} failed refresh${failedCount === 1 ? "" : "es"}`,
+        performance.now() - refreshStartedAt,
+      );
+    })();
 
     return -1;
   }
 
   async function handleAreaSave(): Promise<void> {
     if (selectedArea === null || areaPanelBusy) {
+      return;
+    }
+
+    if (areaDraftName.length > AREA_NAME_MAX_LENGTH) {
+      setAreaMessage({
+        tone: "error",
+        text: `Name is limited to ${AREA_NAME_MAX_LENGTH} characters.`,
+      });
+      return;
+    }
+
+    if (areaDraftDescription.length > AREA_DESCRIPTION_MAX_LENGTH) {
+      setAreaMessage({
+        tone: "error",
+        text: `Description is limited to ${AREA_DESCRIPTION_MAX_LENGTH} characters.`,
+      });
       return;
     }
 
@@ -6433,6 +7725,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     applyAreaSelection(cacheClaimAreaSummary(result.area));
     await refreshOwnedAreas();
+    setAreaEditorOpen(false);
     setAreaMessage({
       tone: "success",
       text: "Area info saved.",
@@ -6445,8 +7738,22 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return;
     }
 
+    if (areaDraftName.length > AREA_NAME_MAX_LENGTH || areaDraftDescription.length > AREA_DESCRIPTION_MAX_LENGTH) {
+      setAreaMessage({
+        tone: "error",
+        text: "Area name or description is above the character limit.",
+      });
+      return;
+    }
+
     setAreaPanelBusy(true);
     setAreaMessage(null);
+    const startedAt = performance.now();
+    emitDebugEvent(
+      "network",
+      "Area finish start",
+      `${selectedArea.id}; ${selectedArea.claimed_pixels_count} claimed / ${selectedArea.painted_pixels_count} painted`,
+    );
 
     const result = await updateClaimArea(
       selectedArea.id,
@@ -6460,20 +7767,59 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         tone: "error",
         text: result.error ?? "Area finish failed.",
       });
+      emitDebugEvent(
+        "warning",
+        "Area finish failed",
+        result.error ?? "Unknown area finish failure",
+        performance.now() - startedAt,
+      );
       setAreaPanelBusy(false);
       return;
     }
 
+    markWorldTilesDirty(result.claim_tiles);
     applyAreaSelection(cacheClaimAreaSummary(result.area));
     if (claimTargetAreaIdRef.current === result.area.id) {
       setClaimAreaMode("new");
       setClaimTargetAreaId(null);
     }
     await refreshAuthStatus(false);
-    await refreshVisiblePixelWindow();
-    await refreshClaimOutlineNow();
-    await refreshOwnedAreas();
-    setWorld(await fetchWorldOverview());
+
+    void (async () => {
+      const refreshStartedAt = performance.now();
+      emitDebugEvent(
+        "network",
+        "Area finish follow-up refresh start",
+        `${result.claim_tiles.length} dirty claim tile${result.claim_tiles.length === 1 ? "" : "s"}`,
+      );
+      const overviewRefresh = async (): Promise<void> => {
+        setWorld(await fetchWorldOverview());
+      };
+      const refreshResults = await Promise.allSettled([
+        refreshVisiblePixelWindow({ force: true }),
+        refreshClaimOutlineNow({ force: true }),
+        refreshOwnedAreas(),
+        overviewRefresh(),
+      ]);
+      const failedRefreshCount = refreshResults
+        .filter((refreshResult) => refreshResult.status === "rejected")
+        .length;
+      emitDebugEvent(
+        failedRefreshCount > 0 ? "warning" : "network",
+        failedRefreshCount > 0
+          ? "Area finish follow-up refresh partially failed"
+          : "Area finish follow-up refresh done",
+        `${failedRefreshCount} failed refresh${failedRefreshCount === 1 ? "" : "es"}; ${result.claim_tiles.length} dirty claim tile${result.claim_tiles.length === 1 ? "" : "s"}`,
+        performance.now() - refreshStartedAt,
+      );
+    })();
+
+    emitDebugEvent(
+      "network",
+      "Area finish done",
+      `${result.area.id}; ${result.claim_tiles.length} dirty claim tile${result.claim_tiles.length === 1 ? "" : "s"}; refresh queued`,
+      performance.now() - startedAt,
+    );
     setAreaMessage({
       tone: "success",
       text: "Area finished. You can start another new area if you still have a free slot.",
@@ -6577,6 +7923,64 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setAreaMessage({
       tone: "success",
       text: `Player #${publicId} can now pixel in this area.`,
+    });
+    setAreaPanelBusy(false);
+  }
+
+  async function handleAreaRemoveContributor(publicId: number, displayName: string): Promise<void> {
+    if (selectedArea === null || areaPanelBusy) {
+      return;
+    }
+
+    setAreaPanelBusy(true);
+    setAreaMessage(null);
+    setAreaPlayerOptionsMenu(null);
+
+    const result = await removeAreaContributor(selectedArea.id, publicId);
+
+    if (!result.ok || result.area === null) {
+      setAreaMessage({
+        tone: "error",
+        text: result.error ?? "Contributor removal failed.",
+      });
+      setAreaPanelBusy(false);
+      return;
+    }
+
+    applyAreaSelection(cacheClaimAreaSummary(result.area), { syncDrafts: false });
+    await refreshOwnedAreas();
+    setAreaMessage({
+      tone: "success",
+      text: `Player #${publicId} ${displayName} was removed from this area.`,
+    });
+    setAreaPanelBusy(false);
+  }
+
+  async function handleAreaPromoteContributor(publicId: number, displayName: string): Promise<void> {
+    if (selectedArea === null || areaPanelBusy) {
+      return;
+    }
+
+    setAreaPanelBusy(true);
+    setAreaMessage(null);
+    setAreaPlayerOptionsMenu(null);
+
+    const result = await promoteAreaContributor(selectedArea.id, publicId);
+
+    if (!result.ok || result.area === null) {
+      setAreaMessage({
+        tone: "error",
+        text: result.error ?? "Contributor promote failed.",
+      });
+      setAreaPanelBusy(false);
+      return;
+    }
+
+    applyAreaSelection(cacheClaimAreaSummary(result.area), { syncDrafts: false });
+    await refreshOwnedAreas();
+    setAreaMessage({
+      tone: "success",
+      text: `Player #${publicId} ${displayName} is now an admin for this area.`,
     });
     setAreaPanelBusy(false);
   }
@@ -6829,10 +8233,34 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       areas: finishedVisibleAreas,
     },
   ];
+  const selectedAreaPaintPercent = selectedArea === null || selectedArea.claimed_pixels_count <= 0
+    ? 0
+    : Math.round((selectedArea.painted_pixels_count / selectedArea.claimed_pixels_count) * 100);
+  const selectedAreaCanManage = selectedArea?.viewer_can_edit ?? false;
+  const selectedAreaContributors = isClaimAreaSummary(selectedArea) ? selectedArea.contributors : [];
+  const areaDraftNameLength = areaDraftName.length;
+  const areaDraftDescriptionLength = areaDraftDescription.length;
+  const areaDraftNameTooLong = areaDraftNameLength > AREA_NAME_MAX_LENGTH;
+  const areaDraftDescriptionTooLong = areaDraftDescriptionLength > AREA_DESCRIPTION_MAX_LENGTH;
+  const areaDraftInvalid = areaDraftNameTooLong || areaDraftDescriptionTooLong;
 
   return (
     <main className={`world-shell ${darkMode ? "theme-dark" : "theme-light"}`}>
       <PerfDebugOverlay getSnapshot={getDebugWorldSnapshot} />
+      {process.env.NODE_ENV === "development" && devRecoveryNotice !== null ? (
+        <div className="dev-recovery-notice" role="status">
+          <span>{devRecoveryNotice}</span>
+          <button
+            aria-label="Dismiss development recovery notice"
+            className="dev-recovery-dismiss"
+            onClick={() => setDevRecoveryNotice(null)}
+            title="Dismiss"
+            type="button"
+          >
+            x
+          </button>
+        </div>
+      ) : null}
       <div className="world-hud world-hud-left">
         <div className="hud-stack">
           <button
@@ -6899,10 +8327,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                 <button
                   aria-label="Open area options"
                   className="area-options-button"
-                  onClick={(event) => openAreaOptionsMenu(event, selectedArea.public_id, "area")}
+                  onClick={(event) => (
+                    openAreaOptionsMenu(event, selectedArea.public_id, "area", selectedAreaCanManage)
+                  )}
+                  title="More options"
                   type="button"
                 >
-                  Options
+                  ...
                 </button>
               ) : null}
               <button
@@ -6918,80 +8349,131 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           </div>
           {selectedArea ? (
             <>
-              <div className="area-stat-grid">
-                <article>
-                  <span>Owner</span>
-                  <strong>#{selectedArea.owner.public_id}</strong>
-                  <small>{selectedArea.owner.display_name}</small>
-                </article>
-                <article>
-                  <span>Size</span>
-                  <strong>{selectedArea.claimed_pixels_count}</strong>
-                  <small>{selectedArea.painted_pixels_count} painted</small>
-                </article>
-                <article>
-                  <span>Contributors</span>
-                  <strong>{selectedArea.contributor_count}</strong>
-                  <small>{selectedArea.viewer_can_paint ? "You can pixel here" : "View only"}</small>
-                </article>
-                <article>
-                  <span>Status</span>
-                  <strong>{getClaimAreaStatusLabel(selectedArea.status)}</strong>
-                  <small>
-                    {selectedArea.status === "active"
-                      ? "Finish this area before you start another active one."
-                      : "Finished areas are read-only and stay visible as artwork."}
-                  </small>
-                </article>
+              <div className="area-summary-card">
+                <dl className="area-summary-list">
+                  <div>
+                    <dt>Name</dt>
+                    <dd className="area-summary-name-value">{selectedArea.name}</dd>
+                  </div>
+                  <div>
+                    <dt>Description</dt>
+                    <dd>{selectedArea.description || "No area info yet."}</dd>
+                  </div>
+                  <div>
+                    <dt>Status</dt>
+                    <dd>{getClaimAreaStatusLabel(selectedArea.status)}</dd>
+                  </div>
+                  <div>
+                    <dt>Painted</dt>
+                    <dd>
+                      {selectedArea.painted_pixels_count} / {selectedArea.claimed_pixels_count}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Painted in %</dt>
+                    <dd>{selectedAreaPaintPercent}%</dd>
+                  </div>
+                </dl>
               </div>
-              {selectedArea.viewer_can_edit ? (
-                <div className="area-owner-tools">
-                  <label className="account-label" htmlFor="area-name-input">Name</label>
-                  <input
-                    className="account-input area-input"
-                    id="area-name-input"
-                    maxLength={80}
-                    onChange={(event) => setAreaDraftName(event.target.value)}
-                    value={areaDraftName}
-                  />
-                  <label className="account-label" htmlFor="area-description-input">Info</label>
-                  <textarea
-                    className="account-input area-textarea"
-                    id="area-description-input"
-                    maxLength={1200}
-                    onChange={(event) => setAreaDraftDescription(event.target.value)}
-                    placeholder="What is shown here?"
-                    value={areaDraftDescription}
-                  />
-                  {selectedArea.status === "active" ? (
+              {selectedAreaCanManage && areaEditorOpen ? (
+                <div className="area-edit-card">
+                  <div className="area-field-stack">
+                    <label className="account-label" htmlFor="area-name-input">Name</label>
+                    <input
+                      aria-describedby="area-name-limit"
+                      aria-invalid={areaDraftNameTooLong}
+                      className="account-input area-input"
+                      id="area-name-input"
+                      onChange={(event) => setAreaDraftName(event.target.value)}
+                      value={areaDraftName}
+                    />
+                    <span
+                      className={`area-field-limit ${areaDraftNameTooLong ? "is-error" : ""}`}
+                      id="area-name-limit"
+                    >
+                      {areaDraftNameLength} / {AREA_NAME_MAX_LENGTH}
+                    </span>
+                  </div>
+                  <div className="area-field-stack">
+                    <label className="account-label" htmlFor="area-description-input">Description</label>
+                    <textarea
+                      aria-describedby="area-description-limit"
+                      aria-invalid={areaDraftDescriptionTooLong}
+                      className="account-input area-textarea"
+                      id="area-description-input"
+                      onChange={(event) => setAreaDraftDescription(event.target.value)}
+                      value={areaDraftDescription}
+                    />
+                    <span
+                      className={`area-field-limit ${areaDraftDescriptionTooLong ? "is-error" : ""}`}
+                      id="area-description-limit"
+                    >
+                      {areaDraftDescriptionLength} / {AREA_DESCRIPTION_MAX_LENGTH}
+                    </span>
+                  </div>
+                  <div className="area-inline-actions">
                     <button
                       className="google-button area-action-button"
+                      disabled={areaPanelBusy || areaDraftInvalid}
+                      onClick={() => void handleAreaSave()}
+                      type="button"
+                    >
+                      {areaPanelBusy ? "Saving..." : "Save"}
+                    </button>
+                    <button
+                      className="pixel-clear-button"
                       disabled={areaPanelBusy}
-                      onClick={handleAreaExtend}
+                      onClick={() => setAreaEditorOpen(false)}
                       type="button"
                     >
-                      Extend this area
+                      Cancel
                     </button>
-                  ) : null}
-                  <button
-                    className="google-button area-action-button"
-                    disabled={areaPanelBusy}
-                    onClick={() => void handleAreaSave()}
-                    type="button"
-                  >
-                    {areaPanelBusy ? "Saving..." : "Save area info"}
-                  </button>
-                  {selectedArea.status === "active" ? (
-                    <button
-                      className="google-button area-action-button"
-                      disabled={areaPanelBusy || pendingClaimCount > 0}
-                      onClick={() => void handleAreaFinish()}
-                      type="button"
-                    >
-                      {areaPanelBusy ? "Finishing..." : "Finish area"}
-                    </button>
-                  ) : null}
-                  <label className="account-label" htmlFor="area-invite-input">Invite by #</label>
+                  </div>
+                </div>
+              ) : null}
+              <div className="area-access-card">
+                <div className="area-access-header">
+                  <div className="area-participant">
+                    <AreaParticipantAvatar participant={selectedArea.owner} />
+                    <div className="area-participant-name">
+                      <span>Owner</span>
+                      <strong>#{selectedArea.owner.public_id} {selectedArea.owner.display_name}</strong>
+                    </div>
+                    <span className="area-role-tag is-owner">Owner</span>
+                  </div>
+                </div>
+                <div className="area-access-list">
+                  <span>Invited</span>
+                  {selectedAreaContributors.length > 0 ? (
+                    selectedAreaContributors.map((contributor) => (
+                      <div className="area-access-row" key={contributor.id}>
+                        <div className="area-participant">
+                          <AreaParticipantAvatar participant={contributor} />
+                          <strong>#{contributor.public_id} {contributor.display_name}</strong>
+                          {contributor.role === "admin" ? (
+                            <span className="area-role-tag is-admin">Admin</span>
+                          ) : null}
+                        </div>
+                        {selectedAreaCanManage ? (
+                          <div className="area-player-actions">
+                            <button
+                              aria-label={`Open options for #${contributor.public_id} ${contributor.display_name}`}
+                              className="area-player-options-button"
+                              onClick={(event) => openAreaPlayerOptionsMenu(event, contributor)}
+                              title="Player options"
+                              type="button"
+                            >
+                              ...
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    ))
+                  ) : (
+                    <small>No players invited.</small>
+                  )}
+                </div>
+                {selectedAreaCanManage ? (
                   <div className="area-invite-row">
                     <input
                       className="account-input area-input"
@@ -7002,35 +8484,49 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                       value={areaInvitePublicId}
                     />
                     <button
-                      className="google-button area-action-button"
+                      aria-label="Invite player"
+                      className="area-add-player-button"
                       disabled={areaPanelBusy}
                       onClick={() => void handleAreaInvite()}
+                      title="Invite player"
                       type="button"
                     >
-                      Invite
+                      +
                     </button>
                   </div>
-                  {selectedArea.status === "active" && pendingClaimCount > 0 ? (
-                    <p className="area-description">
-                      Submit your pending Claim Area cells before finishing this active area.
-                    </p>
+                ) : null}
+              </div>
+              {selectedAreaCanManage ? (
+                <div className="area-primary-actions">
+                  {selectedArea.status === "active" ? (
+                    <button
+                      className="google-button area-action-button"
+                      disabled={areaPanelBusy}
+                      onClick={handleAreaExtend}
+                      type="button"
+                    >
+                      Extend Area
+                    </button>
+                  ) : null}
+                  {selectedArea.status === "active" ? (
+                    <button
+                      className="google-button area-action-button area-finish-button"
+                      disabled={areaPanelBusy || pendingClaimCount > 0}
+                      onClick={() => void handleAreaFinish()}
+                      type="button"
+                    >
+                      {areaPanelBusy ? "Finishing..." : "Finish Area"}
+                    </button>
                   ) : null}
                 </div>
-              ) : (
-                <p className="area-description">
-                  {selectedArea.description || "No area info yet."}
-                </p>
-              )}
-              {selectedArea.viewer_can_edit && areaDetailsBusy ? (
-                <p className="area-description">Loading contributor access...</p>
               ) : null}
-              {isClaimAreaSummary(selectedArea) && selectedArea.contributors.length > 0 ? (
-                <div className="area-contributor-list">
-                  <span className="account-label">Can pixel here</span>
-                  {selectedArea.contributors.map((contributor) => (
-                    <small key={contributor.id}>#{contributor.public_id} {contributor.display_name}</small>
-                  ))}
-                </div>
+              {selectedAreaCanManage && selectedArea.status === "active" && pendingClaimCount > 0 ? (
+                <p className="area-description">
+                  Submit your pending Claim Area cells before finishing this active area.
+                </p>
+              ) : null}
+              {areaDetailsBusy ? (
+                <p className="area-description">Loading contributor access...</p>
               ) : null}
             </>
           ) : areaPanelBusy ? (
@@ -7039,10 +8535,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
             <p className="area-description">
               Starter frontier cells are reserved and do not belong to a claim area.
             </p>
-          ) : inspectedPixelRecord?.area_id ? (
-            <p className="area-description">This older claim is not assigned to an area yet.</p>
           ) : (
-            <p className="area-description">No claim area is assigned to this cell.</p>
+            <p className="area-description">No claim area exists at this cell yet.</p>
           )}
           {areaMessage ? (
             <p className={`account-feedback is-${areaMessage.tone}`}>{areaMessage.text}</p>
@@ -7187,7 +8681,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                 >
                   Rectangle
                 </button>
-                {rectangleAnchor ? (
+                {rectanglePlacementBusy ? (
+                  <span>Checking...</span>
+                ) : rectangleAnchor ? (
                   <span>{rectangleAnchor.x} : {rectangleAnchor.y}</span>
                 ) : null}
               </div>
@@ -7245,6 +8741,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                         key={color.id}
                         onClick={() => {
                           setSelectedColorId(color.id);
+                          emitDebugEvent("action", "Brush color selected from palette", `#${color.id} ${color.name}`);
                           setPaintTool("brush");
                         }}
                         style={color.hex === "transparent" ? undefined : { backgroundColor: color.hex }}
@@ -7318,24 +8815,26 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         onPointerLeave={handlePointerLeave}
         ref={viewportRef}
       >
-        <WorldViewportCanvas
-          activeChunkBoundaryRects={activeChunkBoundaryRects}
-          activeChunkViewportRects={activeChunkViewportRects}
-          bulkPendingClaimOverlay={bulkPendingClaimOverlay}
-          claimOutlinePaths={claimOutlinePaths}
-          crosshairHorizontalRef={crosshairHorizontalRef}
-          crosshairVerticalRef={crosshairVerticalRef}
+            <WorldViewportCanvas
+              activeChunkBoundaryRects={activeChunkBoundaryRects}
+              activeChunkViewportRects={activeChunkViewportRects}
+              bulkPendingClaimOverlay={bulkPendingClaimOverlay}
+              camera={camera}
+              claimOutlinePaths={claimOutlinePaths}
+              crosshairHorizontalRef={crosshairHorizontalRef}
+              crosshairVerticalRef={crosshairVerticalRef}
           getVisualTileFallback={getVisualTileFallback}
           getVisualTileSrc={getVisualTileSrc}
           gridLines={gridLines}
           onTileDebugSignal={handleTileDebugSignal}
-          onTileLoaded={handleTileLoaded}
-          outsideArtPatternImages={outsideArtPatternImages}
-          renderedPendingClaims={renderedPendingClaims}
-          renderedPendingPaints={renderedPendingPaints}
-          renderedWorldTiles={renderedWorldTiles}
+              onTileLoaded={handleTileLoaded}
+              outsideArtPatternImages={outsideArtPatternImages}
+              pendingPaintTiles={pendingPaintTiles}
+              renderedPendingClaims={renderedPendingClaims}
+              renderedWorldTiles={renderedWorldTiles}
           retainedVisualTileSrcs={retainedTileSrcRef.current.visual}
           hoverPixelOverlay={hoverPixelOverlay}
+          paintCursorOverlay={paintCursorOverlay}
           selectedPixelOverlay={selectedPixelOverlay}
           viewportSize={viewportSize}
           worldOutsideMaskId={worldOutsideMaskId}
@@ -7851,6 +9350,19 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               <span>Area options</span>
               <strong>{formatClaimAreaId(areaOptionsMenu.publicId)}</strong>
             </div>
+            {areaOptionsMenu.canEdit ? (
+              <button
+                className="area-context-menu-item"
+                onClick={() => {
+                  setAreaEditorOpen(true);
+                  setAreaOptionsMenu(null);
+                }}
+                role="menuitem"
+                type="button"
+              >
+                Edit name / description
+              </button>
+            ) : null}
             <button
               className="area-context-menu-item"
               onClick={() => void copyClaimAreaId(areaOptionsMenu.publicId, areaOptionsMenu.messageTarget)}
@@ -7858,6 +9370,63 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               type="button"
             >
               Copy Area ID
+            </button>
+            <button
+              className="area-context-menu-item"
+              disabled
+              role="menuitem"
+              title="Coming later"
+              type="button"
+            >
+              Report Area
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {areaPlayerOptionsMenu ? (
+        <div
+          className="area-context-menu-layer"
+          onClick={() => setAreaPlayerOptionsMenu(null)}
+          role="presentation"
+        >
+          <div
+            className="area-context-menu area-player-context-menu"
+            onClick={(event) => event.stopPropagation()}
+            role="menu"
+            style={{
+              left: `${areaPlayerOptionsMenu.left}px`,
+              top: `${areaPlayerOptionsMenu.top}px`,
+            }}
+          >
+            <div className="area-context-menu-header">
+              <span>Player options</span>
+              <strong>#{areaPlayerOptionsMenu.publicId} {areaPlayerOptionsMenu.displayName}</strong>
+            </div>
+            <button
+              className="area-context-menu-item"
+              disabled={areaPanelBusy || areaPlayerOptionsMenu.role === "admin"}
+              onClick={() => void handleAreaPromoteContributor(
+                areaPlayerOptionsMenu.publicId,
+                areaPlayerOptionsMenu.displayName,
+              )}
+              role="menuitem"
+              title={areaPlayerOptionsMenu.role === "admin" ? "Already an admin" : undefined}
+              type="button"
+            >
+              Promote to Admin
+            </button>
+            <button
+              className="area-context-menu-item"
+              disabled={areaPanelBusy}
+              onClick={() => void handleAreaRemoveContributor(
+                areaPlayerOptionsMenu.publicId,
+                areaPlayerOptionsMenu.displayName,
+              )}
+              role="menuitem"
+              type="button"
+            >
+              Remove player
             </button>
           </div>
         </div>

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Sequence, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Integer, Sequence, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -28,8 +28,8 @@ class ClaimArea(Base):
         index=True,
         nullable=False,
     )
-    name: Mapped[str] = mapped_column(String(80), default="Untitled area", nullable=False)
-    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    name: Mapped[str] = mapped_column(String(20), default="Untitled area", nullable=False)
+    description: Mapped[str] = mapped_column(String(250), default="", nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
     claimed_pixels_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     painted_pixels_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

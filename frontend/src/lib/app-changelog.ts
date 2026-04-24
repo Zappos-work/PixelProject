@@ -11,6 +11,47 @@ export type ChangelogEntry = {
 
 export const APP_CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.1.10",
+    date: "Apr 24, 2026",
+    sections: [
+      {
+        title: "New Features",
+        items: [
+          "Area owners can now manage invited players directly from Area Info, including promoting contributors to admin access or removing them from an area.",
+          "Area admins can edit area details, invite contributors and manage access without needing to be the original owner.",
+          "Area Info now shows the owner, invited players, avatars, admin badges, paint progress and a focused edit mode for name and description changes.",
+          "Color Pixel brush placement now stages paint immediately while dragging, with a live cursor preview for the selected color or Transparent.",
+        ],
+      },
+      {
+        title: "Improvements",
+        items: [
+          "Large pending paint changes now render through tiled canvas overlays, keeping the world smoother while many Color Pixels are staged.",
+          "Rectangle Claim Area placement now checks nearby claim context before staging when local data is incomplete, reducing invalid rectangle attempts.",
+          "Pixel, claim outline and area refreshes now avoid repeated in-flight requests, abort stale selected-pixel fetches and run follow-up refreshes in parallel after saves.",
+          "Paint saves now patch paint and visual tile caches in place, and world growth progress uses stored painted-pixel counters per chunk.",
+          "Outside-world decorative art now uses deterministic placement slots for more even spacing.",
+        ],
+      },
+      {
+        title: "Bug Fixes",
+        items: [
+          "Claim rectangles no longer depend only on currently visible paint records when checking adjacency and occupied territory.",
+          "Area finishing now returns the exact claim tiles that changed after unpainted cells are released, so the frontend can refresh the right tiles.",
+          "Area name and description limits are enforced consistently in the UI, backend and migration repair.",
+          "Crosshair and build actions now block inactive-world cells more clearly before a player stages work.",
+        ],
+      },
+      {
+        title: "Developer & Tooling",
+        items: [
+          "Database migrations now add contributor roles, backfill role data and keep per-chunk painted-pixel counters repaired.",
+          "Development builds now show a recoverable local-bundle notice when stale Next.js chunks are detected.",
+        ],
+      },
+    ],
+  },
+  {
     version: "0.1.9",
     date: "Apr 23, 2026",
     sections: [

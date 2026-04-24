@@ -156,6 +156,23 @@ export type WorldPixelWindow = {
   pixels: WorldPixel[];
 };
 
+export type ClaimContextPixel = {
+  x: number;
+  y: number;
+  owner_user_id: string | null;
+  area_id: string | null;
+  is_starter: boolean;
+};
+
+export type ClaimContextPixelWindow = {
+  min_x: number;
+  max_x: number;
+  min_y: number;
+  max_y: number;
+  truncated: boolean;
+  pixels: ClaimContextPixel[];
+};
+
 export type ClaimOutlineSegment = {
   orientation: "horizontal" | "vertical";
   line: number;
@@ -278,6 +295,15 @@ const fallbackWorldPixels: WorldPixelWindow = {
   pixels: [],
 };
 
+const fallbackClaimContextPixels: ClaimContextPixelWindow = {
+  min_x: 0,
+  max_x: 0,
+  min_y: 0,
+  max_y: 0,
+  truncated: false,
+  pixels: [],
+};
+
 const fallbackClaimOutline: ClaimOutlineWindow = {
   min_x: 0,
   max_x: 0,
@@ -352,12 +378,15 @@ export type AreaOwnerSummary = {
   id: string;
   public_id: number;
   display_name: string;
+  avatar_url: string | null;
 };
 
 export type AreaContributorSummary = {
   id: string;
   public_id: number;
   display_name: string;
+  avatar_url: string | null;
+  role: "member" | "admin";
 };
 
 export type ClaimAreaStatus = "active" | "finished";
@@ -464,6 +493,7 @@ export type PixelBatchClaimResult = {
 export type ClaimAreaResult = {
   ok: boolean;
   area: ClaimAreaSummary | null;
+  claim_tiles: WorldTileCoordinate[];
   status: number | null;
   error: string | null;
 };
@@ -717,6 +747,36 @@ export async function fetchVisibleWorldPixels(
     return (await response.json()) as WorldPixelWindow;
   } catch {
     return fallbackWorldPixels;
+  }
+}
+
+export async function fetchClaimContextPixels(
+  minX: number,
+  maxX: number,
+  minY: number,
+  maxY: number,
+  signal?: AbortSignal,
+): Promise<ClaimContextPixelWindow> {
+  try {
+    const params = new URLSearchParams({
+      min_x: String(minX),
+      max_x: String(maxX),
+      min_y: String(minY),
+      max_y: String(maxY),
+    });
+    const response = await fetch(`${clientApiBaseUrl}/world/claims/context?${params.toString()}`, {
+      cache: "no-store",
+      credentials: "include",
+      signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Request failed with status ${response.status}`);
+    }
+
+    return (await response.json()) as ClaimContextPixelWindow;
+  } catch {
+    return fallbackClaimContextPixels;
   }
 }
 
@@ -1032,6 +1092,7 @@ export async function fetchClaimArea(areaId: string, signal?: AbortSignal): Prom
       return {
         ok: false,
         area: null,
+        claim_tiles: [],
         status: response.status,
         error: await readApiError(response, "Area request failed."),
       };
@@ -1040,6 +1101,7 @@ export async function fetchClaimArea(areaId: string, signal?: AbortSignal): Prom
     return {
       ok: true,
       area: (await response.json()) as ClaimAreaSummary,
+      claim_tiles: [],
       status: response.status,
       error: null,
     };
@@ -1048,6 +1110,7 @@ export async function fetchClaimArea(areaId: string, signal?: AbortSignal): Prom
       return {
         ok: false,
         area: null,
+        claim_tiles: [],
         status: null,
         error: "Area request aborted.",
       };
@@ -1056,6 +1119,7 @@ export async function fetchClaimArea(areaId: string, signal?: AbortSignal): Prom
     return {
       ok: false,
       area: null,
+      claim_tiles: [],
       status: null,
       error: "Area request failed.",
     };
@@ -1165,14 +1229,21 @@ export async function updateClaimArea(
       return {
         ok: false,
         area: null,
+        claim_tiles: [],
         status: response.status,
         error: await readApiError(response, "Area update failed."),
       };
     }
 
+    const payload = (await response.json()) as {
+      area: ClaimAreaSummary;
+      claim_tiles: WorldTileCoordinate[];
+    };
+
     return {
       ok: true,
-      area: (await response.json()) as ClaimAreaSummary,
+      area: payload.area,
+      claim_tiles: payload.claim_tiles,
       status: response.status,
       error: null,
     };
@@ -1180,6 +1251,7 @@ export async function updateClaimArea(
     return {
       ok: false,
       area: null,
+      claim_tiles: [],
       status: null,
       error: "Area update failed.",
     };
@@ -1204,6 +1276,7 @@ export async function inviteAreaContributor(
       return {
         ok: false,
         area: null,
+        claim_tiles: [],
         status: response.status,
         error: await readApiError(response, "Contributor invite failed."),
       };
@@ -1212,6 +1285,7 @@ export async function inviteAreaContributor(
     return {
       ok: true,
       area: (await response.json()) as ClaimAreaSummary,
+      claim_tiles: [],
       status: response.status,
       error: null,
     };
@@ -1219,8 +1293,85 @@ export async function inviteAreaContributor(
     return {
       ok: false,
       area: null,
+      claim_tiles: [],
       status: null,
       error: "Contributor invite failed.",
+    };
+  }
+}
+
+export async function removeAreaContributor(
+  areaId: string,
+  publicId: number,
+): Promise<ClaimAreaResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/world/areas/${areaId}/contributors/${publicId}`, {
+      method: "DELETE",
+      credentials: "include",
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        area: null,
+        claim_tiles: [],
+        status: response.status,
+        error: await readApiError(response, "Contributor removal failed."),
+      };
+    }
+
+    return {
+      ok: true,
+      area: (await response.json()) as ClaimAreaSummary,
+      claim_tiles: [],
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      area: null,
+      claim_tiles: [],
+      status: null,
+      error: "Contributor removal failed.",
+    };
+  }
+}
+
+export async function promoteAreaContributor(
+  areaId: string,
+  publicId: number,
+): Promise<ClaimAreaResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/world/areas/${areaId}/contributors/${publicId}/promote`, {
+      method: "POST",
+      credentials: "include",
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        area: null,
+        claim_tiles: [],
+        status: response.status,
+        error: await readApiError(response, "Contributor promote failed."),
+      };
+    }
+
+    return {
+      ok: true,
+      area: (await response.json()) as ClaimAreaSummary,
+      claim_tiles: [],
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      area: null,
+      claim_tiles: [],
+      status: null,
+      error: "Contributor promote failed.",
     };
   }
 }

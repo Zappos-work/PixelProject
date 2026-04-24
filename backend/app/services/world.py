@@ -174,11 +174,8 @@ async def count_painted_pixels_in_shape(
         return 0
 
     return await session.scalar(
-        select(func.count(WorldPixel.id)).where(
-            tuple_(WorldPixel.chunk_x, WorldPixel.chunk_y).in_(sorted(coordinates)),
-            WorldPixel.owner_user_id.is_not(None),
-            WorldPixel.is_starter.is_(False),
-            WorldPixel.color_id.is_not(None),
+        select(func.coalesce(func.sum(WorldChunk.painted_pixels_count), 0)).where(
+            tuple_(WorldChunk.chunk_x, WorldChunk.chunk_y).in_(sorted(coordinates)),
         )
     ) or 0
 
@@ -246,6 +243,7 @@ async def build_growth_progress(
 
 async def refresh_world_chunk_claim_counts(session: AsyncSession) -> None:
     await session.execute(text("UPDATE world_chunks SET claimed_pixels_count = 0"))
+    await session.execute(text("UPDATE world_chunks SET painted_pixels_count = 0"))
     await session.execute(
         text(
             """
@@ -258,6 +256,25 @@ async def refresh_world_chunk_claim_counts(session: AsyncSession) -> None:
             )
             UPDATE world_chunks
             SET claimed_pixels_count = counts.claimed_count
+            FROM counts
+            WHERE world_chunks.chunk_x = counts.chunk_x
+              AND world_chunks.chunk_y = counts.chunk_y
+            """
+        )
+    )
+    await session.execute(
+        text(
+            """
+            WITH counts AS (
+                SELECT chunk_x, chunk_y, COUNT(*)::integer AS painted_count
+                FROM world_pixels
+                WHERE owner_user_id IS NOT NULL
+                  AND is_starter IS FALSE
+                  AND color_id IS NOT NULL
+                GROUP BY chunk_x, chunk_y
+            )
+            UPDATE world_chunks
+            SET painted_pixels_count = counts.painted_count
             FROM counts
             WHERE world_chunks.chunk_x = counts.chunk_x
               AND world_chunks.chunk_y = counts.chunk_y

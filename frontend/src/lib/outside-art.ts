@@ -9,18 +9,19 @@ import { OUTSIDE_ART_PATTERN_SIZE, type OutsideArtAsset } from "@/lib/outside-ar
 
 const OUTSIDE_ART_DIRECTORY = path.join(process.cwd(), "public", "outside-art");
 const SUPPORTED_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".avif"]);
-const OUTSIDE_ART_MARGIN = 32;
-const OUTSIDE_ART_CANDIDATE_COUNT = 24;
+const OUTSIDE_ART_MIN_CLEARANCE = 10;
 
 type OutsideArtEntry = {
   fileName: string;
   repeatIndex: number;
 };
 
-type PositionedOutsideArtAsset = OutsideArtAsset & {
+type PlacementSlot = {
+  key: string;
   centerX: number;
   centerY: number;
-  fileName: string;
+  width: number;
+  height: number;
 };
 
 function hashString(value: string): number {
@@ -102,100 +103,64 @@ function buildPlacementEntries(artFiles: string[], repeats: number): OutsideArtE
   return entries;
 }
 
-function getToroidalDistance(ax: number, ay: number, bx: number, by: number): number {
-  const wrappedDx = Math.min(Math.abs(ax - bx), OUTSIDE_ART_PATTERN_SIZE - Math.abs(ax - bx));
-  const wrappedDy = Math.min(Math.abs(ay - by), OUTSIDE_ART_PATTERN_SIZE - Math.abs(ay - by));
-
-  return Math.hypot(wrappedDx, wrappedDy);
+function getRotatedArtDiameter(size: number): number {
+  return size * Math.SQRT2;
 }
 
-function scoreCandidate(
-  candidateFileName: string,
-  candidateSize: number,
-  centerX: number,
-  centerY: number,
-  placedAssets: PositionedOutsideArtAsset[],
-): number {
-  if (placedAssets.length === 0) {
-    return 0;
-  }
+function buildPlacementSlots(entryCount: number): PlacementSlot[] {
+  const columnCount = Math.max(1, Math.ceil(Math.sqrt(entryCount)));
+  const rowCount = Math.max(1, Math.ceil(entryCount / columnCount));
+  const slotWidth = OUTSIDE_ART_PATTERN_SIZE / columnCount;
+  const slotHeight = OUTSIDE_ART_PATTERN_SIZE / rowCount;
+  const slots: PlacementSlot[] = [];
 
-  let minAnyClearance = Number.POSITIVE_INFINITY;
-  let minSameFileClearance = Number.POSITIVE_INFINITY;
-
-  for (const placedAsset of placedAssets) {
-    const distance = getToroidalDistance(centerX, centerY, placedAsset.centerX, placedAsset.centerY);
-    const clearance = distance - (candidateSize + placedAsset.size) * 0.58;
-
-    if (clearance < minAnyClearance) {
-      minAnyClearance = clearance;
-    }
-
-    if (placedAsset.fileName === candidateFileName && clearance < minSameFileClearance) {
-      minSameFileClearance = clearance;
+  for (let row = 0; row < rowCount; row += 1) {
+    for (let column = 0; column < columnCount; column += 1) {
+      slots.push({
+        key: `${column}:${row}`,
+        centerX: slotWidth * column + slotWidth / 2,
+        centerY: slotHeight * row + slotHeight / 2,
+        width: slotWidth,
+        height: slotHeight,
+      });
     }
   }
 
-  if (!Number.isFinite(minSameFileClearance)) {
-    minSameFileClearance = OUTSIDE_ART_PATTERN_SIZE / 2;
-  }
-
-  return minSameFileClearance * 2.6 + minAnyClearance;
+  return slots
+    .sort((left, right) => compareBySeed(left.key, right.key, `slot:${entryCount}`))
+    .slice(0, entryCount);
 }
 
-function placeOutsideArtAsset(
-  entry: OutsideArtEntry,
-  assetCount: number,
-  placedAssets: PositionedOutsideArtAsset[],
-): PositionedOutsideArtAsset {
+function getJitterBudget(slotSize: number, artSize: number): number {
+  const maxOffset = (slotSize - getRotatedArtDiameter(artSize) - OUTSIDE_ART_MIN_CLEARANCE) / 2;
+
+  return Math.max(0, Math.floor(maxOffset));
+}
+
+function placeOutsideArtAsset(entry: OutsideArtEntry, assetCount: number, slot: PlacementSlot): OutsideArtAsset {
   const sizeRange = getArtSizeRange(assetCount);
   const size = pickRange(hashString(`${entry.fileName}:size:${entry.repeatIndex}`), sizeRange.min, sizeRange.max);
-  const minCoordinate = OUTSIDE_ART_MARGIN;
-  const maxCoordinate = OUTSIDE_ART_PATTERN_SIZE - size - OUTSIDE_ART_MARGIN;
-  let bestAsset: PositionedOutsideArtAsset | null = null;
-  let bestScore = Number.NEGATIVE_INFINITY;
-
-  for (let candidateIndex = 0; candidateIndex < OUTSIDE_ART_CANDIDATE_COUNT; candidateIndex += 1) {
-    const x = pickRange(hashString(`${entry.fileName}:x:${entry.repeatIndex}:${candidateIndex}`), minCoordinate, maxCoordinate);
-    const y = pickRange(hashString(`${entry.fileName}:y:${entry.repeatIndex}:${candidateIndex}`), minCoordinate, maxCoordinate);
-    const centerX = x + size / 2;
-    const centerY = y + size / 2;
-    const score =
-      scoreCandidate(entry.fileName, size, centerX, centerY, placedAssets) +
-      hashString(`${entry.fileName}:tie:${entry.repeatIndex}:${candidateIndex}`) / 1_000_000_000;
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestAsset = {
-        key: `${entry.fileName}-${entry.repeatIndex}`,
-        src: path.posix.join("/outside-art", entry.fileName),
-        x,
-        y,
-        size,
-        rotation: pickRange(hashString(`${entry.fileName}:rotation:${entry.repeatIndex}`), -12, 12),
-        opacity: pickRange(hashString(`${entry.fileName}:opacity:${entry.repeatIndex}`), 16, 26) / 100,
-        centerX,
-        centerY,
-        fileName: entry.fileName,
-      };
-    }
-  }
-
-  if (bestAsset !== null) {
-    return bestAsset;
-  }
+  const jitterX = pickRange(
+    hashString(`${entry.fileName}:x:${entry.repeatIndex}:${slot.key}`),
+    -getJitterBudget(slot.width, size),
+    getJitterBudget(slot.width, size),
+  );
+  const jitterY = pickRange(
+    hashString(`${entry.fileName}:y:${entry.repeatIndex}:${slot.key}`),
+    -getJitterBudget(slot.height, size),
+    getJitterBudget(slot.height, size),
+  );
+  const x = Math.round(slot.centerX + jitterX - size / 2);
+  const y = Math.round(slot.centerY + jitterY - size / 2);
 
   return {
     key: `${entry.fileName}-${entry.repeatIndex}`,
     src: path.posix.join("/outside-art", entry.fileName),
-    x: minCoordinate,
-    y: minCoordinate,
+    x,
+    y,
     size,
-    rotation: 0,
-    opacity: 0.2,
-    centerX: minCoordinate + size / 2,
-    centerY: minCoordinate + size / 2,
-    fileName: entry.fileName,
+    rotation: pickRange(hashString(`${entry.fileName}:rotation:${entry.repeatIndex}`), -12, 12),
+    opacity: pickRange(hashString(`${entry.fileName}:opacity:${entry.repeatIndex}`), 16, 26) / 100,
   };
 }
 
@@ -211,13 +176,9 @@ function buildOutsideArtAssets(fileNames: string[]): OutsideArtAsset[] {
 
   const repeats = getRepeatCount(artFiles.length);
   const entries = buildPlacementEntries(artFiles, repeats);
-  const placedAssets: PositionedOutsideArtAsset[] = [];
+  const placementSlots = buildPlacementSlots(entries.length);
 
-  for (const entry of entries) {
-    placedAssets.push(placeOutsideArtAsset(entry, artFiles.length, placedAssets));
-  }
-
-  return placedAssets.map(({ centerX: _centerX, centerY: _centerY, fileName: _fileName, ...asset }) => asset);
+  return entries.map((entry, index) => placeOutsideArtAsset(entry, artFiles.length, placementSlots[index]));
 }
 
 export async function listOutsideArtAssets(): Promise<OutsideArtAsset[]> {

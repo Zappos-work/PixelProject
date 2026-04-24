@@ -89,6 +89,14 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(text("ALTER TABLE users ALTER COLUMN holders_placed_total SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN claimed_pixels_count SET NOT NULL"))
     await connection.execute(
+        text("ALTER TABLE area_contributors ADD COLUMN IF NOT EXISTS role VARCHAR(16)")
+    )
+    await connection.execute(
+        text("UPDATE area_contributors SET role = 'member' WHERE role IS NULL OR role NOT IN ('member', 'admin')")
+    )
+    await connection.execute(text("ALTER TABLE area_contributors ALTER COLUMN role SET DEFAULT 'member'"))
+    await connection.execute(text("ALTER TABLE area_contributors ALTER COLUMN role SET NOT NULL"))
+    await connection.execute(
         text(
             """
             DO $$
@@ -107,9 +115,15 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(
         text("ALTER TABLE world_chunks ADD COLUMN IF NOT EXISTS claimed_pixels_count INTEGER DEFAULT 0")
     )
+    await connection.execute(
+        text("ALTER TABLE world_chunks ADD COLUMN IF NOT EXISTS painted_pixels_count INTEGER DEFAULT 0")
+    )
     await connection.execute(text("ALTER TABLE world_pixels ADD COLUMN IF NOT EXISTS is_starter BOOLEAN DEFAULT FALSE"))
     await connection.execute(
         text("UPDATE world_chunks SET claimed_pixels_count = 0 WHERE claimed_pixels_count IS NULL")
+    )
+    await connection.execute(
+        text("UPDATE world_chunks SET painted_pixels_count = 0 WHERE painted_pixels_count IS NULL")
     )
     await connection.execute(
         text(
@@ -151,6 +165,8 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     )
     await connection.execute(text("ALTER TABLE world_chunks ALTER COLUMN claimed_pixels_count SET DEFAULT 0"))
     await connection.execute(text("ALTER TABLE world_chunks ALTER COLUMN claimed_pixels_count SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE world_chunks ALTER COLUMN painted_pixels_count SET DEFAULT 0"))
+    await connection.execute(text("ALTER TABLE world_chunks ALTER COLUMN painted_pixels_count SET NOT NULL"))
     if (
         settings.world_origin_x == -(settings.world_chunk_size // 2)
         and settings.world_origin_y == -(settings.world_chunk_size // 2)
@@ -307,6 +323,14 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     )
     await connection.execute(text("ALTER TABLE claim_areas ALTER COLUMN public_id SET NOT NULL"))
     await connection.execute(
+        text("UPDATE claim_areas SET name = LEFT(name, 20) WHERE char_length(name) > 20")
+    )
+    await connection.execute(
+        text("UPDATE claim_areas SET description = LEFT(description, 250) WHERE char_length(description) > 250")
+    )
+    await connection.execute(text("ALTER TABLE claim_areas ALTER COLUMN name TYPE VARCHAR(20)"))
+    await connection.execute(text("ALTER TABLE claim_areas ALTER COLUMN description TYPE VARCHAR(250)"))
+    await connection.execute(
         text(
             """
             DO $$
@@ -383,6 +407,7 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
         )
     )
     await connection.execute(text("UPDATE world_chunks SET claimed_pixels_count = 0"))
+    await connection.execute(text("UPDATE world_chunks SET painted_pixels_count = 0"))
     await connection.execute(
         text(
             """
@@ -395,6 +420,25 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
             )
             UPDATE world_chunks
             SET claimed_pixels_count = counts.claimed_count
+            FROM counts
+            WHERE world_chunks.chunk_x = counts.chunk_x
+              AND world_chunks.chunk_y = counts.chunk_y
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            WITH counts AS (
+                SELECT chunk_x, chunk_y, COUNT(*)::integer AS painted_count
+                FROM world_pixels
+                WHERE owner_user_id IS NOT NULL
+                  AND COALESCE(is_starter, FALSE) IS FALSE
+                  AND color_id IS NOT NULL
+                GROUP BY chunk_x, chunk_y
+            )
+            UPDATE world_chunks
+            SET painted_pixels_count = counts.painted_count
             FROM counts
             WHERE world_chunks.chunk_x = counts.chunk_x
               AND world_chunks.chunk_y = counts.chunk_y

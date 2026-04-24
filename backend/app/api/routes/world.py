@@ -10,6 +10,8 @@ from app.schemas.world import (
     AreaContributorInviteRequest,
     ClaimAreaInspection,
     ClaimAreaListResponse,
+    ClaimAreaMutationResponse,
+    ClaimContextPixelWindow,
     ClaimAreaPreviewWindow,
     ClaimOutlineWindow,
     ClaimAreaSummary,
@@ -33,6 +35,7 @@ from app.services.pixels import (
     claim_world_pixel,
     claim_world_pixels,
     ensure_world_tile_png,
+    get_claim_context_pixels,
     get_claim_area_at_pixel,
     get_claim_area_details,
     get_claim_outline_pixels,
@@ -43,6 +46,8 @@ from app.services.pixels import (
     list_owned_claim_areas,
     paint_world_pixels,
     paint_world_pixel,
+    promote_area_contributor,
+    remove_area_contributor,
     update_claim_area_metadata,
 )
 from app.services.world import get_world_overview
@@ -72,6 +77,17 @@ async def world_pixels(
     settings = get_settings()
     viewer = await peek_authenticated_user(request, session, settings)
     return await get_visible_world_pixels(session, min_x, max_x, min_y, max_y, viewer)
+
+
+@router.get("/claims/context", response_model=ClaimContextPixelWindow)
+async def claim_context_pixels(
+    min_x: int = Query(...),
+    max_x: int = Query(...),
+    min_y: int = Query(...),
+    max_y: int = Query(...),
+    session: AsyncSession = Depends(get_db),
+) -> ClaimContextPixelWindow:
+    return await get_claim_context_pixels(session, min_x, max_x, min_y, max_y)
 
 
 @router.get("/claims/outline", response_model=ClaimOutlineWindow)
@@ -274,13 +290,13 @@ async def get_area(
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 
 
-@router.patch("/areas/{area_id}", response_model=ClaimAreaSummary)
+@router.patch("/areas/{area_id}", response_model=ClaimAreaMutationResponse)
 async def patch_area(
     area_id: UUID,
     payload: ClaimAreaUpdateRequest,
     request: Request,
     session: AsyncSession = Depends(get_db),
-) -> ClaimAreaSummary:
+) -> ClaimAreaMutationResponse:
     settings = get_settings()
     user = await resolve_authenticated_user(request, session, settings)
 
@@ -315,5 +331,43 @@ async def post_area_contributor(
 
     try:
         return await invite_area_contributor(session, area_id, user, payload.public_id)
+    except PixelPlacementError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+
+@router.delete("/areas/{area_id}/contributors/{contributor_public_id}", response_model=ClaimAreaSummary)
+async def delete_area_contributor(
+    area_id: UUID,
+    contributor_public_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> ClaimAreaSummary:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, session, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    try:
+        return await remove_area_contributor(session, area_id, user, contributor_public_id)
+    except PixelPlacementError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+
+@router.post("/areas/{area_id}/contributors/{contributor_public_id}/promote", response_model=ClaimAreaSummary)
+async def post_area_contributor_promote(
+    area_id: UUID,
+    contributor_public_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> ClaimAreaSummary:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, session, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    try:
+        return await promote_area_contributor(session, area_id, user, contributor_public_id)
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
