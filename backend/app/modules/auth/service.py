@@ -11,13 +11,13 @@ import httpx
 from fastapi import Request
 from fastapi.responses import RedirectResponse, Response
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.models.auth_session import AuthSession
 from app.models.user import User
-from app.schemas.auth import AuthSessionStatus, AuthUserSummary
+from app.schemas.auth import AuthSessionStatus, AuthUserSummary, ShopItemPurchaseSummary, ShopItemsPurchasedSummary
 
 GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
@@ -33,6 +33,9 @@ AVATAR_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
 AVATAR_RENDER_SIZE = 128
 AVATAR_UPLOAD_MAX_DIMENSION = 4096
 AVATAR_UPLOAD_MAX_PIXELS = 8_000_000
+SHOP_PIXEL_PACK_ITEM_ID = "pixel_pack_50"
+SHOP_MAX_PIXELS_ITEM_ID = "max_pixels_5"
+DELETED_DISPLAY_NAME = "Deleted"
 
 
 class GoogleOAuthError(Exception):
@@ -47,6 +50,13 @@ class DisplayNameUpdateError(Exception):
 
 
 class UserStateError(Exception):
+    def __init__(self, detail: str, status_code: int) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.status_code = status_code
+
+
+class ShopPurchaseError(Exception):
     def __init__(self, detail: str, status_code: int) -> None:
         super().__init__(detail)
         self.detail = detail
@@ -94,6 +104,9 @@ def hash_session_token(token: str, settings: Settings) -> str:
 
 
 def needs_display_name_setup(user: User) -> bool:
+    if user.is_deactivated:
+        return False
+
     return user.display_name_changed_at is None and user.display_name == DEFAULT_DISPLAY_NAME
 
 
@@ -105,6 +118,9 @@ def get_display_name_change_available_at(user: User) -> datetime | None:
 
 
 def can_change_display_name(user: User, now: datetime | None = None) -> bool:
+    if user.is_deactivated:
+        return False
+
     available_at = get_display_name_change_available_at(user)
 
     if available_at is None:
@@ -114,11 +130,29 @@ def can_change_display_name(user: User, now: datetime | None = None) -> bool:
     return current_time >= available_at
 
 
+def get_level_xp_target(level: int, settings: Settings) -> int:
+    return max(1, settings.level_xp_start) + (max(1, level) - 1) * max(1, settings.level_xp_increment)
+
+
+def get_next_level_xp_target(current_target: int, settings: Settings) -> int:
+    return max(1, current_target) + max(1, settings.level_xp_increment)
+
+
+def get_level_progress(total_xp: int, settings: Settings) -> tuple[int, int, int]:
+    remaining_xp = max(0, total_xp)
+    level = 1
+    target = get_level_xp_target(level, settings)
+
+    while remaining_xp >= target:
+        remaining_xp -= target
+        level += 1
+        target = get_next_level_xp_target(target, settings)
+
+    return level, remaining_xp, target
+
+
 def get_user_level(user: User, settings: Settings) -> tuple[int, int, int]:
-    step = max(1, settings.level_up_holders_step)
-    level = 1 + user.holders_placed_total // step
-    progress_current = user.holders_placed_total % step
-    return level, progress_current, step
+    return get_level_progress(max(0, int(user.xp or 0)), settings)
 
 
 def _get_next_regeneration_at(
@@ -165,9 +199,6 @@ def _apply_regenerating_resource(
     current_amount = max(0, int(getattr(user, amount_attr) or 0))
     limit = max(0, int(getattr(user, limit_attr) or 0))
 
-    if current_amount > limit:
-        current_amount = limit
-
     setattr(user, amount_attr, current_amount)
     setattr(user, limit_attr, limit)
 
@@ -177,7 +208,6 @@ def _apply_regenerating_resource(
         return
 
     if current_amount >= limit:
-        setattr(user, amount_attr, limit)
         setattr(user, updated_attr, current_time)
         return
 
@@ -230,6 +260,8 @@ def build_auth_user_summary(user: User, settings: Settings | None = None) -> Aut
     available_at = get_display_name_change_available_at(user)
     current_time = datetime.now(timezone.utc)
     level, progress_current, progress_target = get_user_level(user, resolved_settings)
+    pixel_pack_purchases = max(0, int(user.shop_pixel_pack_50_purchases or 0))
+    max_pixel_purchases = max(0, int(user.shop_max_pixels_5_purchases or 0))
 
     return AuthUserSummary(
         id=user.id,
@@ -240,6 +272,7 @@ def build_auth_user_summary(user: User, settings: Settings | None = None) -> Aut
         avatar_url=user.avatar_url,
         role=user.role,
         is_banned=user.is_banned,
+        is_deactivated=user.is_deactivated,
         holders=user.holders,
         holders_unlimited=user.holders_unlimited,
         holder_limit=user.holder_limit,
@@ -257,9 +290,24 @@ def build_auth_user_summary(user: User, settings: Settings | None = None) -> Aut
         needs_display_name_setup=needs_display_name_setup(user),
         can_change_display_name=available_at is None or current_time >= available_at,
         next_display_name_change_at=available_at,
+        xp=max(0, int(user.xp or 0)),
         level=level,
         level_progress_current=progress_current,
         level_progress_target=progress_target,
+        coins=max(0, int(user.coins or 0)),
+        shop_items_purchased=ShopItemsPurchasedSummary(
+            pixel_pack_50=ShopItemPurchaseSummary(
+                purchased=pixel_pack_purchases,
+                item_size=resolved_settings.shop_pixel_pack_amount,
+                total_received=pixel_pack_purchases * resolved_settings.shop_pixel_pack_amount,
+            ),
+            max_pixels_5=ShopItemPurchaseSummary(
+                purchased=max_pixel_purchases,
+                item_size=resolved_settings.shop_normal_pixel_limit_amount,
+                total_received=max_pixel_purchases * resolved_settings.shop_normal_pixel_limit_amount,
+            ),
+        ),
+        pixels_placed_total=max(0, int(user.pixels_placed_total or 0)),
         holders_placed_total=user.holders_placed_total,
         claimed_pixels_count=user.claimed_pixels_count,
     )
@@ -356,10 +404,31 @@ async def upsert_google_user(
     google_subject = str(profile["sub"])
     email = str(profile["email"]).lower()
 
-    user = await db.scalar(select(User).where(User.google_subject == google_subject))
+    banned_deactivated_user = await db.scalar(
+        select(User).where(
+            User.google_subject == google_subject,
+            User.is_deactivated.is_(True),
+            User.is_banned.is_(True),
+        )
+    )
+
+    if banned_deactivated_user is not None:
+        raise UserStateError("This Google account is banned.", 403)
+
+    user = await db.scalar(
+        select(User).where(
+            User.google_subject == google_subject,
+            User.is_deactivated.is_(False),
+        )
+    )
 
     if user is None:
-        user = await db.scalar(select(User).where(User.email == email))
+        user = await db.scalar(
+            select(User).where(
+                User.email == email,
+                User.is_deactivated.is_(False),
+            )
+        )
 
     now = datetime.now(timezone.utc)
     is_new_user = user is None
@@ -381,6 +450,12 @@ async def upsert_google_user(
             normal_pixels=resolved_settings.normal_pixel_start_amount,
             normal_pixel_limit=resolved_settings.normal_pixel_start_limit,
             normal_pixels_last_updated_at=now,
+            xp=0,
+            level=1,
+            coins=0,
+            shop_pixel_pack_50_purchases=0,
+            shop_max_pixels_5_purchases=0,
+            pixels_placed_total=0,
             holders_placed_total=0,
             claimed_pixels_count=0,
             last_login_at=now,
@@ -390,16 +465,29 @@ async def upsert_google_user(
         user.google_subject = google_subject
         user.email = email
         user.display_name = user.display_name or DEFAULT_DISPLAY_NAME
+        user.is_deactivated = False
+        user.deactivated_at = None
         user.avatar_key = CUSTOM_AVATAR_KEY if user.avatar_url else DEFAULT_AVATAR_KEY
         user.holders_unlimited = bool(user.holders_unlimited)
         user.claim_area_limit = max(1, int(user.claim_area_limit or resolved_settings.claim_area_start_limit))
         user.normal_pixel_limit = max(0, int(user.normal_pixel_limit or resolved_settings.normal_pixel_start_limit))
-        user.normal_pixels = min(
-            max(0, int(user.normal_pixels or resolved_settings.normal_pixel_start_amount)),
-            user.normal_pixel_limit,
-        )
+        user.normal_pixels = max(0, int(user.normal_pixels or resolved_settings.normal_pixel_start_amount))
         if user.normal_pixels_last_updated_at is None:
             user.normal_pixels_last_updated_at = now
+        if user.xp is None:
+            user.xp = max(0, int(user.holders_placed_total or 0))
+        user.xp = max(0, int(user.xp or 0))
+        level, _progress_current, _progress_target = get_user_level(user, resolved_settings)
+        user.level = level
+        user.coins = max(0, int(user.coins or 0))
+        user.shop_pixel_pack_50_purchases = max(0, int(user.shop_pixel_pack_50_purchases or 0))
+        user.shop_max_pixels_5_purchases = max(0, int(user.shop_max_pixels_5_purchases or 0))
+        user.pixels_placed_total = max(0, int(user.pixels_placed_total or user.xp))
+        level_pixel_limit = (
+            resolved_settings.normal_pixel_start_limit
+            + max(0, level - 1) * resolved_settings.level_up_normal_pixel_limit_bonus
+        )
+        user.normal_pixel_limit = max(user.normal_pixel_limit, level_pixel_limit)
         user.last_login_at = now
 
     await db.commit()
@@ -612,6 +700,97 @@ async def apply_normal_pixel_regeneration(
     return user
 
 
+async def deactivate_user_account(
+    db: AsyncSession,
+    user: User,
+    now: datetime | None = None,
+) -> User:
+    current_time = now or datetime.now(timezone.utc)
+
+    user.display_name = DELETED_DISPLAY_NAME
+    user.display_name_changed_at = current_time
+    user.email = None
+    user.avatar_key = DEFAULT_AVATAR_KEY
+    user.avatar_url = None
+    user.is_deactivated = True
+    user.deactivated_at = current_time
+
+    await db.execute(delete(AuthSession).where(AuthSession.user_id == user.id))
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+def grant_pixel_placement_rewards(
+    user: User,
+    placed_pixel_count: int,
+    settings: Settings,
+) -> int:
+    if placed_pixel_count <= 0:
+        return 0
+
+    current_xp = max(0, int(user.xp or 0))
+    current_level, _progress_current, _progress_target = get_level_progress(current_xp, settings)
+    next_xp = current_xp + placed_pixel_count
+    next_level, _next_progress_current, _next_progress_target = get_level_progress(next_xp, settings)
+    gained_levels = max(0, next_level - current_level)
+
+    user.xp = next_xp
+    user.level = next_level
+    user.coins = max(0, int(user.coins or 0)) + placed_pixel_count
+    user.pixels_placed_total = max(0, int(user.pixels_placed_total or 0)) + placed_pixel_count
+
+    if gained_levels > 0:
+        user.coins += gained_levels * settings.level_up_coin_reward
+        user.normal_pixel_limit = max(0, int(user.normal_pixel_limit or 0)) + (
+            gained_levels * settings.level_up_normal_pixel_limit_bonus
+        )
+
+    return gained_levels
+
+
+async def purchase_shop_item(
+    db: AsyncSession,
+    user: User,
+    item_id: str,
+    settings: Settings,
+    quantity: int = 1,
+    now: datetime | None = None,
+) -> User:
+    current_time = now or datetime.now(timezone.utc)
+    purchase_quantity = max(1, min(999, int(quantity)))
+    await apply_normal_pixel_regeneration(db, user, settings, current_time)
+
+    if item_id == SHOP_PIXEL_PACK_ITEM_ID:
+        cost = settings.shop_pixel_pack_cost * purchase_quantity
+        current_coins = max(0, int(user.coins or 0))
+        if current_coins < cost:
+            raise ShopPurchaseError("Not enough Coins.", 409)
+
+        user.coins = current_coins - cost
+        user.normal_pixels = max(0, int(user.normal_pixels or 0)) + (
+            settings.shop_pixel_pack_amount * purchase_quantity
+        )
+        user.shop_pixel_pack_50_purchases = max(0, int(user.shop_pixel_pack_50_purchases or 0)) + purchase_quantity
+    elif item_id == SHOP_MAX_PIXELS_ITEM_ID:
+        cost = settings.shop_normal_pixel_limit_cost * purchase_quantity
+        current_coins = max(0, int(user.coins or 0))
+        if current_coins < cost:
+            raise ShopPurchaseError("Not enough Coins.", 409)
+
+        user.coins = current_coins - cost
+        user.normal_pixel_limit = max(0, int(user.normal_pixel_limit or 0)) + (
+            settings.shop_normal_pixel_limit_amount * purchase_quantity
+        )
+        user.shop_max_pixels_5_purchases = max(0, int(user.shop_max_pixels_5_purchases or 0)) + purchase_quantity
+    else:
+        raise ShopPurchaseError("Unknown shop item.", 422)
+
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
 async def attach_user_session(
     response: Response,
     db: AsyncSession,
@@ -681,6 +860,11 @@ async def resolve_authenticated_user(
         await db.commit()
         return None
 
+    if user.is_deactivated:
+        await db.delete(session_record)
+        await db.commit()
+        return None
+
     await apply_holder_regeneration(db, user, resolved_settings, now)
     await apply_normal_pixel_regeneration(db, user, resolved_settings, now)
     await db.commit()
@@ -710,7 +894,12 @@ async def peek_authenticated_user(
     if session_record.expires_at <= datetime.now(timezone.utc):
         return None
 
-    return await db.get(User, session_record.user_id)
+    user = await db.get(User, session_record.user_id)
+
+    if user is not None and user.is_deactivated:
+        return None
+
+    return user
 
 
 async def clear_user_session(

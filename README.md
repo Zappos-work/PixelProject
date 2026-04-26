@@ -6,7 +6,7 @@ The repository is no longer just a planning sandbox. It already contains a worki
 
 ## Current Status
 
-- Current frontend build marker: `0.2.2`
+- Current frontend build marker: `0.3.0`
 - Production URL: `https://pixel.zappos-dev.work`
 - Local frontend: `http://localhost:3000`
 - Local backend API docs: `http://localhost:8000/docs`
@@ -147,6 +147,14 @@ Important gameplay defaults:
 - `NORMAL_PIXEL_START_AMOUNT=64`
 - `NORMAL_PIXEL_START_LIMIT=64`
 - `NORMAL_PIXEL_REGENERATION_INTERVAL_SECONDS=30`
+- `LEVEL_XP_START=60`
+- `LEVEL_XP_INCREMENT=10`
+- `LEVEL_UP_COIN_REWARD=750`
+- `LEVEL_UP_NORMAL_PIXEL_LIMIT_BONUS=2`
+- `SHOP_PIXEL_PACK_COST=500`
+- `SHOP_PIXEL_PACK_AMOUNT=50`
+- `SHOP_NORMAL_PIXEL_LIMIT_COST=500`
+- `SHOP_NORMAL_PIXEL_LIMIT_AMOUNT=5`
 
 ## Useful Commands
 

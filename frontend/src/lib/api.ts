@@ -92,6 +92,7 @@ export type AuthUser = {
   avatar_url: string | null;
   role: string;
   is_banned: boolean;
+  is_deactivated: boolean;
   holders: number;
   holders_unlimited: boolean;
   holder_limit: number;
@@ -109,9 +110,24 @@ export type AuthUser = {
   needs_display_name_setup: boolean;
   can_change_display_name: boolean;
   next_display_name_change_at: string | null;
+  xp: number;
   level: number;
   level_progress_current: number;
   level_progress_target: number;
+  coins: number;
+  shop_items_purchased: {
+    pixel_pack_50: {
+      purchased: number;
+      item_size: number;
+      total_received: number;
+    };
+    max_pixels_5: {
+      purchased: number;
+      item_size: number;
+      total_received: number;
+    };
+  };
+  pixels_placed_total: number;
   holders_placed_total: number;
   claimed_pixels_count: number;
 };
@@ -172,6 +188,7 @@ export type ClaimOutlineSegment = {
   start: number;
   end: number;
   status: "owner" | "contributor" | "blocked" | "starter";
+  side?: "north" | "east" | "south" | "west" | null;
 };
 
 export type ClaimOutlineWindow = {
@@ -365,6 +382,21 @@ export type UploadAvatarResult = {
   error: string | null;
 };
 
+export type ShopItemId = "pixel_pack_50" | "max_pixels_5";
+
+export type ShopPurchaseResult = {
+  ok: boolean;
+  user: AuthUser | null;
+  status: number | null;
+  error: string | null;
+};
+
+export type DeleteAccountResult = {
+  ok: boolean;
+  status: number | null;
+  error: string | null;
+};
+
 export type PixelClaimResult = {
   ok: boolean;
   pixel: WorldPixel | null;
@@ -414,6 +446,13 @@ export type AreaContributorSummary = {
 
 export type ClaimAreaStatus = "active" | "finished";
 export type ClaimAreaClaimMode = "new" | "expand";
+export type ClaimAreaReactionValue = "like" | "dislike";
+
+export type ClaimAreaReactionSummary = {
+  like_count: number;
+  dislike_count: number;
+  viewer_reaction: ClaimAreaReactionValue | null;
+};
 
 export type ClaimAreaPreview = {
   id: string;
@@ -425,6 +464,7 @@ export type ClaimAreaPreview = {
   claimed_pixels_count: number;
   painted_pixels_count: number;
   contributor_count: number;
+  reactions: ClaimAreaReactionSummary;
   viewer_can_edit: boolean;
   viewer_can_paint: boolean;
   created_at: string;
@@ -461,9 +501,11 @@ export type ClaimAreaListItem = {
   claimed_pixels_count: number;
   painted_pixels_count: number;
   contributor_count: number;
+  reactions: ClaimAreaReactionSummary;
   viewer_can_edit: boolean;
   viewer_can_paint: boolean;
   bounds: ClaimAreaBounds;
+  outline_segments?: ClaimOutlineSegment[];
   created_at: string;
   updated_at: string;
   last_activity_at: string;
@@ -771,6 +813,71 @@ export async function uploadAvatar(file: File): Promise<UploadAvatarResult> {
       user: null,
       status: null,
       error: "Avatar upload failed.",
+    };
+  }
+}
+
+export async function deleteAccount(): Promise<DeleteAccountResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/auth/profile`, {
+      method: "DELETE",
+      credentials: "include",
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error: await readApiError(response, "Account deletion failed."),
+      };
+    }
+
+    return {
+      ok: true,
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      status: null,
+      error: "Account deletion failed.",
+    };
+  }
+}
+
+export async function purchaseShopItem(itemId: ShopItemId, quantity = 1): Promise<ShopPurchaseResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/auth/shop/purchase`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      credentials: "include",
+      body: JSON.stringify({ item_id: itemId, quantity }),
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        user: null,
+        status: response.status,
+        error: await readApiError(response, "Shop purchase failed."),
+      };
+    }
+
+    return {
+      ok: true,
+      user: (await response.json()) as AuthUser,
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      user: null,
+      status: null,
+      error: "Shop purchase failed.",
     };
   }
 }
@@ -1239,9 +1346,16 @@ export async function fetchClaimAreaAtPixel(
   }
 }
 
-export async function fetchMyClaimAreas(): Promise<ClaimAreaListResult> {
+export async function fetchMyClaimAreas(options?: { includeOutlines?: boolean }): Promise<ClaimAreaListResult> {
   try {
-    const response = await fetch(`${clientApiBaseUrl}/world/areas/mine`, {
+    const params = new URLSearchParams();
+
+    if (options?.includeOutlines === true) {
+      params.set("include_outlines", "true");
+    }
+
+    const query = params.size > 0 ? `?${params.toString()}` : "";
+    const response = await fetch(`${clientApiBaseUrl}/world/areas/mine${query}`, {
       cache: "no-store",
       credentials: "include",
     });
@@ -1317,6 +1431,48 @@ export async function updateClaimArea(
       claim_tiles: [],
       status: null,
       error: "Area update failed.",
+    };
+  }
+}
+
+export async function updateClaimAreaReaction(
+  areaId: string,
+  reaction: ClaimAreaReactionValue | null,
+): Promise<ClaimAreaResult> {
+  try {
+    const response = await fetch(`${clientApiBaseUrl}/world/areas/${areaId}/reaction`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      credentials: "include",
+      body: JSON.stringify({ reaction }),
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        area: null,
+        claim_tiles: [],
+        status: response.status,
+        error: await readApiError(response, "Area reaction failed."),
+      };
+    }
+
+    return {
+      ok: true,
+      area: (await response.json()) as ClaimAreaSummary,
+      claim_tiles: [],
+      status: response.status,
+      error: null,
+    };
+  } catch {
+    return {
+      ok: false,
+      area: null,
+      claim_tiles: [],
+      status: null,
+      error: "Area reaction failed.",
     };
   }
 }

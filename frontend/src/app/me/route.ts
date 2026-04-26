@@ -16,12 +16,6 @@ type AuthMeResponse = {
   avatar_url: string | null;
   role: string;
   is_banned: boolean;
-  holders: number;
-  holders_unlimited: boolean;
-  holder_limit: number;
-  holder_regeneration_interval_seconds: number;
-  holders_last_updated_at: string;
-  next_holder_regeneration_at: string | null;
   claim_area_limit: number;
   normal_pixels: number;
   normal_pixel_limit: number;
@@ -33,10 +27,24 @@ type AuthMeResponse = {
   needs_display_name_setup: boolean;
   can_change_display_name: boolean;
   next_display_name_change_at: string | null;
+  xp: number;
   level: number;
   level_progress_current: number;
   level_progress_target: number;
-  holders_placed_total: number;
+  coins: number;
+  shop_items_purchased: {
+    pixel_pack_50: {
+      purchased: number;
+      item_size: number;
+      total_received: number;
+    };
+    max_pixels_5: {
+      purchased: number;
+      item_size: number;
+      total_received: number;
+    };
+  };
+  pixels_placed_total: number;
   claimed_pixels_count: number;
 };
 
@@ -54,6 +62,11 @@ type ClaimAreaListItem = {
   claimed_pixels_count: number;
   painted_pixels_count: number;
   contributor_count: number;
+  reactions: {
+    like_count: number;
+    dislike_count: number;
+    viewer_reaction: "like" | "dislike" | null;
+  };
   viewer_can_edit: boolean;
   viewer_can_paint: boolean;
   bounds: {
@@ -124,6 +137,35 @@ function summarizeImageSource(value: string | null): ImageSourceSummary | null {
   };
 }
 
+function sanitizeOwnedClaimArea(area: ClaimAreaListItem): ClaimAreaListItem {
+  return {
+    id: area.id,
+    public_id: area.public_id,
+    name: area.name,
+    description: area.description,
+    status: area.status,
+    owner: {
+      id: area.owner.id,
+      public_id: area.owner.public_id,
+      display_name: area.owner.display_name,
+    },
+    claimed_pixels_count: area.claimed_pixels_count,
+    painted_pixels_count: area.painted_pixels_count,
+    contributor_count: area.contributor_count,
+    reactions: area.reactions ?? {
+      like_count: 0,
+      dislike_count: 0,
+      viewer_reaction: null,
+    },
+    viewer_can_edit: area.viewer_can_edit,
+    viewer_can_paint: area.viewer_can_paint,
+    bounds: area.bounds,
+    created_at: area.created_at,
+    updated_at: area.updated_at,
+    last_activity_at: area.last_activity_at,
+  };
+}
+
 export async function GET(request: Request) {
   const authResponse = await fetch(`${apiBaseUrl}/auth/me`, {
     cache: "no-store",
@@ -150,7 +192,7 @@ export async function GET(request: Request) {
 
   if (ownedAreasResponse.ok) {
     const payload = (await ownedAreasResponse.json()) as ClaimAreaListResponse;
-    ownedAreas = payload.areas;
+    ownedAreas = payload.areas.map(sanitizeOwnedClaimArea);
   }
 
   return NextResponse.json({
@@ -161,12 +203,6 @@ export async function GET(request: Request) {
     avatar: summarizeImageSource(user.avatar_url),
     role: user.role,
     is_banned: user.is_banned,
-    holders: user.holders,
-    holders_unlimited: user.holders_unlimited,
-    holder_limit: user.holder_limit,
-    holder_regeneration_interval_seconds: user.holder_regeneration_interval_seconds,
-    holders_last_updated_at: user.holders_last_updated_at,
-    next_holder_regeneration_at: user.next_holder_regeneration_at,
     claim_area_limit: user.claim_area_limit,
     normal_pixels: user.normal_pixels,
     normal_pixel_limit: user.normal_pixel_limit,
@@ -178,10 +214,28 @@ export async function GET(request: Request) {
     needs_display_name_setup: user.needs_display_name_setup,
     can_change_display_name: user.can_change_display_name,
     next_display_name_change_at: user.next_display_name_change_at,
+    xp: user.xp,
     level: user.level,
     level_progress_current: user.level_progress_current,
     level_progress_target: user.level_progress_target,
-    holders_placed_total: user.holders_placed_total,
+    coins: user.coins,
+    shop_items_purchased: {
+      color_pixels: {
+        item_id: "pixel_pack_50",
+        label: "50 Color Pixels",
+        purchased: user.shop_items_purchased.pixel_pack_50.purchased,
+        color_pixels_per_purchase: user.shop_items_purchased.pixel_pack_50.item_size,
+        total_color_pixels_received: user.shop_items_purchased.pixel_pack_50.total_received,
+      },
+      max_pixels: {
+        item_id: "max_pixels_5",
+        label: "Max Pixels +5",
+        purchased: user.shop_items_purchased.max_pixels_5.purchased,
+        max_pixels_per_purchase: user.shop_items_purchased.max_pixels_5.item_size,
+        total_max_pixels_received: user.shop_items_purchased.max_pixels_5.total_received,
+      },
+    },
+    pixels_placed_total: user.pixels_placed_total,
     claimed_pixels_count: user.claimed_pixels_count,
     owned_claim_areas: ownedAreas,
   });

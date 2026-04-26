@@ -8,21 +8,32 @@ from app.modules.auth.service import (
     AvatarUploadError,
     DisplayNameUpdateError,
     GoogleOAuthError,
+    ShopPurchaseError,
+    UserStateError,
     append_query_parameter,
     attach_user_session,
     build_auth_status,
     build_auth_user_summary,
     build_google_redirect,
     clear_user_session,
+    deactivate_user_account,
     exchange_google_code_for_profile,
     is_google_oauth_configured,
     normalize_frontend_redirect_url,
+    purchase_shop_item,
     resolve_authenticated_user,
     update_user_display_name,
     upload_user_avatar,
     upsert_google_user,
 )
-from app.schemas.auth import AuthSessionStatus, AuthUserSummary, LogoutResponse, UpdateDisplayNameRequest
+from app.schemas.auth import (
+    AuthSessionStatus,
+    AuthUserSummary,
+    LogoutResponse,
+    ShopPurchaseRequest,
+    UpdateDisplayNameRequest,
+)
+from app.services.realtime import publish_world_update
 
 router = APIRouter(prefix="/auth")
 
@@ -30,6 +41,8 @@ router = APIRouter(prefix="/auth")
 def ensure_active_account(user) -> None:
     if user.is_banned:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is banned.")
+    if user.is_deactivated:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated.")
 
 
 @router.get("/session", response_model=AuthSessionStatus)
@@ -99,6 +112,11 @@ async def finish_google_login(request: Request, db: AsyncSession = Depends(get_d
     try:
         profile = await exchange_google_code_for_profile(code, settings)
         user, is_new_user = await upsert_google_user(db, profile, settings)
+    except UserStateError as error:
+        return RedirectResponse(
+            append_query_parameter(next_url, "auth", f"error:{error.status_code}"),
+            status_code=302,
+        )
     except GoogleOAuthError:
         return RedirectResponse(
             append_query_parameter(next_url, "auth", "error:google"),
@@ -116,6 +134,26 @@ async def logout(request: Request, db: AsyncSession = Depends(get_db)) -> JSONRe
     settings = get_settings()
     response = JSONResponse(LogoutResponse(success=True).model_dump())
     await clear_user_session(request, response, db, settings)
+    return response
+
+
+@router.delete("/profile", response_model=LogoutResponse)
+async def delete_profile(request: Request, db: AsyncSession = Depends(get_db)) -> JSONResponse:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, db, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    await deactivate_user_account(db, user)
+    response = JSONResponse(LogoutResponse(success=True).model_dump())
+    response.delete_cookie(
+        key=settings.auth_session_cookie_name,
+        httponly=True,
+        secure=settings.auth_cookie_secure,
+        samesite="lax",
+        path="/",
+    )
     return response
 
 
@@ -161,4 +199,30 @@ async def post_avatar_upload(
     finally:
         await avatar.close()
 
+    return build_auth_user_summary(updated_user, settings)
+
+
+@router.post("/shop/purchase", response_model=AuthUserSummary)
+async def post_shop_purchase(
+    payload: ShopPurchaseRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> AuthUserSummary:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, db, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_account(user)
+
+    try:
+        updated_user = await purchase_shop_item(db, user, payload.item_id, settings, payload.quantity)
+    except ShopPurchaseError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+    await publish_world_update(
+        source="shop",
+        actor_user_id=str(updated_user.id),
+        world_dirty=False,
+    )
     return build_auth_user_summary(updated_user, settings)

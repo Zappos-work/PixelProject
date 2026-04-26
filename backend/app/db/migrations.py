@@ -28,12 +28,28 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(
         text("ALTER TABLE users ADD COLUMN IF NOT EXISTS normal_pixels_last_updated_at TIMESTAMPTZ")
     )
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS xp INTEGER"))
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS level INTEGER"))
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER"))
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS shop_pixel_pack_50_purchases INTEGER"))
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS shop_max_pixels_5_purchases INTEGER"))
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS pixels_placed_total INTEGER"))
     await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS holders_placed_total INTEGER"))
     await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS claimed_pixels_count INTEGER"))
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deactivated BOOLEAN"))
+    await connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMPTZ"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN email DROP NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN holders_unlimited SET DEFAULT TRUE"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN is_deactivated SET DEFAULT FALSE"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN claim_area_limit SET DEFAULT 1"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN normal_pixels SET DEFAULT 64"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN normal_pixel_limit SET DEFAULT 64"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN xp SET DEFAULT 0"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN level SET DEFAULT 1"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN coins SET DEFAULT 0"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN shop_pixel_pack_50_purchases SET DEFAULT 0"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN shop_max_pixels_5_purchases SET DEFAULT 0"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN pixels_placed_total SET DEFAULT 0"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN avatar_url TYPE TEXT"))
     await connection.execute(
         text("UPDATE users SET public_id = nextval('users_public_id_seq') WHERE public_id IS NULL")
@@ -61,7 +77,6 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(
         text("UPDATE users SET normal_pixel_limit = 64 WHERE normal_pixel_limit IS NULL OR normal_pixel_limit < 0")
     )
-    await connection.execute(text("UPDATE users SET normal_pixels = LEAST(normal_pixels, normal_pixel_limit)"))
     await connection.execute(
         text("UPDATE users SET normal_pixels_last_updated_at = NOW() WHERE normal_pixels_last_updated_at IS NULL")
     )
@@ -71,17 +86,124 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     await connection.execute(
         text("UPDATE users SET claimed_pixels_count = 0 WHERE claimed_pixels_count IS NULL")
     )
+    await connection.execute(text("UPDATE users SET is_deactivated = FALSE WHERE is_deactivated IS NULL"))
+    await connection.execute(
+        text("UPDATE users SET xp = 0 WHERE xp IS NULL OR xp < 0")
+    )
+    await connection.execute(
+        text(
+            """
+            WITH RECURSIVE level_steps(level, xp_floor, target) AS (
+                SELECT 1::integer, 0::bigint, CAST(:level_xp_start AS bigint)
+                UNION ALL
+                SELECT
+                    level + 1,
+                    xp_floor + target,
+                    target + CAST(:level_xp_increment AS bigint)
+                FROM level_steps
+                WHERE xp_floor + target <= (
+                    SELECT
+                        COALESCE(MAX(xp), 0)::bigint
+                        + CAST(:level_xp_start AS bigint)
+                        + CAST(:level_xp_increment AS bigint)
+                    FROM users
+                )
+            ),
+            calculated_levels AS (
+                SELECT users.id, MAX(level_steps.level)::integer AS calculated_level
+                FROM users
+                JOIN level_steps ON level_steps.xp_floor <= users.xp
+                GROUP BY users.id
+            )
+            UPDATE users
+            SET level = GREATEST(1, calculated_levels.calculated_level)
+            FROM calculated_levels
+            WHERE users.id = calculated_levels.id
+            """
+        ),
+        {
+            "level_xp_start": settings.level_xp_start,
+            "level_xp_increment": settings.level_xp_increment,
+        },
+    )
+    await connection.execute(text("UPDATE users SET level = 1 WHERE level IS NULL OR level < 1"))
+    await connection.execute(
+        text(
+            """
+            UPDATE users
+            SET coins = GREATEST(0, xp + (GREATEST(level, 1) - 1) * :level_up_coin_reward)
+            WHERE coins IS NULL
+            """
+        ),
+        {"level_up_coin_reward": settings.level_up_coin_reward},
+    )
+    await connection.execute(text("UPDATE users SET coins = 0 WHERE coins IS NULL OR coins < 0"))
+    await connection.execute(
+        text("UPDATE users SET shop_pixel_pack_50_purchases = 0 WHERE shop_pixel_pack_50_purchases IS NULL OR shop_pixel_pack_50_purchases < 0")
+    )
+    await connection.execute(
+        text("UPDATE users SET shop_max_pixels_5_purchases = 0 WHERE shop_max_pixels_5_purchases IS NULL OR shop_max_pixels_5_purchases < 0")
+    )
+    await connection.execute(
+        text("UPDATE users SET pixels_placed_total = xp WHERE pixels_placed_total IS NULL OR pixels_placed_total < xp")
+    )
+    await connection.execute(
+        text(
+            """
+            UPDATE users
+            SET normal_pixel_limit = GREATEST(
+                normal_pixel_limit,
+                :normal_pixel_start_limit + (GREATEST(level, 1) - 1) * :level_up_normal_pixel_limit_bonus
+            )
+            """
+        ),
+        {
+            "normal_pixel_start_limit": settings.normal_pixel_start_limit,
+            "level_up_normal_pixel_limit_bonus": settings.level_up_normal_pixel_limit_bonus,
+        },
+    )
     await connection.execute(
         text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_public_id ON users (public_id)")
     )
+    await connection.execute(text("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_google_subject_key"))
+    await connection.execute(text("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key"))
+    await connection.execute(text("DROP INDEX IF EXISTS ix_users_google_subject"))
+    await connection.execute(text("DROP INDEX IF EXISTS ix_users_email"))
+    await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_users_google_subject ON users (google_subject)"))
+    await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_users_email ON users (email)"))
+    await connection.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_users_active_google_subject
+            ON users (google_subject)
+            WHERE is_deactivated IS FALSE
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_users_active_email
+            ON users (email)
+            WHERE is_deactivated IS FALSE AND email IS NOT NULL
+            """
+        )
+    )
     await connection.execute(text("ALTER TABLE users ALTER COLUMN public_id SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN avatar_key SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN is_deactivated SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN holders_unlimited SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN holders_last_updated_at SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN claim_area_limit SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN normal_pixels SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN normal_pixel_limit SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN normal_pixels_last_updated_at SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN xp SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN level SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN coins SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN shop_pixel_pack_50_purchases SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN shop_max_pixels_5_purchases SET NOT NULL"))
+    await connection.execute(text("ALTER TABLE users ALTER COLUMN pixels_placed_total SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN holders_placed_total SET NOT NULL"))
     await connection.execute(text("ALTER TABLE users ALTER COLUMN claimed_pixels_count SET NOT NULL"))
     await connection.execute(
@@ -135,6 +257,28 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
     )
     await connection.execute(
         text("CREATE INDEX IF NOT EXISTS ix_claim_area_overlays_area_id ON claim_area_overlays (area_id)")
+    )
+    await connection.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS claim_area_reactions (
+                id UUID PRIMARY KEY,
+                area_id UUID NOT NULL REFERENCES claim_areas(id) ON DELETE CASCADE,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                value INTEGER NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_claim_area_reactions_area_user UNIQUE (area_id, user_id),
+                CONSTRAINT ck_claim_area_reactions_value CHECK (value IN (-1, 1))
+            )
+            """
+        )
+    )
+    await connection.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_claim_area_reactions_area_id ON claim_area_reactions (area_id)")
+    )
+    await connection.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_claim_area_reactions_user_id ON claim_area_reactions (user_id)")
     )
 
     await connection.execute(
@@ -535,6 +679,670 @@ async def ensure_auth_schema(connection: AsyncConnection) -> None:
             """
             CREATE INDEX IF NOT EXISTS ix_world_pixels_area_yx
             ON world_pixels (area_id, y, x)
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS app_migrations (
+                key VARCHAR(120) PRIMARY KEY,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.4_color_pixel_reward_repair'
+                ) AS pending
+            ),
+            painted_counts AS (
+                SELECT owner_user_id, COUNT(*)::integer AS color_pixel_count
+                FROM world_pixels
+                WHERE owner_user_id IS NOT NULL
+                  AND COALESCE(is_starter, FALSE) IS FALSE
+                  AND color_id IS NOT NULL
+                GROUP BY owner_user_id
+            ),
+            resolved_counts AS (
+                SELECT users.id, COALESCE(painted_counts.color_pixel_count, 0)::integer AS color_pixel_count
+                FROM users
+                LEFT JOIN painted_counts ON painted_counts.owner_user_id = users.id
+            )
+            UPDATE users
+            SET
+                xp = resolved_counts.color_pixel_count,
+                pixels_placed_total = resolved_counts.color_pixel_count
+            FROM resolved_counts
+            WHERE users.id = resolved_counts.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            WITH RECURSIVE migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.4_color_pixel_reward_repair'
+                ) AS pending
+            ),
+            level_steps(level, xp_floor, target) AS (
+                SELECT 1::integer, 0::bigint, CAST(:level_xp_start AS bigint)
+                UNION ALL
+                SELECT
+                    level + 1,
+                    xp_floor + target,
+                    target + CAST(:level_xp_increment AS bigint)
+                FROM level_steps
+                WHERE xp_floor + target <= (
+                    SELECT
+                        COALESCE(MAX(xp), 0)::bigint
+                        + CAST(:level_xp_start AS bigint)
+                        + CAST(:level_xp_increment AS bigint)
+                    FROM users
+                )
+            ),
+            calculated_levels AS (
+                SELECT users.id, MAX(level_steps.level)::integer AS calculated_level
+                FROM users
+                JOIN level_steps ON level_steps.xp_floor <= users.xp
+                GROUP BY users.id
+            )
+            UPDATE users
+            SET level = GREATEST(1, calculated_levels.calculated_level)
+            FROM calculated_levels
+            WHERE users.id = calculated_levels.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {
+            "level_xp_start": settings.level_xp_start,
+            "level_xp_increment": settings.level_xp_increment,
+        },
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.4_color_pixel_reward_repair'
+                ) AS pending
+            ),
+            reward_budget AS (
+                SELECT
+                    id,
+                    GREATEST(0, xp + (GREATEST(level, 1) - 1) * :level_up_coin_reward)::integer AS max_earned_coins
+                FROM users
+            )
+            UPDATE users
+            SET coins = CASE
+                WHEN users.coins IS NULL OR users.coins <= 0 THEN reward_budget.max_earned_coins
+                ELSE LEAST(users.coins, reward_budget.max_earned_coins)
+            END
+            FROM reward_budget
+            WHERE users.id = reward_budget.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {"level_up_coin_reward": settings.level_up_coin_reward},
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.4_color_pixel_reward_repair'
+                ) AS pending
+            ),
+            entitlement AS (
+                SELECT
+                    id,
+                    (
+                        :normal_pixel_start_limit
+                        + (GREATEST(level, 1) - 1) * :level_up_normal_pixel_limit_bonus
+                    )::integer AS base_limit,
+                    (
+                        :normal_pixel_start_limit
+                        + (GREATEST(level, 1) - 1) * :level_up_normal_pixel_limit_bonus
+                        + CASE
+                            WHEN :shop_normal_pixel_limit_cost > 0
+                            THEN FLOOR(
+                                GREATEST(0, xp + (GREATEST(level, 1) - 1) * :level_up_coin_reward)::numeric
+                                / :shop_normal_pixel_limit_cost
+                            )::integer * :shop_normal_pixel_limit_amount
+                            ELSE 0
+                        END
+                    )::integer AS plausible_limit
+                FROM users
+            )
+            UPDATE users
+            SET normal_pixel_limit = GREATEST(
+                entitlement.base_limit,
+                LEAST(users.normal_pixel_limit, entitlement.plausible_limit)
+            )
+            FROM entitlement
+            WHERE users.id = entitlement.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {
+            "normal_pixel_start_limit": settings.normal_pixel_start_limit,
+            "level_up_normal_pixel_limit_bonus": settings.level_up_normal_pixel_limit_bonus,
+            "level_up_coin_reward": settings.level_up_coin_reward,
+            "shop_normal_pixel_limit_cost": settings.shop_normal_pixel_limit_cost,
+            "shop_normal_pixel_limit_amount": settings.shop_normal_pixel_limit_amount,
+        },
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.4_color_pixel_reward_repair'
+                ) AS pending
+            ),
+            pixel_budget AS (
+                SELECT
+                    id,
+                    (
+                        normal_pixel_limit
+                        + CASE
+                            WHEN :shop_pixel_pack_cost > 0
+                            THEN FLOOR(
+                                GREATEST(0, xp + (GREATEST(level, 1) - 1) * :level_up_coin_reward)::numeric
+                                / :shop_pixel_pack_cost
+                            )::integer * :shop_pixel_pack_amount
+                            ELSE normal_pixels
+                        END
+                    )::integer AS plausible_pixels
+                FROM users
+            )
+            UPDATE users
+            SET normal_pixels = LEAST(users.normal_pixels, pixel_budget.plausible_pixels)
+            FROM pixel_budget
+            WHERE users.id = pixel_budget.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {
+            "level_up_coin_reward": settings.level_up_coin_reward,
+            "shop_pixel_pack_cost": settings.shop_pixel_pack_cost,
+            "shop_pixel_pack_amount": settings.shop_pixel_pack_amount,
+        },
+    )
+    await connection.execute(
+        text(
+            """
+            INSERT INTO app_migrations (key)
+            VALUES ('0.2.4_color_pixel_reward_repair')
+            ON CONFLICT (key) DO NOTHING
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.5_linear_level_reward_repair'
+                ) AS pending
+            ),
+            painted_counts AS (
+                SELECT owner_user_id, COUNT(*)::integer AS color_pixel_count
+                FROM world_pixels
+                WHERE owner_user_id IS NOT NULL
+                  AND COALESCE(is_starter, FALSE) IS FALSE
+                  AND color_id IS NOT NULL
+                GROUP BY owner_user_id
+            ),
+            resolved_counts AS (
+                SELECT users.id, COALESCE(painted_counts.color_pixel_count, 0)::integer AS color_pixel_count
+                FROM users
+                LEFT JOIN painted_counts ON painted_counts.owner_user_id = users.id
+            )
+            UPDATE users
+            SET
+                xp = resolved_counts.color_pixel_count,
+                pixels_placed_total = resolved_counts.color_pixel_count
+            FROM resolved_counts
+            WHERE users.id = resolved_counts.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            WITH RECURSIVE migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.5_linear_level_reward_repair'
+                ) AS pending
+            ),
+            level_steps(level, xp_floor, target) AS (
+                SELECT 1::integer, 0::bigint, CAST(:level_xp_start AS bigint)
+                UNION ALL
+                SELECT
+                    level + 1,
+                    xp_floor + target,
+                    target + CAST(:level_xp_increment AS bigint)
+                FROM level_steps
+                WHERE xp_floor + target <= (
+                    SELECT
+                        COALESCE(MAX(xp), 0)::bigint
+                        + CAST(:level_xp_start AS bigint)
+                        + CAST(:level_xp_increment AS bigint)
+                    FROM users
+                )
+            ),
+            calculated_levels AS (
+                SELECT users.id, MAX(level_steps.level)::integer AS calculated_level
+                FROM users
+                JOIN level_steps ON level_steps.xp_floor <= users.xp
+                GROUP BY users.id
+            )
+            UPDATE users
+            SET level = GREATEST(1, calculated_levels.calculated_level)
+            FROM calculated_levels
+            WHERE users.id = calculated_levels.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {
+            "level_xp_start": settings.level_xp_start,
+            "level_xp_increment": settings.level_xp_increment,
+        },
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.5_linear_level_reward_repair'
+                ) AS pending
+            ),
+            reward_budget AS (
+                SELECT
+                    id,
+                    GREATEST(0, xp + (GREATEST(level, 1) - 1) * :level_up_coin_reward)::integer AS max_earned_coins
+                FROM users
+            )
+            UPDATE users
+            SET coins = CASE
+                WHEN users.coins IS NULL OR users.coins <= 0 THEN reward_budget.max_earned_coins
+                ELSE LEAST(users.coins, reward_budget.max_earned_coins)
+            END
+            FROM reward_budget
+            WHERE users.id = reward_budget.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {"level_up_coin_reward": settings.level_up_coin_reward},
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.5_linear_level_reward_repair'
+                ) AS pending
+            ),
+            entitlement AS (
+                SELECT
+                    id,
+                    (
+                        :normal_pixel_start_limit
+                        + (GREATEST(level, 1) - 1) * :level_up_normal_pixel_limit_bonus
+                    )::integer AS base_limit,
+                    (
+                        :normal_pixel_start_limit
+                        + (GREATEST(level, 1) - 1) * :level_up_normal_pixel_limit_bonus
+                        + CASE
+                            WHEN :shop_normal_pixel_limit_cost > 0
+                            THEN FLOOR(
+                                GREATEST(0, xp + (GREATEST(level, 1) - 1) * :level_up_coin_reward)::numeric
+                                / :shop_normal_pixel_limit_cost
+                            )::integer * :shop_normal_pixel_limit_amount
+                            ELSE 0
+                        END
+                    )::integer AS plausible_limit,
+                    (
+                        :legacy_normal_pixel_start_limit
+                        + FLOOR(
+                            GREATEST(0, COALESCE(holders_placed_total, 0))::numeric
+                            / :legacy_level_xp_start
+                        )::integer * :level_up_normal_pixel_limit_bonus
+                    )::integer AS legacy_holder_limit
+                FROM users
+            )
+            UPDATE users
+            SET normal_pixel_limit = CASE
+                WHEN users.normal_pixel_limit = entitlement.legacy_holder_limit THEN entitlement.base_limit
+                ELSE GREATEST(
+                    entitlement.base_limit,
+                    LEAST(users.normal_pixel_limit, entitlement.plausible_limit)
+                )
+            END
+            FROM entitlement
+            WHERE users.id = entitlement.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {
+            "normal_pixel_start_limit": settings.normal_pixel_start_limit,
+            "legacy_normal_pixel_start_limit": 64,
+            "legacy_level_xp_start": 64,
+            "level_up_normal_pixel_limit_bonus": settings.level_up_normal_pixel_limit_bonus,
+            "level_up_coin_reward": settings.level_up_coin_reward,
+            "shop_normal_pixel_limit_cost": settings.shop_normal_pixel_limit_cost,
+            "shop_normal_pixel_limit_amount": settings.shop_normal_pixel_limit_amount,
+        },
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.5_linear_level_reward_repair'
+                ) AS pending
+            ),
+            pixel_budget AS (
+                SELECT
+                    id,
+                    (
+                        normal_pixel_limit
+                        + CASE
+                            WHEN :shop_pixel_pack_cost > 0
+                            THEN FLOOR(
+                                GREATEST(0, xp + (GREATEST(level, 1) - 1) * :level_up_coin_reward)::numeric
+                                / :shop_pixel_pack_cost
+                            )::integer * :shop_pixel_pack_amount
+                            ELSE normal_pixels
+                        END
+                    )::integer AS plausible_pixels
+                FROM users
+            )
+            UPDATE users
+            SET normal_pixels = LEAST(users.normal_pixels, pixel_budget.plausible_pixels)
+            FROM pixel_budget
+            WHERE users.id = pixel_budget.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {
+            "level_up_coin_reward": settings.level_up_coin_reward,
+            "shop_pixel_pack_cost": settings.shop_pixel_pack_cost,
+            "shop_pixel_pack_amount": settings.shop_pixel_pack_amount,
+        },
+    )
+    await connection.execute(
+        text(
+            """
+            INSERT INTO app_migrations (key)
+            VALUES ('0.2.5_linear_level_reward_repair')
+            ON CONFLICT (key) DO NOTHING
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.6_level_tuning_and_shop_counts'
+                ) AS pending
+            ),
+            inferred AS (
+                SELECT
+                    id,
+                    CASE
+                        WHEN :shop_normal_pixel_limit_amount > 0 THEN FLOOR(
+                            GREATEST(
+                                0,
+                                normal_pixel_limit
+                                - (
+                                    :normal_pixel_start_limit
+                                    + (GREATEST(level, 1) - 1) * :level_up_normal_pixel_limit_bonus
+                                )
+                            )::numeric
+                            / :shop_normal_pixel_limit_amount
+                        )::integer
+                        ELSE 0
+                    END AS inferred_max_pixel_purchases
+                FROM users
+            )
+            UPDATE users
+            SET
+                shop_max_pixels_5_purchases = GREATEST(
+                    users.shop_max_pixels_5_purchases,
+                    inferred.inferred_max_pixel_purchases
+                )
+            FROM inferred
+            WHERE users.id = inferred.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {
+            "normal_pixel_start_limit": settings.normal_pixel_start_limit,
+            "level_up_normal_pixel_limit_bonus": settings.level_up_normal_pixel_limit_bonus,
+            "shop_normal_pixel_limit_amount": settings.shop_normal_pixel_limit_amount,
+        },
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.6_level_tuning_and_shop_counts'
+                ) AS pending
+            ),
+            painted_counts AS (
+                SELECT owner_user_id, COUNT(*)::integer AS color_pixel_count
+                FROM world_pixels
+                WHERE owner_user_id IS NOT NULL
+                  AND COALESCE(is_starter, FALSE) IS FALSE
+                  AND color_id IS NOT NULL
+                GROUP BY owner_user_id
+            ),
+            resolved_counts AS (
+                SELECT users.id, COALESCE(painted_counts.color_pixel_count, 0)::integer AS color_pixel_count
+                FROM users
+                LEFT JOIN painted_counts ON painted_counts.owner_user_id = users.id
+            )
+            UPDATE users
+            SET
+                xp = resolved_counts.color_pixel_count,
+                pixels_placed_total = resolved_counts.color_pixel_count
+            FROM resolved_counts
+            WHERE users.id = resolved_counts.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            WITH RECURSIVE migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.6_level_tuning_and_shop_counts'
+                ) AS pending
+            ),
+            level_steps(level, xp_floor, target) AS (
+                SELECT 1::integer, 0::bigint, CAST(:level_xp_start AS bigint)
+                UNION ALL
+                SELECT
+                    level + 1,
+                    xp_floor + target,
+                    target + CAST(:level_xp_increment AS bigint)
+                FROM level_steps
+                WHERE xp_floor + target <= (
+                    SELECT
+                        COALESCE(MAX(xp), 0)::bigint
+                        + CAST(:level_xp_start AS bigint)
+                        + CAST(:level_xp_increment AS bigint)
+                    FROM users
+                )
+            ),
+            calculated_levels AS (
+                SELECT users.id, MAX(level_steps.level)::integer AS calculated_level
+                FROM users
+                JOIN level_steps ON level_steps.xp_floor <= users.xp
+                GROUP BY users.id
+            )
+            UPDATE users
+            SET level = GREATEST(1, calculated_levels.calculated_level)
+            FROM calculated_levels
+            WHERE users.id = calculated_levels.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {
+            "level_xp_start": settings.level_xp_start,
+            "level_xp_increment": settings.level_xp_increment,
+        },
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.6_level_tuning_and_shop_counts'
+                ) AS pending
+            ),
+            reward_budget AS (
+                SELECT
+                    id,
+                    GREATEST(0, xp + (GREATEST(level, 1) - 1) * :level_up_coin_reward)::integer AS max_earned_coins
+                FROM users
+            )
+            UPDATE users
+            SET coins = CASE
+                WHEN users.coins IS NULL OR users.coins <= 0 THEN reward_budget.max_earned_coins
+                ELSE LEAST(users.coins, reward_budget.max_earned_coins)
+            END
+            FROM reward_budget
+            WHERE users.id = reward_budget.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {"level_up_coin_reward": settings.level_up_coin_reward},
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.6_level_tuning_and_shop_counts'
+                ) AS pending
+            ),
+            entitlement AS (
+                SELECT
+                    id,
+                    (
+                        :normal_pixel_start_limit
+                        + (GREATEST(level, 1) - 1) * :level_up_normal_pixel_limit_bonus
+                        + GREATEST(0, shop_max_pixels_5_purchases) * :shop_normal_pixel_limit_amount
+                    )::integer AS earned_limit
+                FROM users
+            )
+            UPDATE users
+            SET normal_pixel_limit = entitlement.earned_limit
+            FROM entitlement
+            WHERE users.id = entitlement.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {
+            "normal_pixel_start_limit": settings.normal_pixel_start_limit,
+            "level_up_normal_pixel_limit_bonus": settings.level_up_normal_pixel_limit_bonus,
+            "shop_normal_pixel_limit_amount": settings.shop_normal_pixel_limit_amount,
+        },
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.6_level_tuning_and_shop_counts'
+                ) AS pending
+            ),
+            pixel_budget AS (
+                SELECT
+                    id,
+                    (
+                        normal_pixel_limit
+                        + GREATEST(0, shop_pixel_pack_50_purchases) * :shop_pixel_pack_amount
+                    )::integer AS purchased_pixel_budget
+                FROM users
+            )
+            UPDATE users
+            SET normal_pixels = LEAST(users.normal_pixels, pixel_budget.purchased_pixel_budget)
+            FROM pixel_budget
+            WHERE users.id = pixel_budget.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {"shop_pixel_pack_amount": settings.shop_pixel_pack_amount},
+    )
+    await connection.execute(
+        text(
+            """
+            INSERT INTO app_migrations (key)
+            VALUES ('0.2.6_level_tuning_and_shop_counts')
+            ON CONFLICT (key) DO NOTHING
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.6_pixel_pack_purchase_count_repair'
+                ) AS pending
+            )
+            UPDATE users
+            SET shop_pixel_pack_50_purchases = 0
+            WHERE (SELECT pending FROM migration_pending)
+            """
+        )
+    )
+    await connection.execute(
+        text(
+            """
+            WITH migration_pending AS (
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM app_migrations WHERE key = '0.2.6_pixel_pack_purchase_count_repair'
+                ) AS pending
+            ),
+            pixel_budget AS (
+                SELECT
+                    id,
+                    (
+                        normal_pixel_limit
+                        + GREATEST(0, shop_pixel_pack_50_purchases) * :shop_pixel_pack_amount
+                    )::integer AS purchased_pixel_budget
+                FROM users
+            )
+            UPDATE users
+            SET normal_pixels = LEAST(users.normal_pixels, pixel_budget.purchased_pixel_budget)
+            FROM pixel_budget
+            WHERE users.id = pixel_budget.id
+              AND (SELECT pending FROM migration_pending)
+            """
+        ),
+        {"shop_pixel_pack_amount": settings.shop_pixel_pack_amount},
+    )
+    await connection.execute(
+        text(
+            """
+            INSERT INTO app_migrations (key)
+            VALUES ('0.2.6_pixel_pack_purchase_count_repair')
+            ON CONFLICT (key) DO NOTHING
             """
         )
     )

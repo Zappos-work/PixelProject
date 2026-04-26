@@ -12,6 +12,7 @@ from app.models.world_pixel import WorldPixel
 from app.services.pixels import (
     get_claim_area_at_pixel,
     get_claim_area_details,
+    get_claim_outline_pixels,
     get_visible_claim_area_previews,
     get_visible_world_pixels,
     list_owned_claim_areas,
@@ -68,6 +69,7 @@ async def run_benchmark(public_id: int | None, iterations: int) -> None:
         list_times: list[float] = []
         selected_pixel_times: list[float] = []
         inspect_area_times: list[float] = []
+        focused_outline_times: list[float] = []
         visible_area_preview_times: list[float] = []
         detail_times: list[float] = []
         sample_bounds = (
@@ -112,6 +114,19 @@ async def run_benchmark(public_id: int | None, iterations: int) -> None:
 
         for _ in range(iterations):
             start = perf_counter()
+            await get_claim_outline_pixels(
+                session,
+                preview_min_x,
+                preview_max_x,
+                preview_min_y,
+                preview_max_y,
+                user,
+                focus_area_id=area.id,
+            )
+            focused_outline_times.append((perf_counter() - start) * 1000)
+
+        for _ in range(iterations):
+            start = perf_counter()
             await get_visible_claim_area_previews(
                 session,
                 preview_min_x,
@@ -151,6 +166,14 @@ async def run_benchmark(public_id: int | None, iterations: int) -> None:
         f"p95={percentile(inspect_area_times, 0.95):.2f}ms",
         f"min={min(inspect_area_times):.2f}ms",
         f"max={max(inspect_area_times):.2f}ms",
+    )
+    print(
+        "get_claim_outline_pixels focused:",
+        f"avg={mean(focused_outline_times):.2f}ms",
+        f"p50={percentile(focused_outline_times, 0.50):.2f}ms",
+        f"p95={percentile(focused_outline_times, 0.95):.2f}ms",
+        f"min={min(focused_outline_times):.2f}ms",
+        f"max={max(focused_outline_times):.2f}ms",
     )
     print(
         "get_visible_claim_area_previews:",

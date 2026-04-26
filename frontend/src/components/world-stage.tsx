@@ -10,6 +10,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type ReactNode,
   type RefObject,
   type MouseEvent as ReactMouseEvent,
@@ -18,6 +19,7 @@ import {
 
 import {
   claimWorldPixels,
+  deleteAccount,
   fetchClaimContextPixels,
   fetchClaimOutlinePixels,
   fetchClaimArea,
@@ -34,8 +36,10 @@ import {
   logoutAuthSession,
   paintWorldPixels,
   promoteAreaContributor,
+  purchaseShopItem,
   removeAreaContributor,
   updateClaimArea,
+  updateClaimAreaReaction,
   updateDisplayName,
   uploadAvatar,
   type AuthUser,
@@ -47,11 +51,13 @@ import {
   type ClaimContextPixel,
   type ClaimAreaPreview,
   type ClaimAreaRecord,
+  type ClaimAreaReactionValue,
   type ClaimAreaSummary,
   type ClaimAreaListItem,
   type ClaimAreaStatus,
   type ClaimOutlineSegment,
   type PaintTileInput,
+  type ShopItemId,
   type WorldOverview,
   type WorldPixel,
   type WorldRealtimeUpdate,
@@ -83,7 +89,7 @@ type BuildMode = "claim" | "paint";
 type ClaimTool = "brush" | "rectangle" | "overlay";
 type PaintTool = "brush" | "eraser" | "picker";
 
-type ActiveModal = "info" | "changelog" | "login" | "shop" | "avatar" | "areas";
+type ActiveModal = "info" | "changelog" | "login" | "shop" | "areas";
 
 type PointerPosition = {
   x: number;
@@ -92,6 +98,12 @@ type PointerPosition = {
 };
 
 type CameraState = {
+  x: number;
+  y: number;
+  zoom: number;
+};
+
+type SharedViewport = {
   x: number;
   y: number;
   zoom: number;
@@ -159,6 +171,10 @@ type PendingClaimRectangle = {
   maxY: number;
 };
 
+type PendingClaimCutoutRectangle = PendingClaimRectangle & {
+  stagedPixelKeys: string[];
+};
+
 type PendingClaimRowInterval = {
   start: number;
   end: number;
@@ -168,6 +184,22 @@ type ClaimContextPixelRecord = ClaimContextPixel;
 
 type ProfileMessage = {
   tone: "error" | "success" | "info";
+  text: string;
+};
+
+type AppNotification = {
+  id: string;
+  tone: "info" | "success" | "warning";
+  title: string;
+  body: string;
+  createdAt: string;
+  read: boolean;
+};
+
+type AppToast = {
+  id: string;
+  tone: ProfileMessage["tone"] | "warning";
+  title: string;
   text: string;
 };
 
@@ -215,6 +247,7 @@ type ClaimRectanglePlacementEvaluation = {
   blockedReason: "outside-world" | "claimed-territory" | null;
   unresolvedNeighborCount: number;
   newPixelCount: number;
+  coveredClaimedPixelCount: number;
   overlapsPendingClaim: boolean;
   touchesClaimRoute: boolean;
 };
@@ -412,6 +445,17 @@ type DebugTileLayerSnapshot = {
   fallbackVisible: number;
 };
 
+type ClaimOutlineDebugStats = {
+  pathCount: number;
+  pathChars: number;
+  pendingPathChars: number;
+  fetchBounds: string | null;
+  fetchCells: number | null;
+  lastFetchMs: number | null;
+  lastFetchSegments: number;
+  lastFetchTruncated: boolean;
+};
+
 type DebugWorldSnapshot = {
   zoom: number;
   cameraX: number;
@@ -422,6 +466,14 @@ type DebugWorldSnapshot = {
   renderedTiles: number;
   visiblePixels: number;
   claimOutlineSegments: number;
+  claimOutlinePaths: number;
+  claimOutlinePathChars: number;
+  pendingClaimOutlinePathChars: number;
+  claimOutlineFetchBounds: string | null;
+  claimOutlineFetchCells: number | null;
+  claimOutlineLastFetchMs: number | null;
+  claimOutlineLastFetchSegments: number;
+  claimOutlineLastFetchTruncated: boolean;
   pendingClaims: number;
   pendingPaints: number;
   selectedPixel: string | null;
@@ -458,6 +510,8 @@ type ClaimOutlinePath = {
   key: string;
   status: ClaimOverlayStatus;
   d: string;
+  shadowCoreD: string;
+  shadowSoftD: string;
 };
 
 type SelectedPixelOverlay = {
@@ -474,6 +528,22 @@ type PaintCursorOverlay = HoverPixelOverlay & {
   color: string;
   isTransparent: boolean;
 };
+
+type AreaPreviewTile = {
+  key: string;
+  src: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+
+type AreaPreviewOutlinePath = {
+  d: string;
+  key: string;
+};
+
+type AreaListFilter = "all" | "owned" | "joined" | "finished";
 
 type GridLineSet = {
   vertical: GridLine[];
@@ -494,7 +564,7 @@ type WorldViewportCanvasProps = {
   onTileLoaded?: (layer: DebugTileLayer, tileKey: string, src: string) => void;
   outsideArtPatternImages: ReactNode;
   pendingPaintTiles: PendingPaintCanvasTile[];
-  pendingClaimOutlinePath: string | null;
+  pendingClaimOutlinePaths: ClaimOutlinePath[];
   renderedPendingClaims: PendingClaimSegment[];
   renderedWorldTiles: WorldTile[];
   retainedVisualTileSrcs: Map<string, string>;
@@ -529,11 +599,17 @@ const SELECTED_PIXEL_FETCH_MISS_COOLDOWN_MS = 1500;
 const CAMERA_FETCH_SETTLE_MS = 180;
 const PIXEL_FETCH_MARGIN = 2;
 const RECTANGLE_ANCHOR_PREFETCH_RADIUS = 72;
-const CLAIM_OUTLINE_FETCH_DEBOUNCE_MS = 120;
+const CLAIM_OUTLINE_FETCH_DEBOUNCE_MS = 70;
 const CLAIM_OUTLINE_FETCH_REPEAT_CACHE_MS = 1000;
 const CLAIM_OUTLINE_FETCH_MARGIN = 2;
-const CLAIM_OUTLINE_FETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
+const CLAIM_OUTLINE_FETCH_OVERSCAN_VIEWPORT_FACTOR = 0.2;
 const CLAIM_OUTLINE_MAX_FREE_FETCH_CELLS = 200_000;
+const CLAIM_OUTLINE_MAX_FOCUSED_FETCH_CELLS = 5_000;
+const CLAIM_OUTLINE_STROKE_WIDTH = 2.35;
+const CLAIM_OUTLINE_SHADOW_CORE_WIDTH = 10;
+const CLAIM_OUTLINE_SHADOW_SOFT_WIDTH = 22;
+const CLAIM_OUTLINE_SHADOW_CORE_COLOR = "rgba(4, 8, 14, 0.38)";
+const CLAIM_OUTLINE_SHADOW_SOFT_COLOR = "rgba(4, 8, 14, 0.2)";
 const VISIBLE_AREA_PREFETCH_DEBOUNCE_MS = 180;
 const VISIBLE_AREA_POLL_INTERVAL_MS = 5000;
 const VISIBLE_AREA_PREFETCH_OVERSCAN_VIEWPORT_FACTOR = 0.45;
@@ -573,17 +649,27 @@ const WORLD_TILE_OVERSCAN_VIEWPORT_FACTOR = 0.35;
 const WORLD_LOW_TILE_MARGIN = 0;
 const WORLD_LOW_TILE_OVERSCAN_VIEWPORT_FACTOR = 0.08;
 const TRANSPARENT_COLOR_ID = 31;
+const PIXEL_PLACE_SOUND_SRC = "/sounds/pixel-place.wav";
+const PIXEL_PLACE_SOUND_THROTTLE_MS = 70;
+const SOUND_MUTED_STORAGE_KEY = "pixelproject:sound-muted";
+const NOTIFICATION_STORAGE_PREFIX = "pixelproject:notifications:";
+const NOTIFICATION_LIMIT = 30;
+const TOAST_LIMIT = 4;
+const TOAST_DISMISS_MS = 4200;
+const AREA_PREVIEW_ASPECT_RATIO = 1.48;
+const AREA_PREVIEW_MAX_TILES = 9;
+const AREA_PREVIEW_MIN_WORLD_SIZE = 18;
 const PIXEL_PALETTE_NAME_BY_ID = new Map<number, string>(PIXEL_PALETTE.map((color) => [color.id, color.name]));
 const PIXEL_PALETTE_COLOR_BY_ID = new Map<number, string>(PIXEL_PALETTE.map((color) => [color.id, color.hex]));
 const CLAIM_OVERLAY_VISIBLE_PALETTE = PIXEL_PALETTE.filter((color) => color.id !== TRANSPARENT_COLOR_ID);
 const CLAIM_OVERLAY_DEFAULT_COLOR_IDS = CLAIM_OVERLAY_VISIBLE_PALETTE.map((color) => color.id);
 const BUILD_MODE_LABEL: Record<BuildMode, string> = {
   claim: "Claim Area",
-  paint: "Color Pixel",
+  paint: "Place Pixels",
 };
 const BUILD_MODE_HELP: Record<BuildMode, string> = {
-  claim: "Claim Area only. Uses Holders and has no color palette.",
-  paint: "Color Pixel only. You can only pixel in areas you own or where you were added.",
+  claim: "",
+  paint: "",
 };
 const DEV_BUNDLE_RECOVERY_NOTICE =
   "Local development bundle is out of sync. Close this browser tab and reopen PixelProject. If it stays broken, restart the frontend container.";
@@ -621,6 +707,28 @@ let perfDebugEnabledCache: boolean | null = null;
 
 function clampZoom(value: number, minZoom: number): number {
   return Math.min(MAX_ZOOM, Math.max(minZoom, Number(value.toFixed(4))));
+}
+
+function formatShareNumber(value: number, fractionDigits: number): string {
+  const fixedValue = value.toFixed(fractionDigits);
+  return fractionDigits === 0 ? fixedValue : fixedValue.replace(/\.?0+$/, "");
+}
+
+function parseSharedViewportSearch(search: string): SharedViewport | null {
+  try {
+    const params = new URLSearchParams(search);
+    const x = Number.parseFloat(params.get("x") ?? "");
+    const y = Number.parseFloat(params.get("y") ?? "");
+    const zoom = Number.parseFloat(params.get("zoom") ?? "");
+
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(zoom) || zoom <= 0) {
+      return null;
+    }
+
+    return { x, y, zoom };
+  } catch {
+    return null;
+  }
 }
 
 function snapScreen(value: number): number {
@@ -1273,6 +1381,10 @@ function formatClaimAreaId(publicId: number): string {
   return `#${publicId}`;
 }
 
+function formatPlayerNameWithId(displayName: string, publicId: number): string {
+  return `${displayName}#${publicId}`;
+}
+
 function isPixelInsideActiveWorldBounds(
   pixel: PixelCoordinate,
   bounds: ActiveWorldBounds,
@@ -1308,6 +1420,9 @@ function buildAreaSelectionSignature(area: ClaimAreaRecord | null): string {
     area.claimed_pixels_count,
     area.painted_pixels_count,
     area.contributor_count,
+    area.reactions?.like_count ?? 0,
+    area.reactions?.dislike_count ?? 0,
+    area.reactions?.viewer_reaction ?? "",
     Number(area.viewer_can_edit),
     Number(area.viewer_can_paint),
     area.updated_at,
@@ -1678,18 +1793,6 @@ function createPendingClaimRectangle(
   };
 }
 
-function getClaimRectangleFetchBounds(
-  rectangle: PendingClaimRectangle,
-  bounds: ActiveWorldBounds,
-): Pick<VisibleAreaBounds, "minX" | "maxX" | "minY" | "maxY"> {
-  return {
-    minX: Math.max(bounds.minX, rectangle.minX - 1),
-    maxX: Math.min(bounds.maxX - 1, rectangle.maxX + 1),
-    minY: Math.max(bounds.minY, rectangle.minY - 1),
-    maxY: Math.min(bounds.maxY - 1, rectangle.maxY + 1),
-  };
-}
-
 function getRectangleAnchorPrefetchBounds(
   anchor: PixelCoordinate,
   bounds: ActiveWorldBounds,
@@ -1861,6 +1964,7 @@ function evaluateClaimRectanglePlacement(input: {
     resolvedBounds = null,
   } = input;
   let newPixelCount = 0;
+  let coveredClaimedPixelCount = 0;
   let overlapsPendingClaim = false;
   let touchesClaimRoute = false;
   const unresolvedNeighborKeys = new Set<string>();
@@ -1882,24 +1986,20 @@ function evaluateClaimRectanglePlacement(input: {
           blockedReason: "outside-world",
           unresolvedNeighborCount: unresolvedNeighborKeys.size,
           newPixelCount,
+          coveredClaimedPixelCount,
           overlapsPendingClaim,
           touchesClaimRoute,
         };
       }
 
       const pixelKey = getPixelKey(pixel);
-      if (pixelMap.has(pixelKey)) {
-        return {
-          blockedReason: "claimed-territory",
-          unresolvedNeighborCount: unresolvedNeighborKeys.size,
-          newPixelCount,
-          overlapsPendingClaim,
-          touchesClaimRoute,
-        };
-      }
-
       if (hasPendingClaimAtPixel(pixel, pendingClaimPixelMap, pendingClaimRectangles)) {
         overlapsPendingClaim = true;
+        continue;
+      }
+
+      if (pixelMap.has(pixelKey)) {
+        coveredClaimedPixelCount += 1;
         continue;
       }
 
@@ -1971,6 +2071,7 @@ function evaluateClaimRectanglePlacement(input: {
     blockedReason: null,
     unresolvedNeighborCount: unresolvedNeighborKeys.size,
     newPixelCount,
+    coveredClaimedPixelCount,
     overlapsPendingClaim,
     touchesClaimRoute,
   };
@@ -2025,86 +2126,28 @@ function splitPendingClaimRectangleAtPixel(
   return nextRectangles;
 }
 
-function addPendingClaimEdgeInterval(
-  target: Map<number, Map<number, number>>,
-  line: number,
+function addPendingClaimRowInterval(
+  rows: Map<number, PendingClaimRowInterval[]>,
+  y: number,
   start: number,
   end: number,
 ): void {
-  if (start === end) {
+  if (start > end) {
     return;
   }
 
-  const events = target.get(line) ?? new Map<number, number>();
-  events.set(start, (events.get(start) ?? 0) + 1);
-  events.set(end, (events.get(end) ?? 0) - 1);
-  target.set(line, events);
-}
-
-function appendPendingClaimOutlineCommands(
-  target: string[],
-  orientation: "horizontal" | "vertical",
-  intervalEvents: Map<number, Map<number, number>>,
-  camera: CameraState,
-): void {
-  const lines = [...intervalEvents.entries()].sort((left, right) => left[0] - right[0]);
-
-  for (const [line, events] of lines) {
-    const sortedEvents = [...events.entries()].sort((left, right) => left[0] - right[0]);
-    let activeCount = 0;
-    let segmentStart: number | null = null;
-
-    for (const [position, delta] of sortedEvents) {
-      const wasVisible = activeCount % 2 === 1;
-      activeCount += delta;
-      const isVisible = activeCount % 2 === 1;
-
-      if (!wasVisible && isVisible) {
-        segmentStart = position;
-        continue;
-      }
-
-      if (wasVisible && !isVisible && segmentStart !== null && segmentStart < position) {
-        if (orientation === "horizontal") {
-          const y = snapSvgLine(worldBoundaryScreenY(line, camera));
-          const x1 = snapSvgLine(camera.x + segmentStart * camera.zoom);
-          const x2 = snapSvgLine(camera.x + position * camera.zoom);
-          target.push(`M${x1} ${y}H${x2}`);
-        } else {
-          const x = snapSvgLine(camera.x + line * camera.zoom);
-          const y1 = snapSvgLine(worldBoundaryScreenY(segmentStart, camera));
-          const y2 = snapSvgLine(worldBoundaryScreenY(position, camera));
-          target.push(`M${x} ${y1}V${y2}`);
-        }
-
-        segmentStart = null;
-      }
-    }
+  const row = rows.get(y);
+  const interval = { start, end };
+  if (row) {
+    row.push(interval);
+  } else {
+    rows.set(y, [interval]);
   }
 }
 
-function buildMergedPendingClaimRowIntervals(
-  pendingClaimPixels: PixelCoordinate[],
+function mergePendingClaimRowIntervals(
+  rows: Map<number, PendingClaimRowInterval[]>,
 ): Array<[number, PendingClaimRowInterval[]]> {
-  const rows = new Map<number, PendingClaimRowInterval[]>();
-  const addRowInterval = (y: number, start: number, end: number): void => {
-    if (start > end) {
-      return;
-    }
-
-    const row = rows.get(y);
-    const interval = { start, end };
-    if (row) {
-      row.push(interval);
-    } else {
-      rows.set(y, [interval]);
-    }
-  };
-
-  for (const pixel of pendingClaimPixels) {
-    addRowInterval(pixel.y, pixel.x, pixel.x);
-  }
-
   return [...rows.entries()]
     .sort((left, right) => left[0] - right[0])
     .map(([y, intervals]): [number, PendingClaimRowInterval[]] => {
@@ -2126,6 +2169,18 @@ function buildMergedPendingClaimRowIntervals(
 
       return [y, merged];
     });
+}
+
+function buildMergedPendingClaimRowIntervals(
+  pendingClaimPixels: PixelCoordinate[],
+): Array<[number, PendingClaimRowInterval[]]> {
+  const rows = new Map<number, PendingClaimRowInterval[]>();
+
+  for (const pixel of pendingClaimPixels) {
+    addPendingClaimRowInterval(rows, pixel.y, pixel.x, pixel.x);
+  }
+
+  return mergePendingClaimRowIntervals(rows);
 }
 
 function buildPendingClaimPixelRectangles(pendingClaimPixels: PixelCoordinate[]): PendingClaimRectangle[] {
@@ -2201,71 +2256,306 @@ function buildPendingClaimSegments(
   return segments;
 }
 
-function buildPendingClaimOutlinePath(
-  pendingClaimPixels: PixelCoordinate[],
-  pendingClaimRectangles: PendingClaimRectangle[],
-  camera: CameraState,
-): string | null {
-  if (pendingClaimPixels.length === 0 && pendingClaimRectangles.length === 0) {
-    return null;
+function subtractPendingClaimIntervals(
+  interval: PendingClaimRowInterval,
+  blockers: PendingClaimRowInterval[],
+): PendingClaimRowInterval[] {
+  const visibleIntervals: PendingClaimRowInterval[] = [];
+  let start = interval.start;
+
+  for (const blocker of blockers) {
+    if (blocker.end < start) {
+      continue;
+    }
+
+    if (blocker.start > interval.end) {
+      break;
+    }
+
+    if (blocker.start > start) {
+      visibleIntervals.push({
+        start,
+        end: Math.min(interval.end, blocker.start - 1),
+      });
+    }
+
+    start = Math.max(start, blocker.end + 1);
+
+    if (start > interval.end) {
+      break;
+    }
   }
 
-  const horizontalEdges = new Map<number, Map<number, number>>();
-  const verticalEdges = new Map<number, Map<number, number>>();
-  const pendingClaimPixelRectangles = buildPendingClaimPixelRectangles(pendingClaimPixels);
+  if (start <= interval.end) {
+    visibleIntervals.push({ start, end: interval.end });
+  }
 
-  const addCellEdges = (minX: number, maxX: number, minY: number, maxY: number): void => {
-    const endX = maxX + 1;
-    const endY = maxY + 1;
-    addPendingClaimEdgeInterval(horizontalEdges, minY, minX, endX);
-    addPendingClaimEdgeInterval(horizontalEdges, endY, minX, endX);
-    addPendingClaimEdgeInterval(verticalEdges, minX, minY, endY);
-    addPendingClaimEdgeInterval(verticalEdges, endX, minY, endY);
-  };
+  return visibleIntervals;
+}
 
-  for (const rectangle of pendingClaimPixelRectangles) {
-    addCellEdges(rectangle.minX, rectangle.maxX, rectangle.minY, rectangle.maxY);
+function addClaimOutlineEdge(
+  target: Map<number, PendingClaimRowInterval[]>,
+  line: number,
+  start: number,
+  end: number,
+): void {
+  if (start >= end) {
+    return;
+  }
+
+  const edges = target.get(line);
+  const edge = { start, end };
+  if (edges) {
+    edges.push(edge);
+  } else {
+    target.set(line, [edge]);
+  }
+}
+
+function buildClaimOutlineSegmentsFromEdges(
+  orientation: "horizontal" | "vertical",
+  side: NonNullable<ClaimOutlineSegment["side"]>,
+  edgesByLine: Map<number, PendingClaimRowInterval[]>,
+): ClaimOutlineSegment[] {
+  const segments: ClaimOutlineSegment[] = [];
+
+  for (const [line, edges] of [...edgesByLine.entries()].sort((left, right) => left[0] - right[0])) {
+    const mergedEdges = mergePendingClaimRowIntervals(new Map([[line, edges]]))[0]?.[1] ?? [];
+
+    for (const edge of mergedEdges) {
+      segments.push({
+        orientation,
+        line,
+        start: edge.start,
+        end: edge.end,
+        status: "owner",
+        side,
+      });
+    }
+  }
+
+  return segments;
+}
+
+function buildPendingClaimOutlineSegments(
+  pendingClaimPixels: PixelCoordinate[],
+  pendingClaimRectangles: PendingClaimRectangle[],
+): ClaimOutlineSegment[] {
+  if (pendingClaimPixels.length === 0 && pendingClaimRectangles.length === 0) {
+    return [];
+  }
+
+  const rows = new Map<number, PendingClaimRowInterval[]>();
+
+  for (const pixel of pendingClaimPixels) {
+    addPendingClaimRowInterval(rows, pixel.y, pixel.x, pixel.x);
   }
 
   for (const rectangle of pendingClaimRectangles) {
-    addCellEdges(rectangle.minX, rectangle.maxX, rectangle.minY, rectangle.maxY);
+    for (let y = rectangle.minY; y <= rectangle.maxY; y += 1) {
+      addPendingClaimRowInterval(rows, y, rectangle.minX, rectangle.maxX);
+    }
   }
 
-  const commands: string[] = [];
-  appendPendingClaimOutlineCommands(commands, "horizontal", horizontalEdges, camera);
-  appendPendingClaimOutlineCommands(commands, "vertical", verticalEdges, camera);
-  return commands.length === 0 ? null : commands.join("");
+  const mergedRows = mergePendingClaimRowIntervals(rows);
+  const rowMap = new Map(mergedRows);
+  const northEdges = new Map<number, PendingClaimRowInterval[]>();
+  const southEdges = new Map<number, PendingClaimRowInterval[]>();
+  const eastEdges = new Map<number, PendingClaimRowInterval[]>();
+  const westEdges = new Map<number, PendingClaimRowInterval[]>();
+
+  for (const [y, intervals] of mergedRows) {
+    const northBlockers = rowMap.get(y + 1) ?? [];
+    const southBlockers = rowMap.get(y - 1) ?? [];
+
+    for (const interval of intervals) {
+      for (const edge of subtractPendingClaimIntervals(interval, northBlockers)) {
+        addClaimOutlineEdge(northEdges, y + 1, edge.start, edge.end + 1);
+      }
+
+      for (const edge of subtractPendingClaimIntervals(interval, southBlockers)) {
+        addClaimOutlineEdge(southEdges, y, edge.start, edge.end + 1);
+      }
+
+      addClaimOutlineEdge(westEdges, interval.start, y, y + 1);
+      addClaimOutlineEdge(eastEdges, interval.end + 1, y, y + 1);
+    }
+  }
+
+  return [
+    ...buildClaimOutlineSegmentsFromEdges("horizontal", "north", northEdges),
+    ...buildClaimOutlineSegmentsFromEdges("horizontal", "south", southEdges),
+    ...buildClaimOutlineSegmentsFromEdges("vertical", "west", westEdges),
+    ...buildClaimOutlineSegmentsFromEdges("vertical", "east", eastEdges),
+  ];
 }
 
 function snapSvgLine(value: number): number {
   return Math.round(value) + 0.5;
 }
 
+function appendClaimOutlineCommand(target: string[], segment: ClaimOutlineSegment, camera: CameraState): void {
+  if (segment.orientation === "horizontal") {
+    const y = snapSvgLine(worldBoundaryScreenY(segment.line, camera));
+    const x1 = snapSvgLine(camera.x + segment.start * camera.zoom);
+    const x2 = snapSvgLine(camera.x + segment.end * camera.zoom);
+    target.push(`M${x1} ${y}H${x2}`);
+    return;
+  }
+
+  const x = snapSvgLine(camera.x + segment.line * camera.zoom);
+  const y1 = snapSvgLine(worldBoundaryScreenY(segment.start, camera));
+  const y2 = snapSvgLine(worldBoundaryScreenY(segment.end, camera));
+  target.push(`M${x} ${y1}V${y2}`);
+}
+
+function appendSvgRectCommand(
+  target: string[],
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+): void {
+  const x1 = Math.min(left, right);
+  const x2 = Math.max(left, right);
+  const y1 = Math.min(top, bottom);
+  const y2 = Math.max(top, bottom);
+
+  if (x1 === x2 || y1 === y2) {
+    return;
+  }
+
+  target.push(`M${x1} ${y1}H${x2}V${y2}H${x1}Z`);
+}
+
+function appendClaimOutlineShadowEdgeCommand(
+  target: string[],
+  segment: ClaimOutlineSegment,
+  camera: CameraState,
+  shadowWidth: number,
+): void {
+  const side = segment.side;
+  if (!side) {
+    return;
+  }
+
+  if (segment.orientation === "horizontal") {
+    if (side !== "north" && side !== "south") {
+      return;
+    }
+
+    const baseY = snapSvgLine(worldBoundaryScreenY(segment.line, camera));
+    const x1 = snapSvgLine(camera.x + segment.start * camera.zoom);
+    const x2 = snapSvgLine(camera.x + segment.end * camera.zoom);
+    const top = side === "north" ? baseY - shadowWidth : baseY;
+    const bottom = side === "north" ? baseY : baseY + shadowWidth;
+    appendSvgRectCommand(target, x1, top, x2, bottom);
+    return;
+  }
+
+  if (side !== "west" && side !== "east") {
+    return;
+  }
+
+  const baseX = snapSvgLine(camera.x + segment.line * camera.zoom);
+  const left = side === "west" ? baseX - shadowWidth : baseX;
+  const right = side === "west" ? baseX : baseX + shadowWidth;
+  const y1 = snapSvgLine(worldBoundaryScreenY(segment.start, camera));
+  const y2 = snapSvgLine(worldBoundaryScreenY(segment.end, camera));
+  appendSvgRectCommand(target, left, y1, right, y2);
+}
+
+function buildClaimOutlineShadowCommands(
+  segments: ClaimOutlineSegment[],
+  camera: CameraState,
+  shadowWidth: number,
+): string[] {
+  const commands: string[] = [];
+  const endpoints = new Map<string, {
+    x: number;
+    y: number;
+    horizontalSides: Set<"north" | "south">;
+    verticalSides: Set<"west" | "east">;
+  }>();
+
+  const addEndpoint = (x: number, y: number, side: NonNullable<ClaimOutlineSegment["side"]>): void => {
+    const key = `${x}:${y}`;
+    const endpoint = endpoints.get(key) ?? {
+      x,
+      y,
+      horizontalSides: new Set<"north" | "south">(),
+      verticalSides: new Set<"west" | "east">(),
+    };
+
+    if (side === "north" || side === "south") {
+      endpoint.horizontalSides.add(side);
+    } else if (side === "west" || side === "east") {
+      endpoint.verticalSides.add(side);
+    }
+
+    endpoints.set(key, endpoint);
+  };
+
+  for (const segment of segments) {
+    appendClaimOutlineShadowEdgeCommand(commands, segment, camera, shadowWidth);
+
+    const side = segment.side;
+    if (!side) {
+      continue;
+    }
+
+    if (segment.orientation === "horizontal" && (side === "north" || side === "south")) {
+      addEndpoint(segment.start, segment.line, side);
+      addEndpoint(segment.end, segment.line, side);
+    } else if (segment.orientation === "vertical" && (side === "west" || side === "east")) {
+      addEndpoint(segment.line, segment.start, side);
+      addEndpoint(segment.line, segment.end, side);
+    }
+  }
+
+  for (const endpoint of endpoints.values()) {
+    if (endpoint.horizontalSides.size === 0 || endpoint.verticalSides.size === 0) {
+      continue;
+    }
+
+    const x = snapSvgLine(camera.x + endpoint.x * camera.zoom);
+    const y = snapSvgLine(worldBoundaryScreenY(endpoint.y, camera));
+
+    for (const horizontalSide of endpoint.horizontalSides) {
+      const top = horizontalSide === "north" ? y - shadowWidth : y;
+      const bottom = horizontalSide === "north" ? y : y + shadowWidth;
+
+      for (const verticalSide of endpoint.verticalSides) {
+        const left = verticalSide === "west" ? x - shadowWidth : x;
+        const right = verticalSide === "west" ? x : x + shadowWidth;
+        appendSvgRectCommand(commands, left, top, right, bottom);
+      }
+    }
+  }
+
+  return commands;
+}
+
 function buildClaimOutlinePaths(
   outlineSegments: ClaimOutlineSegment[],
   camera: CameraState,
 ): ClaimOutlinePath[] {
-  const commandsByKey = new Map<string, { status: ClaimOverlayStatus; commands: string[] }>();
+  const commandsByKey = new Map<string, {
+    status: ClaimOverlayStatus;
+    commands: string[];
+    segments: ClaimOutlineSegment[];
+  }>();
 
   for (const segment of outlineSegments) {
-    const key = `${segment.orientation}:${segment.status}`;
+    const key = segment.status;
     const existing = commandsByKey.get(key) ?? {
       status: segment.status,
       commands: [],
+      segments: [],
     };
 
-    if (segment.orientation === "horizontal") {
-      const y = snapSvgLine(worldBoundaryScreenY(segment.line, camera));
-      const x1 = snapSvgLine(camera.x + segment.start * camera.zoom);
-      const x2 = snapSvgLine(camera.x + segment.end * camera.zoom);
-      existing.commands.push(`M${x1} ${y}H${x2}`);
-    } else {
-      const x = snapSvgLine(camera.x + segment.line * camera.zoom);
-      const y1 = snapSvgLine(worldBoundaryScreenY(segment.start, camera));
-      const y2 = snapSvgLine(worldBoundaryScreenY(segment.end, camera));
-      existing.commands.push(`M${x} ${y1}V${y2}`);
-    }
-
+    appendClaimOutlineCommand(existing.commands, segment, camera);
+    existing.segments.push(segment);
     commandsByKey.set(key, existing);
   }
 
@@ -2281,8 +2571,70 @@ function buildClaimOutlinePaths(
       key,
       status: value.status,
       d: value.commands.join(""),
+      shadowCoreD: buildClaimOutlineShadowCommands(value.segments, camera, CLAIM_OUTLINE_SHADOW_CORE_WIDTH).join(""),
+      shadowSoftD: buildClaimOutlineShadowCommands(value.segments, camera, CLAIM_OUTLINE_SHADOW_SOFT_WIDTH).join(""),
     }))
     .sort((left, right) => statusOrder[left.status] - statusOrder[right.status]);
+}
+
+function getClaimAreaOutlineStatus(area: ClaimAreaRecord): ClaimOverlayStatus {
+  if (area.viewer_can_edit) {
+    return "owner";
+  }
+
+  if (area.viewer_can_paint) {
+    return "contributor";
+  }
+
+  return "blocked";
+}
+
+function buildClaimAreaBoundsOutlinePaths(area: ClaimAreaRecord | null, camera: CameraState): ClaimOutlinePath[] {
+  if (!area?.bounds) {
+    return [];
+  }
+
+  const bounds = area.bounds;
+  const status = getClaimAreaOutlineStatus(area);
+  const segments: ClaimOutlineSegment[] = [
+    {
+      orientation: "horizontal",
+      line: bounds.max_y + 1,
+      start: bounds.min_x,
+      end: bounds.max_x + 1,
+      status,
+      side: "north",
+    },
+    {
+      orientation: "horizontal",
+      line: bounds.min_y,
+      start: bounds.min_x,
+      end: bounds.max_x + 1,
+      status,
+      side: "south",
+    },
+    {
+      orientation: "vertical",
+      line: bounds.min_x,
+      start: bounds.min_y,
+      end: bounds.max_y + 1,
+      status,
+      side: "west",
+    },
+    {
+      orientation: "vertical",
+      line: bounds.max_x + 1,
+      start: bounds.min_y,
+      end: bounds.max_y + 1,
+      status,
+      side: "east",
+    },
+  ];
+
+  return buildClaimOutlinePaths(segments, camera).map((path) => ({
+    ...path,
+    key: `bounds-${area.id}-${path.key}`,
+  }));
 }
 
 function areWorldPixelsEqual(left: WorldPixel[], right: WorldPixel[]): boolean {
@@ -2454,8 +2806,93 @@ function formatCount(value: number): string {
   return new Intl.NumberFormat("en-GB").format(value);
 }
 
+function formatNotificationTime(value: string): string {
+  return new Intl.DateTimeFormat("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    day: "2-digit",
+    month: "short",
+  }).format(new Date(value));
+}
+
+function getUnreadNotificationLabel(count: number): string {
+  return count > 9 ? "9+" : String(count);
+}
+
+function isStoredNotification(value: unknown): value is AppNotification {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<AppNotification>;
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.title === "string" &&
+    typeof candidate.body === "string" &&
+    typeof candidate.createdAt === "string" &&
+    typeof candidate.read === "boolean" &&
+    (candidate.tone === "info" || candidate.tone === "success" || candidate.tone === "warning")
+  );
+}
+
 function formatPercent(value: number): string {
   return `${value.toFixed(value >= 10 || value === 0 ? 1 : 2)}%`;
+}
+
+function formatDurationShort(totalSeconds: number): string {
+  const safeSeconds = Math.max(0, Math.ceil(totalSeconds));
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const seconds = safeSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+
+  return `${seconds}s`;
+}
+
+function getLevelProgressPercent(user: AuthUser | null): number {
+  if (user === null || user.level_progress_target <= 0) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(100, (user.level_progress_current / user.level_progress_target) * 100));
+}
+
+function getNormalPixelFullRefillText(user: AuthUser | null, nowMs = Date.now()): string {
+  if (user === null) {
+    return "";
+  }
+
+  if (user.normal_pixels >= user.normal_pixel_limit) {
+    return "Full";
+  }
+
+  const intervalMs = Math.max(1000, user.normal_pixel_regeneration_interval_seconds * 1000);
+  const lastUpdatedMs = new Date(user.normal_pixels_last_updated_at).getTime();
+  const elapsedMs = Math.max(0, nowMs - lastUpdatedMs);
+  const regenerated = Math.floor(elapsedMs / intervalMs);
+  const displayedPixels = Math.min(user.normal_pixel_limit, user.normal_pixels + regenerated);
+  const missingPixels = user.normal_pixel_limit - displayedPixels;
+
+  if (missingPixels <= 0) {
+    return "Full";
+  }
+
+  const remainderMs = elapsedMs % intervalMs;
+  const nextPixelMs = remainderMs === 0 ? intervalMs : intervalMs - remainderMs;
+  const fullRefillMs = nextPixelMs + (missingPixels - 1) * intervalMs;
+
+  return formatDurationShort(fullRefillMs / 1000);
+}
+
+function sanitizeQuantityInput(value: string): string {
+  return value.replace(/[^\d]/g, "").replace(/^0+(?=\d)/, "").slice(0, 3);
 }
 
 function getProjectedHolderState(
@@ -2833,7 +3270,7 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
   onTileLoaded,
   outsideArtPatternImages,
   pendingPaintTiles,
-  pendingClaimOutlinePath,
+  pendingClaimOutlinePaths,
   renderedPendingClaims,
   renderedWorldTiles,
   retainedVisualTileSrcs,
@@ -2960,18 +3397,38 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
             width={viewportSize.width}
           >
             {claimOutlinePaths.map((path) => (
+              <g className={`world-claim-outline-shadow-stack is-${path.status}`} key={`${path.key}:shadow`}>
+                <path
+                  className="world-claim-outline-shadow is-soft"
+                  d={path.shadowSoftD}
+                  fill={CLAIM_OUTLINE_SHADOW_SOFT_COLOR}
+                  shapeRendering="crispEdges"
+                  stroke="none"
+                />
+                <path
+                  className="world-claim-outline-shadow is-core"
+                  d={path.shadowCoreD}
+                  fill={CLAIM_OUTLINE_SHADOW_CORE_COLOR}
+                  shapeRendering="crispEdges"
+                  stroke="none"
+                />
+              </g>
+            ))}
+            {claimOutlinePaths.map((path) => (
               <path
+                className={`world-claim-outline-path is-${path.status}`}
                 d={path.d}
                 fill="none"
                 key={path.key}
+                shapeRendering="crispEdges"
                 stroke={CLAIM_OUTLINE_COLORS[path.status]}
-                strokeWidth="1"
+                strokeWidth={CLAIM_OUTLINE_STROKE_WIDTH}
                 vectorEffect="non-scaling-stroke"
               />
             ))}
           </svg>
         ) : null}
-        {pendingClaimOutlinePath ? (
+        {pendingClaimOutlinePaths.length > 0 ? (
           <svg
             aria-hidden="true"
             className="world-pending-claim-outline-layer"
@@ -2979,12 +3436,36 @@ const WorldViewportCanvas = memo(function WorldViewportCanvas({
             shapeRendering="crispEdges"
             width={viewportSize.width}
           >
-            <path
-              className="world-pending-claim-outline-path"
-              d={pendingClaimOutlinePath}
-              fill="none"
-              vectorEffect="non-scaling-stroke"
-            />
+            {pendingClaimOutlinePaths.map((path) => (
+              <g className={`world-pending-claim-outline-shadow-stack is-${path.status}`} key={`${path.key}:shadow`}>
+                <path
+                  className="world-claim-outline-shadow world-pending-claim-outline-shadow is-soft"
+                  d={path.shadowSoftD}
+                  fill={CLAIM_OUTLINE_SHADOW_SOFT_COLOR}
+                  shapeRendering="crispEdges"
+                  stroke="none"
+                />
+                <path
+                  className="world-claim-outline-shadow world-pending-claim-outline-shadow is-core"
+                  d={path.shadowCoreD}
+                  fill={CLAIM_OUTLINE_SHADOW_CORE_COLOR}
+                  shapeRendering="crispEdges"
+                  stroke="none"
+                />
+              </g>
+            ))}
+            {pendingClaimOutlinePaths.map((path) => (
+              <path
+                className={`world-claim-outline-path world-pending-claim-outline-path is-${path.status}`}
+                d={path.d}
+                fill="none"
+                key={path.key}
+                shapeRendering="crispEdges"
+                stroke={CLAIM_OUTLINE_COLORS[path.status]}
+                strokeWidth={CLAIM_OUTLINE_STROKE_WIDTH}
+                vectorEffect="non-scaling-stroke"
+              />
+            ))}
           </svg>
         ) : null}
         {renderedPendingClaims.map((pixel) => (
@@ -3090,9 +3571,8 @@ function HolderPanelSummary({
   if (user === null) {
     return (
       <div className="pixel-resource-summary">
-        <span>Holder left</span>
+        <span>Holders</span>
         <strong>--</strong>
-        <small>Login required for Holder balance</small>
       </div>
     );
   }
@@ -3100,44 +3580,48 @@ function HolderPanelSummary({
   if (projection.isUnlimited) {
     return (
       <div className="pixel-resource-summary">
-        <span>Holder left</span>
-        <strong>Unlimited</strong>
-        <small>
-          {pendingClaims} pending claim{pendingClaims === 1 ? "" : "s"} - {user.claim_area_limit} total area slot
-          {user.claim_area_limit === 1 ? "" : "s"}
-        </small>
+        <span>Holders</span>
+        <strong>∞</strong>
+        {pendingClaims > 0 ? <small>{pendingClaims} staged</small> : null}
+        {pendingClaims > 0 ? (
+          <div className="claim-batch-progress">
+            <div className="claim-batch-progress-header">
+              <span>Batch</span>
+              <strong>{formatCount(pendingClaims)} / {formatCount(CLAIM_BATCH_PIXEL_LIMIT)}</strong>
+            </div>
+            <div className="claim-batch-progress-bar" aria-hidden="true">
+              <span style={{ width: `${batchFillRatio * 100}%` }} />
+            </div>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  const remainingHolders = Math.max(0, projection.displayedHolders - pendingClaims);
+  const holderFillRatio = projection.displayedHolders <= 0
+    ? 0
+    : Math.min(1, remainingHolders / projection.displayedHolders);
+
+  return (
+    <div className="pixel-resource-summary">
+      <span>Holders</span>
+      <strong>{remainingHolders}</strong>
+      {pendingClaims > 0 ? <small>{pendingClaims} staged</small> : null}
+      <div className="resource-meter" aria-hidden="true">
+        <span style={{ width: `${holderFillRatio * 100}%` }} />
+      </div>
+      {pendingClaims > 0 ? (
         <div className="claim-batch-progress">
           <div className="claim-batch-progress-header">
-            <span>Batch size</span>
+            <span>Batch</span>
             <strong>{formatCount(pendingClaims)} / {formatCount(CLAIM_BATCH_PIXEL_LIMIT)}</strong>
           </div>
           <div className="claim-batch-progress-bar" aria-hidden="true">
             <span style={{ width: `${batchFillRatio * 100}%` }} />
           </div>
         </div>
-      </div>
-    );
-  }
-
-  const remainingHolders = Math.max(0, projection.displayedHolders - pendingClaims);
-
-  return (
-    <div className="pixel-resource-summary">
-      <span>Holder left</span>
-      <strong>{remainingHolders}</strong>
-      <small>
-        {pendingClaims} pending claim{pendingClaims === 1 ? "" : "s"} from{" "}
-        {projection.displayedHolders} ready Holders
-      </small>
-      <div className="claim-batch-progress">
-        <div className="claim-batch-progress-header">
-          <span>Batch size</span>
-          <strong>{formatCount(pendingClaims)} / {formatCount(CLAIM_BATCH_PIXEL_LIMIT)}</strong>
-        </div>
-        <div className="claim-batch-progress-bar" aria-hidden="true">
-          <span style={{ width: `${batchFillRatio * 100}%` }} />
-        </div>
-      </div>
+      ) : null}
     </div>
   );
 }
@@ -3154,55 +3638,25 @@ function NormalPixelPanelSummary({
   if (user === null) {
     return (
       <div className="pixel-resource-summary">
-        <span>Pixels left</span>
+        <span>Color Pixels</span>
         <strong>--</strong>
-        <small>Login required for Color Pixel balance</small>
       </div>
     );
   }
 
   const remainingPixels = Math.max(0, projection.displayedPixels - pendingPaints);
+  const pixelFillRatio = Math.min(1, remainingPixels / Math.max(1, user.normal_pixel_limit));
 
   return (
     <div className="pixel-resource-summary">
-      <span>Pixels left</span>
+      <span>Color Pixels</span>
       <strong>{remainingPixels}</strong>
-      <small>
-        {pendingPaints} pending pixel{pendingPaints === 1 ? "" : "s"} from{" "}
-        {projection.displayedPixels} ready Color Pixels
-      </small>
+      {pendingPaints > 0 ? <small>{pendingPaints} staged</small> : null}
+      <div className="resource-meter" aria-hidden="true">
+        <span style={{ width: `${pixelFillRatio * 100}%` }} />
+      </div>
     </div>
   );
-}
-
-function HolderAccountCount({ user }: { user: AuthUser }) {
-  const holderProjection = useProjectedHolderState(user);
-  const normalPixelProjection = useProjectedNormalPixelState(user);
-  const holderLabel = holderProjection.isUnlimited
-    ? "Unlimited"
-    : `${holderProjection.displayedHolders} / ${user.holder_limit}`;
-
-  return (
-    <>
-      Holders: {holderLabel} - Color Pixels: {normalPixelProjection.displayedPixels} / {user.normal_pixel_limit}
-    </>
-  );
-}
-
-function NormalPixelAccountCount({ user }: { user: AuthUser }) {
-  const projection = useProjectedNormalPixelState(user);
-
-  return (
-    <strong>
-      {projection.displayedPixels} / {user.normal_pixel_limit}
-    </strong>
-  );
-}
-
-function NormalPixelAccountStatus({ user }: { user: AuthUser }) {
-  const projection = useProjectedNormalPixelState(user);
-
-  return <small>{projection.statusText}</small>;
 }
 
 function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
@@ -3423,13 +3877,17 @@ function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
           `paint ${snapshot.paint.loaded}/${snapshot.paint.active} loaded (${snapshot.paint.loading} loading, ${snapshot.paint.fallbackVisible} fallback)`,
           `claims ${snapshot.claims.loaded}/${snapshot.claims.active} loaded (${snapshot.claims.loading} loading, ${snapshot.claims.fallbackVisible} fallback)`,
         ];
+    const outlineFetchDetail = snapshot.claimOutlineFetchBounds === null
+      ? "outline fetch off"
+      : `outline fetch ${snapshot.claimOutlineFetchBounds} (${formatCount(snapshot.claimOutlineFetchCells ?? 0)} cells, ${snapshot.claimOutlineLastFetchMs === null ? "pending" : formatPerfTime(snapshot.claimOutlineLastFetchMs)})`;
 
     const detailParts = [
       `${formatGrowthStageLabel(snapshot.growth)}, filled ${formatCount(snapshot.growth.painted_pixels)} / ${formatCount(snapshot.growth.capacity_pixels)} px (${formatPercent(snapshot.growth.filled_percent)})`,
       `cam ${Math.round(snapshot.cameraX)}:${Math.round(snapshot.cameraY)} @ ${snapshot.zoom.toFixed(2)}x`,
       `layer ${formatDebugLayerLabel(snapshot)}`,
       ...layers,
-      `pixels ${snapshot.visiblePixels}, outlines ${snapshot.claimOutlineSegments}, pending ${snapshot.pendingClaims}/${snapshot.pendingPaints}`,
+      `pixels ${snapshot.visiblePixels}, outlines ${snapshot.claimOutlineSegments} seg/${snapshot.claimOutlinePaths} paths/${formatCount(snapshot.claimOutlinePathChars)} chars, pending ${snapshot.pendingClaims}/${snapshot.pendingPaints}`,
+      outlineFetchDetail,
     ];
 
     if (snapshot.rectanglePlacementBusy) {
@@ -3862,7 +4320,13 @@ function PerfDebugOverlay({ getSnapshot }: PerfDebugOverlayProps) {
             </>
           )}
           <span>
-            Pixels {latestSnapshot.visiblePixels}, outline {latestSnapshot.claimOutlineSegments}, pending {latestSnapshot.pendingClaims}/{latestSnapshot.pendingPaints}
+            Pixels {latestSnapshot.visiblePixels}, outline {latestSnapshot.claimOutlineSegments} seg / {latestSnapshot.claimOutlinePaths} paths / {formatCount(latestSnapshot.claimOutlinePathChars)} chars, pending outline {formatCount(latestSnapshot.pendingClaimOutlinePathChars)} chars
+          </span>
+          <span>
+            Outline fetch {latestSnapshot.claimOutlineFetchBounds ?? "--"} | {latestSnapshot.claimOutlineFetchCells === null ? "--" : `${formatCount(latestSnapshot.claimOutlineFetchCells)} cells`} | last {latestSnapshot.claimOutlineLastFetchMs === null ? "--" : formatPerfTime(latestSnapshot.claimOutlineLastFetchMs)} / {latestSnapshot.claimOutlineLastFetchSegments} seg{latestSnapshot.claimOutlineLastFetchTruncated ? " / truncated" : ""}
+          </span>
+          <span>
+            Pending {latestSnapshot.pendingClaims}/{latestSnapshot.pendingPaints}
           </span>
           <span>
             Selected {latestSnapshot.selectedPixel ?? "--"} | Area {latestSnapshot.selectedAreaId ?? "--"} | Panels {latestSnapshot.buildPanelOpen ? "build" : "closed"} / {latestSnapshot.areaPanelBusy || latestSnapshot.areaDetailsBusy ? "busy" : "idle"} | Rectangle {latestSnapshot.rectanglePlacementBusy ? "checking" : "idle"}
@@ -3923,10 +4387,60 @@ function AreaParticipantAvatar({ participant }: {
 function ShopIcon() {
   return (
     <svg aria-hidden="true" className="hud-button-icon" viewBox="0 0 24 24">
-      <path
-        d="M6.25 7.5A1.25 1.25 0 0 1 7.5 6.25h9A1.25 1.25 0 0 1 17.75 7.5v.75h1.1c.39 0 .71.29.75.67l.73 7.5a1.8 1.8 0 0 1-1.79 1.98H5.46a1.8 1.8 0 0 1-1.79-1.98l.73-7.5a.75.75 0 0 1 .75-.67h1.1V7.5Zm10 0v.75h-8.5V7.5c0-.14.11-.25.25-.25h8a.25.25 0 0 1 .25.25Zm-6 3.5a.75.75 0 0 0-1.5 0v1.75a.75.75 0 0 0 1.5 0V11Zm5 0a.75.75 0 0 0-1.5 0v1.75a.75.75 0 0 0 1.5 0V11Z"
-        fill="currentColor"
-      />
+      <path d="M5.5 9.2h13v10.3h-13V9.2Zm2 2v6.3h3.5v-6.3H7.5Zm5.5 0v6.3h3.5v-6.3H13Z" fill="currentColor" />
+      <path d="M4 4.5h16l1 4.2c-.45.78-1.25 1.3-2.15 1.3-.8 0-1.5-.4-1.96-1.02A2.45 2.45 0 0 1 14.93 10c-.8 0-1.5-.4-1.96-1.02A2.45 2.45 0 0 1 11 10c-.8 0-1.5-.4-1.96-1.02A2.45 2.45 0 0 1 7.08 10c-.9 0-1.7-.52-2.15-1.3L4 4.5Z" fill="currentColor" opacity="0.82" />
+      <path d="M6 3h12v2H6V3Zm-1 16h14v2H5v-2Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function BellIcon({ className = "hud-button-icon" }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 24 24">
+      <path d="M12 3.25a5.5 5.5 0 0 0-5.5 5.5v2.8c0 1.18-.43 2.32-1.22 3.2L4 16.2v1.55h16V16.2l-1.28-1.45a4.85 4.85 0 0 1-1.22-3.2v-2.8A5.5 5.5 0 0 0 12 3.25Zm-2.8 16.1a2.9 2.9 0 0 0 5.6 0H9.2Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function VolumeOnIcon({ className = "hud-button-icon" }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 24 24">
+      <path d="M4.5 9.2h3.6l4.4-4v13.6l-4.4-4H4.5V9.2Z" fill="currentColor" />
+      <path d="M15.2 8.1a5.4 5.4 0 0 1 0 7.8M17.8 5.6a9 9 0 0 1 0 12.8" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="2" />
+    </svg>
+  );
+}
+
+function VolumeMutedIcon({ className = "hud-button-icon" }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 24 24">
+      <path d="M4.5 9.2h3.6l4.4-4v13.6l-4.4-4H4.5V9.2Z" fill="currentColor" />
+      <path d="m16 9 4 4m0-4-4 4" stroke="currentColor" strokeLinecap="round" strokeWidth="2.2" />
+    </svg>
+  );
+}
+
+function ThumbUpIcon() {
+  return (
+    <svg aria-hidden="true" className="area-reaction-icon" viewBox="0 0 24 24">
+      <path d="M9.2 20H5.8a1.8 1.8 0 0 1-1.8-1.8v-6.4A1.8 1.8 0 0 1 5.8 10h3.4v10Zm1.8-9.9 2.6-5.6a1.7 1.7 0 0 1 3.25.68V10h2.05a2.1 2.1 0 0 1 2.02 2.67l-1.4 5a3.2 3.2 0 0 1-3.08 2.33H11v-9.9Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function ThumbDownIcon() {
+  return (
+    <svg aria-hidden="true" className="area-reaction-icon" viewBox="0 0 24 24">
+      <path d="M14.8 4h3.4A1.8 1.8 0 0 1 20 5.8v6.4a1.8 1.8 0 0 1-1.8 1.8h-3.4V4Zm-1.8 9.9-2.6 5.6a1.7 1.7 0 0 1-3.25-.68V14H5.1a2.1 2.1 0 0 1-2.02-2.67l1.4-5A3.2 3.2 0 0 1 7.56 4H13v9.9Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function ShareIcon() {
+  return (
+    <svg aria-hidden="true" className="area-share-icon" viewBox="0 0 24 24">
+      <path d="M12 4v11M8 8l4-4 4 4" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.9" />
+      <path d="M6 12v6h12v-6" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.9" />
     </svg>
   );
 }
@@ -3942,11 +4456,1119 @@ function PencilIcon() {
   );
 }
 
+function SaveIcon() {
+  return (
+    <svg aria-hidden="true" className="hud-button-icon" viewBox="0 0 24 24">
+      <path d="M5.5 3.5h10.2l2.8 2.8v14.2h-13V3.5Zm2 2v5h8v-3.7l-1.3-1.3H7.5Zm0 13h9v-5h-9v5Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg aria-hidden="true" className="hud-button-icon" viewBox="0 0 24 24">
+      <path d="M9 3.5h6l.8 2h3.2v2H5v-2h3.2l.8-2Zm-1.9 6h9.8l-.7 10.2a1.9 1.9 0 0 1-1.9 1.8H9.7a1.9 1.9 0 0 1-1.9-1.8L7.1 9.5Zm3.4 2.5v6h1.5v-6h-1.5Zm3.5 0v6h1.5v-6H14Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function LogoutIcon() {
+  return (
+    <svg aria-hidden="true" className="hud-button-icon" viewBox="0 0 24 24">
+      <path d="M4.5 4.5h8v2h-6v11h6v2h-8v-15Zm10.4 3.2 4.8 4.8-4.8 4.8-1.4-1.4 2.4-2.4H10v-2h5.9l-2.4-2.4 1.4-1.4Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function MoreHorizontalIcon({ className = "options-dot-icon" }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 24 24">
+      <circle cx="6.5" cy="12" fill="currentColor" r="1.8" />
+      <circle cx="12" cy="12" fill="currentColor" r="1.8" />
+      <circle cx="17.5" cy="12" fill="currentColor" r="1.8" />
+    </svg>
+  );
+}
+
+function CoinIcon() {
+  return (
+    <svg aria-hidden="true" className="account-mini-icon" viewBox="0 0 24 24">
+      <path d="M12 3.5c4.42 0 8 1.79 8 4s-3.58 4-8 4-8-1.79-8-4 3.58-4 8-4Zm-8 6.15c1.45 1.4 4.36 2.35 8 2.35s6.55-.95 8-2.35V12c0 2.21-3.58 4-8 4s-8-1.79-8-4V9.65Zm0 4.5c1.45 1.4 4.36 2.35 8 2.35s6.55-.95 8-2.35V16.5c0 2.21-3.58 4-8 4s-8-1.79-8-4v-2.35Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function PixelIcon() {
+  return (
+    <svg aria-hidden="true" className="account-mini-icon" viewBox="0 0 24 24">
+      <path d="M4 4h7v7H4V4Zm9 0h7v7h-7V4ZM4 13h7v7H4v-7Zm9 0h7v7h-7v-7Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function TimerIcon() {
+  return (
+    <svg aria-hidden="true" className="account-mini-icon" viewBox="0 0 24 24">
+      <path d="M9 2.75h6v2H9v-2Zm3 3.5a7.5 7.5 0 1 1 0 15 7.5 7.5 0 0 1 0-15Zm1 3.5h-2v4.55l3.35 2 1-1.72L13 13.18V9.75Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function LevelIcon() {
+  return (
+    <svg aria-hidden="true" className="account-mini-icon" viewBox="0 0 24 24">
+      <path d="M12 3.25 14.65 8.6l5.9.86-4.27 4.16 1.01 5.88L12 16.72 6.71 19.5l1.01-5.88L3.45 9.46l5.9-.86L12 3.25Z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function AreaIcon({ className = "account-mini-icon" }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 24 24">
+      <path d="M5 5h6v6H5V5Zm8 0h6v6h-6V5ZM5 13h6v6H5v-6Zm8 0h6v6h-6v-6Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.8" />
+      <path d="M3.5 3.5h17v17h-17v-17Z" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.4" />
+    </svg>
+  );
+}
+
+function BrushToolIcon({ className = "tool-mini-icon" }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 24 24">
+      <path d="M14.8 4.8 19.2 9.2 9.4 19H5v-4.4l9.8-9.8Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.8" />
+      <path d="M13.4 6.2 17.8 10.6" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function RectangleToolIcon({ className = "tool-mini-icon" }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 24 24">
+      <rect fill="none" height="12" rx="2" stroke="currentColor" strokeWidth="1.8" width="16" x="4" y="6" />
+      <path d="M8 10h8M8 14h5" stroke="currentColor" strokeLinecap="round" strokeWidth="1.6" />
+    </svg>
+  );
+}
+
+function OverlayToolIcon({ className = "tool-mini-icon" }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 24 24">
+      <rect fill="none" height="12" rx="2" stroke="currentColor" strokeWidth="1.8" width="16" x="4" y="6" />
+      <path d="m7 15 3.2-3.2 2.3 2.3 1.6-1.6L18 16H6l1-1Z" fill="currentColor" />
+      <circle cx="15.8" cy="9.2" fill="currentColor" r="1.3" />
+    </svg>
+  );
+}
+
+function EraserToolIcon({ className = "tool-mini-icon" }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 24 24">
+      <path d="m4.5 14.5 7.2-7.2a3 3 0 0 1 4.2 0l2.8 2.8a3 3 0 0 1 0 4.2L14 19H8.8l-4.3-4.5Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.8" />
+      <path d="M10 19h9" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function PickerToolIcon({ className = "tool-mini-icon" }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" className={className} viewBox="0 0 24 24">
+      <path d="M4 20l4.5-1 8.2-8.2-3.5-3.5L5 15.5 4 20Z" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+      <path d="M12 5.5 15.5 9" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+type ShopArtworkVariant = number;
+const SHOP_COLOR_PIXEL_ARTWORK_VARIANT: ShopArtworkVariant = 8;
+const SHOP_MAX_PIXEL_ARTWORK_VARIANT: ShopArtworkVariant = 6;
+
+function ShopArtworkFrame({
+  children,
+  className,
+}: {
+  children: ReactNode;
+  className: string;
+}) {
+  return (
+    <svg aria-hidden="true" className={`shop-item-art ${className}`} viewBox="0 0 96 96">
+      <rect className="shop-art-bg" height="88" rx="16" width="88" x="4" y="4" />
+      {children}
+    </svg>
+  );
+}
+
+function ShopChargeBase({ y = 72, width = 36 }: { y?: number; width?: number }) {
+  const left = 48 - width / 2;
+
+  return (
+    <rect fill="currentColor" height="7" rx="1.5" width={width} x={left} y={y} />
+  );
+}
+
+function ShopDroplet({
+  x,
+  y,
+  scale = 1,
+}: {
+  x: number;
+  y: number;
+  scale?: number;
+}) {
+  return (
+    <path
+      d="M0-10C5-4 8 1 8 6a8 8 0 0 1-16 0c0-5 3-10 8-16Z"
+      fill="currentColor"
+      transform={`translate(${x} ${y}) scale(${scale})`}
+    />
+  );
+}
+
+function ShopSpark({ x, y }: { x: number; y: number }) {
+  return (
+    <path
+      d={`M${x} ${y - 8}v16M${x - 8} ${y}h16`}
+      opacity="0.46"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeWidth="3.4"
+    />
+  );
+}
+
+function ShopTinyPlus({ x = 70, y = 28 }: { x?: number; y?: number }) {
+  return (
+    <path
+      d={`M${x} ${y - 7}v14M${x - 7} ${y}h14`}
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeWidth="4.4"
+    />
+  );
+}
+
+function ShopUpArrow({
+  x = 48,
+  y = 26,
+  height = 35,
+}: {
+  x?: number;
+  y?: number;
+  height?: number;
+}) {
+  const tipY = y;
+  const stemTop = y + 11;
+  const stemBottom = y + height;
+
+  return (
+    <>
+      <path
+        d={`M${x} ${stemBottom}V${stemTop}M${x - 15} ${stemTop + 4}l15-15 15 15`}
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="square"
+        strokeLinejoin="miter"
+        strokeWidth="7"
+      />
+      <path d={`M${x - 2.5} ${tipY + 3}h5v7h-5z`} fill="currentColor" opacity="0.01" />
+    </>
+  );
+}
+
+function renderPaintChargeArtwork(variant: ShopArtworkVariant): ReactNode {
+  const coreVariant = ((variant - 1) % 16) + 1;
+  const alternate = variant > 16;
+  const accent = alternate ? (
+    <>
+      <ShopTinyPlus x={70} y={28} />
+      <path d="M25 27h12" opacity="0.28" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+    </>
+  ) : null;
+
+  switch (coreVariant) {
+    case 1:
+      return (
+        <>
+          <path d="M40 25 64 49 51 62 27 38l13-13Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <path d="M43 28 61 46" stroke="currentColor" strokeLinecap="square" strokeWidth="6" />
+          <ShopDroplet x={68} y={59} scale={0.68} />
+          <ShopChargeBase width={42} />
+          {accent}
+        </>
+      );
+    case 2:
+      return (
+        <>
+          <path d="M35 28h28l10 10-22 22-26-26 10-6Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <path d="M35 37h26" stroke="currentColor" strokeLinecap="square" strokeWidth="6" />
+          <ShopDroplet x={66} y={60} scale={0.58} />
+          <ShopDroplet x={55} y={66} scale={0.36} />
+          <ShopChargeBase width={44} />
+          {accent}
+        </>
+      );
+    case 3:
+      return (
+        <>
+          <path d="M31 31h30l8 8-20 21H31V31Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <path d="M61 31v11h10M39 43h17" stroke="currentColor" strokeLinecap="square" strokeLinejoin="round" strokeWidth="5.5" />
+          <ShopDroplet x={65} y={60} scale={0.56} />
+          <ShopChargeBase width={40} />
+          {accent}
+        </>
+      );
+    case 4:
+      return (
+        <>
+          <ShopDroplet x={48} y={45} scale={1.48} />
+          <path d="M33 60h30" opacity="0.34" stroke="currentColor" strokeLinecap="round" strokeWidth="5" />
+          <ShopChargeBase width={48} />
+          {accent}
+        </>
+      );
+    case 5:
+      return (
+        <>
+          <path d="M30 37h36v28H30V37Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <path d="M38 48h20" stroke="currentColor" strokeLinecap="square" strokeWidth="6" />
+          <ShopDroplet x={48} y={61} scale={0.5} />
+          <ShopDroplet x={70} y={46} scale={0.58} />
+          <ShopChargeBase width={38} />
+          {accent}
+        </>
+      );
+    case 6:
+      return (
+        <>
+          <path d="M30 56c8-19 14-28 18-28s10 9 18 28H30Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <ShopDroplet x={45} y={54} scale={0.42} />
+          <ShopDroplet x={58} y={57} scale={0.36} />
+          <ShopChargeBase width={46} />
+          {accent}
+        </>
+      );
+    case 7:
+      return (
+        <>
+          <path d="M31 41 50 24l19 17-19 19-19-19Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <path d="M39 41h23" stroke="currentColor" strokeLinecap="square" strokeWidth="5.5" />
+          <ShopDroplet x={65} y={60} scale={0.64} />
+          <ShopChargeBase width={42} />
+          {accent}
+        </>
+      );
+    case 8:
+      return (
+        <>
+          <ShopDroplet x={38} y={44} scale={0.82} />
+          <ShopDroplet x={52} y={39} scale={0.72} />
+          <ShopDroplet x={61} y={57} scale={0.86} />
+          <ShopChargeBase width={46} />
+          {accent}
+        </>
+      );
+    case 9:
+      return (
+        <>
+          <path d="M30 35h31l8 8v25H30V35Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <path d="M61 35v10h8M38 48h17" stroke="currentColor" strokeLinecap="square" strokeLinejoin="round" strokeWidth="5.5" />
+          <ShopDroplet x={50} y={61} scale={0.54} />
+          <ShopChargeBase width={40} />
+          {accent}
+        </>
+      );
+    case 10:
+      return (
+        <>
+          <path d="M31 62 58 35" fill="none" stroke="currentColor" strokeLinecap="square" strokeWidth="7" />
+          <path d="m56 25 15 15-11 11-15-15 11-11Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <ShopDroplet x={34} y={63} scale={0.42} />
+          <ShopChargeBase width={38} />
+          {accent}
+        </>
+      );
+    case 11:
+      return (
+        <>
+          <path d="M31 55a19 19 0 0 1 34 0" fill="none" stroke="currentColor" strokeLinecap="square" strokeWidth="6" />
+          <path d="M48 55 62 39" stroke="currentColor" strokeLinecap="square" strokeWidth="6" />
+          <ShopDroplet x={35} y={45} scale={0.48} />
+          <ShopChargeBase width={42} />
+          {accent}
+        </>
+      );
+    case 12:
+      return (
+        <>
+          <path d="M28 45h37M43 28v34M58 28v34" stroke="currentColor" strokeLinecap="square" strokeWidth="6" />
+          <ShopDroplet x={70} y={55} scale={0.62} />
+          <ShopChargeBase width={42} />
+          {accent}
+        </>
+      );
+    case 13:
+      return (
+        <>
+          <path d="M31 37h34v24H31V37Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <path d="M39 37V27h18v10M39 49h18" stroke="currentColor" strokeLinecap="square" strokeLinejoin="round" strokeWidth="5.5" />
+          <ShopDroplet x={68} y={58} scale={0.56} />
+          <ShopChargeBase width={40} />
+          {accent}
+        </>
+      );
+    case 14:
+      return (
+        <>
+          <path d="M27 51c8-11 14-16 21-16s13 5 21 16c-8 11-14 16-21 16s-13-5-21-16Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <ShopDroplet x={48} y={52} scale={0.52} />
+          <ShopChargeBase width={40} />
+          {accent}
+        </>
+      );
+    case 15:
+      return (
+        <>
+          <path d="M28 58h40l-5 10H33l-5-10Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <path d="M34 31h28v27H34V31Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <ShopDroplet x={48} y={49} scale={0.58} />
+          <ShopChargeBase width={36} y={73} />
+          {accent}
+        </>
+      );
+    case 16:
+      return (
+        <>
+          <path d="M48 25c12 9 20 17 20 29a20 20 0 0 1-40 0c0-12 8-20 20-29Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <path d="M38 54h20" stroke="currentColor" strokeLinecap="square" strokeWidth="5.5" />
+          <ShopChargeBase width={42} />
+          {accent}
+        </>
+      );
+      default:
+        return null;
+  }
+}
+
+function renderMaxChargeArtwork(variant: ShopArtworkVariant): ReactNode {
+  const coreVariant = ((variant - 1) % 16) + 1;
+  const alternate = variant > 16;
+  const accent = alternate ? (
+    <>
+      <ShopTinyPlus x={70} y={28} />
+      <path d="M24 29h13" opacity="0.28" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+    </>
+  ) : null;
+
+  switch (coreVariant) {
+    case 1:
+      return (
+        <>
+          <ShopUpArrow />
+          <ShopChargeBase width={43} />
+          {accent}
+        </>
+      );
+    case 2:
+      return (
+        <>
+          <path d="M29 45 48 26l19 19M36 58l12-12 12 12" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="7" />
+          <ShopChargeBase width={43} />
+          {accent}
+        </>
+      );
+    case 3:
+      return (
+        <>
+          <path d="M28 38V27h13M68 38V27H55" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="6" />
+          <ShopUpArrow y={32} height={27} />
+          <ShopChargeBase width={40} />
+          {accent}
+        </>
+      );
+    case 4:
+      return (
+        <>
+          <path d="M30 60h36M48 58V29M34 43l14-14 14 14" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="7" />
+          <ShopChargeBase width={44} />
+          {accent}
+        </>
+      );
+    case 5:
+      return (
+        <>
+          <path d="M34 66V31h28v35H34Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <path d="M48 58V38M39 46l9-9 9 9" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="6" />
+          <ShopChargeBase width={36} />
+          {accent}
+        </>
+      );
+    case 6:
+      return (
+        <>
+          <path d="M34 52 48 38l14 14M34 38l14-14 14 14" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="7" />
+          <ShopChargeBase width={42} />
+          {accent}
+        </>
+      );
+    case 7:
+      return (
+        <>
+          <ShopUpArrow x={42} y={29} height={31} />
+          <ShopTinyPlus x={66} y={48} />
+          <ShopChargeBase width={43} />
+          {alternate ? <ShopSpark x={27} y={29} /> : null}
+        </>
+      );
+    case 8:
+      return (
+        <>
+          <path d="M29 62h38M35 50h26M41 38h14" stroke="currentColor" strokeLinecap="square" strokeWidth="7" />
+          <path d="M48 58V26M38 36l10-10 10 10" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="6" />
+          <ShopChargeBase width={42} y={73} />
+          {accent}
+        </>
+      );
+    case 9:
+      return (
+        <>
+          <circle cx="48" cy="47" fill="none" r="22" stroke="currentColor" strokeWidth="6" />
+          <path d="M48 59V35M39 44l9-9 9 9" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="6" />
+          <ShopChargeBase width={40} />
+          {accent}
+        </>
+      );
+    case 10:
+      return (
+        <>
+          <path d="M48 61V29M37 40l11-11 11 11M30 54l-8-8M66 54l8-8" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="6" />
+          <ShopChargeBase width={40} />
+          {accent}
+        </>
+      );
+    case 11:
+      return (
+        <>
+          <path d="M27 57a21 21 0 0 1 42 0" fill="none" stroke="currentColor" strokeLinecap="square" strokeWidth="6" />
+          <path d="M48 56 62 39M36 57h24" stroke="currentColor" strokeLinecap="square" strokeWidth="6" />
+          <ShopChargeBase width={42} />
+          {accent}
+        </>
+      );
+    case 12:
+      return (
+        <>
+          <path d="M28 42h40v24H28V42Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="6" />
+          <path d="M68 49h5v10h-5M48 62V30M38 40l10-10 10 10" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="5.5" />
+          <ShopChargeBase width={34} />
+          {accent}
+        </>
+      );
+    case 13:
+      return (
+        <>
+          <path d="M30 62h14V50h13V38h11" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="7" />
+          <path d="M58 30h10v10" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="7" />
+          <ShopChargeBase width={40} />
+          {accent}
+        </>
+      );
+    case 14:
+      return (
+        <>
+          <path d="M31 64h34M37 64V38h22v26M48 57V26M38 36l10-10 10 10" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="6" />
+          <ShopChargeBase width={42} y={73} />
+          {accent}
+        </>
+      );
+    case 15:
+      return (
+        <>
+          <path d="M25 61h46M48 59V26M34 40l14-14 14 14M33 48h30" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="6.5" />
+          <ShopChargeBase width={44} />
+          {accent}
+        </>
+      );
+    case 16:
+      return (
+        <>
+          <path d="M48 25 68 45 48 65 28 45 48 25Z" fill="none" stroke="currentColor" strokeLinejoin="miter" strokeWidth="6" />
+          <path d="M48 57V36M39 45l9-9 9 9" fill="none" stroke="currentColor" strokeLinecap="square" strokeLinejoin="miter" strokeWidth="5.8" />
+          <ShopChargeBase width={38} />
+          {accent}
+        </>
+      );
+      default:
+        return null;
+  }
+}
+
+function ShopPixelPackArtwork({ variant }: { variant: ShopArtworkVariant }) {
+  if (variant >= 1) {
+    return (
+      <ShopArtworkFrame className="is-paint-charge">
+        {renderPaintChargeArtwork(variant)}
+      </ShopArtworkFrame>
+    );
+  }
+
+  const content = (() => {
+    switch (variant) {
+      case 1:
+        return (
+          <>
+            <rect fill="none" height="34" rx="7" stroke="currentColor" strokeWidth="4" width="34" x="21" y="31" />
+            <path d="M31 41h14M31 51h9M59 58h14M66 51v14" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 2:
+        return (
+          <>
+            <path d="M28 32h28l12 12v20H28V32Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M56 32v13h12M37 47h18M37 57h12" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+          </>
+        );
+      case 3:
+        return (
+          <>
+            <path d="M25 34h44v31H25V34Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M35 44h8v8h-8v-8ZM53 44h8v8h-8v-8ZM35 56h8v8h-8v-8Z" fill="currentColor" opacity="0.72" />
+            <path d="M58 60h13M64.5 53.5v13" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 4:
+        return (
+          <>
+            <path d="M27 31h37v10H27V31Zm5 10h37v25H32V41Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M41 51h18M41 60h10" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M62 28v12" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+          </>
+        );
+      case 5:
+        return (
+          <>
+            <rect fill="none" height="38" rx="9" stroke="currentColor" strokeWidth="4" width="42" x="22" y="31" />
+            <path d="M32 41h7v7h-7v-7ZM47 41h7v7h-7v-7ZM32 56h7v7h-7v-7Z" fill="currentColor" opacity="0.76" />
+            <path d="M62 57h12M68 51v12" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 6:
+        return (
+          <>
+            <path d="M36 22h24v9l-6 7v25a12 12 0 0 1-24 0V38l6-7v-9Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M33 51h30M38 61h6v6h-6v-6ZM49 56h7v7h-7v-7Z" fill="currentColor" opacity="0.72" />
+            <path d="M63 56h10M68 51v10" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 7:
+        return (
+          <>
+            <path d="M24 61h48l-5 11H29l-5-11Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M30 30h36v31H30V30Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M39 39h7v7h-7v-7ZM51 39h7v7h-7v-7ZM39 51h7v7h-7v-7Z" fill="currentColor" opacity="0.68" />
+            <path d="M66 25v12M60 31h12" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 8:
+        return (
+          <>
+            <path d="M28 66c11-28 18-38 21-38s10 10 21 38H28Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M40 52h7v7h-7v-7ZM51 44h7v7h-7v-7ZM55 57h7v7h-7v-7Z" fill="currentColor" opacity="0.7" />
+            <path d="M27 28c5 2 8 5 9 10M67 28c-5 2-8 5-9 10" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+          </>
+        );
+      case 9:
+        return (
+          <>
+            <path d="M27 33h42v29H27V33Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M32 27h32M32 68h32" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M36 42h8v8h-8v-8ZM49 42h8v8h-8v-8ZM36 54h8v8h-8v-8Z" fill="currentColor" opacity="0.72" />
+            <path d="M63 54h12M69 48v12" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 10:
+        return (
+          <>
+            <path d="M29 28h31l8 8v32H29V28Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M60 28v10h8M37 40h7v7h-7v-7ZM50 40h7v7h-7v-7ZM37 53h7v7h-7v-7Z" fill="currentColor" opacity="0.72" />
+            <path d="M23 45h9M23 55h9" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+          </>
+        );
+      case 11:
+        return (
+          <>
+            <path d="M48 23c9 11 18 20 18 32a18 18 0 0 1-36 0c0-12 9-21 18-32Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M41 53h6v6h-6v-6ZM50 43h7v7h-7v-7ZM53 59h6v6h-6v-6Z" fill="currentColor" opacity="0.72" />
+            <path d="M65 31h11M70.5 25.5v11" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 12:
+        return (
+          <>
+            <path d="M25 44c6-8 12-12 20-12 11 0 16 9 26 8-3 15-11 24-25 24-10 0-17-7-21-20Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M38 43h7v7h-7v-7ZM50 38h7v7h-7v-7ZM50 52h7v7h-7v-7Z" fill="currentColor" opacity="0.72" />
+            <path d="M30 29c4 2 7 5 8 10" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+          </>
+        );
+      case 13:
+        return (
+          <>
+            <path d="m48 23 7 16 17 2-13 11 4 17-15-9-15 9 4-17-13-11 17-2 7-16Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M43 45h6v6h-6v-6ZM51 51h6v6h-6v-6Z" fill="currentColor" opacity="0.74" />
+            <path d="M70 27v10M65 32h10" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 14:
+        return (
+          <>
+            <path d="M28 66 57 37M49 29l18 18" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="4" />
+            <path d="m57 25 5 10 10 5-10 5-5 10-5-10-10-5 10-5 5-10Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M27 36h6M35 27v6M65 63h7M72 56v7" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+          </>
+        );
+      case 15:
+        return (
+          <>
+            <path d="M29 30h28l10 10v26H29V30Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M57 30v12h10M37 43h8v8h-8v-8ZM49 43h8v8h-8v-8ZM37 55h8v8h-8v-8Z" fill="currentColor" opacity="0.72" />
+            <path d="M70 57h10M75 52v10" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 16:
+        return (
+          <>
+            <path d="M27 54c8-20 15-30 21-30s13 10 21 30" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M25 54h46v15H25V54Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M35 60h7v7h-7v-7ZM48 60h7v7h-7v-7ZM61 60h7v7h-7v-7Z" fill="currentColor" opacity="0.72" />
+          </>
+        );
+      case 17:
+        return (
+          <>
+            <path d="M31 31h28l10 10v27H31V31Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M59 31v12h10M38 47h24M38 57h15" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M23 28h8M27 24v8M68 62h10M73 57v10" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 18:
+        return (
+          <>
+            <path d="M27 58 48 28l21 30H27Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M37 58v10h22V58M44 45h8v8h-8v-8Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M65 29h10M70 24v10" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 19:
+        return (
+          <>
+            <path d="M30 34h36v28H30V34Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M25 62h46l-5 10H30l-5-10Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M38 42h8v8h-8v-8ZM51 42h8v8h-8v-8ZM44 54h8v8h-8v-8Z" fill="currentColor" opacity="0.72" />
+          </>
+        );
+      case 20:
+        return (
+          <>
+            <circle cx="48" cy="48" fill="none" r="24" stroke="currentColor" strokeWidth="4" />
+            <path d="M48 24v48M24 48h48M31 31l34 34M65 31 31 65" stroke="currentColor" strokeLinecap="round" strokeWidth="3.5" />
+            <path d="M67 24v11M61.5 29.5h11" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+    }
+  })();
+
+  return (
+    <svg aria-hidden="true" className="shop-item-art" viewBox="0 0 96 96">
+      <rect className="shop-art-bg" height="88" rx="16" width="88" x="4" y="4" />
+      {content}
+      <path d="M30 22h36M30 74h22" opacity="0.28" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+    </svg>
+  );
+}
+
+function ShopCapacityArtwork({ variant }: { variant: ShopArtworkVariant }) {
+  if (variant >= 1) {
+    return (
+      <ShopArtworkFrame className="is-max-charge">
+        {renderMaxChargeArtwork(variant)}
+      </ShopArtworkFrame>
+    );
+  }
+
+  const content = (() => {
+    switch (variant) {
+      case 1:
+        return (
+          <>
+            <rect fill="none" height="34" rx="7" stroke="currentColor" strokeWidth="4" width="34" x="31" y="31" />
+            <path d="M39 39h6v6h-6v-6ZM51 39h6v6h-6v-6ZM39 51h6v6h-6v-6ZM51 51h6v6h-6v-6Z" fill="currentColor" opacity="0.72" />
+            <path d="M25 35V24h11M71 35V24H60M25 61v11h11M71 61v11H60" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="4" />
+          </>
+        );
+      case 2:
+        return (
+          <>
+            <path d="M28 48h40M48 28v40" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <rect fill="none" height="44" rx="9" stroke="currentColor" strokeWidth="4" width="44" x="26" y="26" />
+            <path d="M36 36h7v7h-7v-7ZM53 36h7v7h-7v-7ZM36 53h7v7h-7v-7ZM53 53h7v7h-7v-7Z" fill="currentColor" opacity="0.62" />
+          </>
+        );
+      case 3:
+        return (
+          <>
+            <path d="M24 56h48M40 24v48M56 24v48" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M27 35h42v30H27V35Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M66 26v13M59.5 32.5h13" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+          </>
+        );
+      case 4:
+        return (
+          <>
+            <path d="M30 30h36v36H30V30Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M38 38h20v20H38V38Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" opacity="0.64" />
+            <path d="M24 48h12M60 48h12M48 24v12M48 60v12" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+          </>
+        );
+      case 5:
+        return (
+          <>
+            <path d="M28 60V36h24v24H28Zm16-16h24v24H44V44Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M58 27v13M51.5 33.5h13" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M36 44h8v8h-8v-8ZM52 52h8v8h-8v-8Z" fill="currentColor" opacity="0.7" />
+          </>
+        );
+      case 6:
+        return (
+          <>
+            <rect fill="none" height="34" rx="8" stroke="currentColor" strokeWidth="4" width="34" x="31" y="31" />
+            <path d="M48 21v13M48 62v13M21 48h13M62 48h13" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="m28 28-7-7M68 28l7-7M28 68l-7 7M68 68l7 7" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+          </>
+        );
+      case 7:
+        return (
+          <>
+            <path d="M29 31h31l7 8v26H29V31Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M60 31v10h7M37 45h22M37 55h14" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M66 53h11M71.5 47.5v11" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 8:
+        return (
+          <>
+            <path d="M24 35h36v28H24V35Zm10-9h36v28H34V26Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M43 35h17M43 44h10" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M66 56h12M72 50v12" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 9:
+        return (
+          <>
+            <path d="M24 59a24 24 0 0 1 48 0" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="m48 56 13-16" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M36 59h24M30 68h36" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M69 27v12M63 33h12" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 10:
+        return (
+          <>
+            <path d="M27 34h42v30H27V34Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M36 43h8v8h-8v-8ZM52 43h8v8h-8v-8Z" fill="currentColor" opacity="0.7" />
+            <path d="M20 40h8M20 58h8M68 40h8M68 58h8M35 28v7M61 28v7M35 63v7M61 63v7" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+          </>
+        );
+      case 11:
+        return (
+          <>
+            <path d="M28 37h36a8 8 0 0 1 0 16H28V37Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M28 53h32a8 8 0 0 1 0 16H28V53Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M69 29v12M63 35h12" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 12:
+        return (
+          <>
+            <path d="M31 33h28l7 7v28H31V33Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M59 33v9h7M39 45h18M39 55h18" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M24 40v-9h9M72 56v9h-9" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="4" />
+          </>
+        );
+      case 13:
+        return (
+          <>
+            <path d="M27 65h42M33 54h30M39 43h18M45 32h6" stroke="currentColor" strokeLinecap="round" strokeWidth="7" />
+            <path d="M69 25v12M63 31h12" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 14:
+        return (
+          <>
+            <path d="M26 58a22 22 0 0 1 44 0" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M35 58h26M48 58l16-18" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M31 68h34" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M70 27v11M64.5 32.5h11" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 15:
+        return (
+          <>
+            <path d="M31 38h34v31H31V38Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M38 38V28h20v10M39 48h18M39 58h12" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M67 48h10M72 43v10" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 16:
+        return (
+          <>
+            <path d="M27 34h42v31H27V34Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M35 42h8v8h-8v-8ZM53 42h8v8h-8v-8ZM35 54h26" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M48 25v12M42 31h12M48 62v10" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 17:
+        return (
+          <>
+            <path d="M36 27h24v11l-6 5v21a12 12 0 0 1-24 0V43l6-5V27Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M35 54h26M39 63h18" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M66 45h11M71.5 39.5v11" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 18:
+        return (
+          <>
+            <path d="M26 44h44v27H26V44Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M32 44V31h32v13M38 54h20M38 63h14" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M69 28v11M63.5 33.5h11" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 19:
+        return (
+          <>
+            <path d="M27 48c8-12 14-18 21-18s13 6 21 18c-8 12-14 18-21 18s-13-6-21-18Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M39 48c4-5 6-7 9-7s5 2 9 7c-4 5-6 7-9 7s-5-2-9-7Z" fill="currentColor" opacity="0.72" />
+            <path d="M68 27v11M62.5 32.5h11" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+      case 20:
+        return (
+          <>
+            <path d="M30 36h36v33H30V36Z" fill="none" stroke="currentColor" strokeLinejoin="round" strokeWidth="4" />
+            <path d="M36 36c0-9 24-9 24 0M40 48h16M40 58h16" stroke="currentColor" strokeLinecap="round" strokeWidth="4" />
+            <path d="M48 22v12M42 28h12" stroke="currentColor" strokeLinecap="round" strokeWidth="4.5" />
+          </>
+        );
+    }
+  })();
+
+  return (
+    <svg aria-hidden="true" className="shop-item-art" viewBox="0 0 96 96">
+      <rect className="shop-art-bg" height="88" rx="16" width="88" x="4" y="4" />
+      {content}
+    </svg>
+  );
+}
+
+function formatAreaPreviewPathNumber(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "0";
+  }
+
+  return value.toFixed(3).replace(/\.?0+$/, "");
+}
+
+function buildAreaPreviewOutlinePaths(
+  outlineSegments: ClaimOutlineSegment[] | undefined,
+  viewMinX: number,
+  viewMaxY: number,
+  viewWidth: number,
+  viewHeight: number,
+): AreaPreviewOutlinePath[] {
+  if (!outlineSegments || outlineSegments.length === 0) {
+    return [];
+  }
+
+  const commands: string[] = [];
+
+  for (const segment of outlineSegments) {
+    if (segment.orientation === "horizontal") {
+      const y = ((viewMaxY - segment.line) / viewHeight) * 100;
+      const x1 = ((segment.start - viewMinX) / viewWidth) * 100;
+      const x2 = ((segment.end - viewMinX) / viewWidth) * 100;
+      commands.push(
+        `M${formatAreaPreviewPathNumber(x1)} ${formatAreaPreviewPathNumber(y)}H${formatAreaPreviewPathNumber(x2)}`,
+      );
+    } else {
+      const x = ((segment.line - viewMinX) / viewWidth) * 100;
+      const y1 = ((viewMaxY - segment.start) / viewHeight) * 100;
+      const y2 = ((viewMaxY - segment.end) / viewHeight) * 100;
+      commands.push(
+        `M${formatAreaPreviewPathNumber(x)} ${formatAreaPreviewPathNumber(y1)}V${formatAreaPreviewPathNumber(y2)}`,
+      );
+    }
+  }
+
+  return [{ d: commands.join(""), key: "area-shape" }];
+}
+
+function buildAreaPreview(
+  area: ClaimAreaListItem,
+  visualTileRevisions: Record<string, number>,
+): { tiles: AreaPreviewTile[]; outlinePaths: AreaPreviewOutlinePath[]; outlineStyle: CSSProperties; isCapped: boolean } {
+  const bounds = area.bounds;
+  const centerX = bounds.center_x;
+  const centerY = bounds.center_y;
+  const paddedWidth = Math.max(
+    AREA_PREVIEW_MIN_WORLD_SIZE,
+    bounds.width + Math.max(6, Math.ceil(bounds.width * 0.28)),
+  );
+  const paddedHeight = Math.max(
+    AREA_PREVIEW_MIN_WORLD_SIZE,
+    bounds.height + Math.max(6, Math.ceil(bounds.height * 0.28)),
+  );
+  let viewWidth = paddedWidth;
+  let viewHeight = paddedHeight;
+
+  if (viewWidth / viewHeight > AREA_PREVIEW_ASPECT_RATIO) {
+    viewHeight = viewWidth / AREA_PREVIEW_ASPECT_RATIO;
+  } else {
+    viewWidth = viewHeight * AREA_PREVIEW_ASPECT_RATIO;
+  }
+
+  const viewMinX = centerX - viewWidth / 2;
+  const viewMaxX = centerX + viewWidth / 2;
+  const viewMinY = centerY - viewHeight / 2;
+  const viewMaxY = centerY + viewHeight / 2;
+  const tileWorldSize = WORLD_LOW_TILE_SIZE;
+  const minTileX = Math.floor(viewMinX / tileWorldSize);
+  const maxTileX = Math.floor((viewMaxX - 1) / tileWorldSize);
+  const minTileY = Math.floor(viewMinY / tileWorldSize);
+  const maxTileY = Math.floor((viewMaxY - 1) / tileWorldSize);
+  const centerTileX = Math.floor(centerX / tileWorldSize);
+  const centerTileY = Math.floor(centerY / tileWorldSize);
+  const tileCoordinates: Array<{ tileX: number; tileY: number }> = [];
+
+  for (let tileY = minTileY; tileY <= maxTileY; tileY += 1) {
+    for (let tileX = minTileX; tileX <= maxTileX; tileX += 1) {
+      tileCoordinates.push({ tileX, tileY });
+    }
+  }
+
+  const cappedCoordinates = tileCoordinates.length > AREA_PREVIEW_MAX_TILES
+    ? tileCoordinates
+        .sort((left, right) => {
+          const leftDistance = (left.tileX - centerTileX) ** 2 + (left.tileY - centerTileY) ** 2;
+          const rightDistance = (right.tileX - centerTileX) ** 2 + (right.tileY - centerTileY) ** 2;
+
+          return leftDistance - rightDistance || left.tileY - right.tileY || left.tileX - right.tileX;
+        })
+        .slice(0, AREA_PREVIEW_MAX_TILES)
+    : tileCoordinates;
+
+  const tiles = cappedCoordinates.map(({ tileX, tileY }) => {
+    const tileKey = getWorldTileKey(tileX, tileY, WORLD_LOW_TILE_DETAIL_SCALE);
+    const tileOriginX = tileX * tileWorldSize;
+    const tileOriginY = tileY * tileWorldSize;
+
+    return {
+      key: tileKey,
+      src: getWorldTileUrl("visual-low", tileX, tileY, visualTileRevisions[tileKey] ?? 0),
+      left: ((tileOriginX - viewMinX) / viewWidth) * 100,
+      top: ((viewMaxY - (tileOriginY + tileWorldSize)) / viewHeight) * 100,
+      width: (tileWorldSize / viewWidth) * 100,
+      height: (tileWorldSize / viewHeight) * 100,
+    };
+  });
+
+  return {
+    tiles,
+    outlinePaths: buildAreaPreviewOutlinePaths(
+      area.outline_segments,
+      viewMinX,
+      viewMaxY,
+      viewWidth,
+      viewHeight,
+    ),
+    outlineStyle: {
+      left: `${((bounds.min_x - viewMinX) / viewWidth) * 100}%`,
+      top: `${((viewMaxY - (bounds.max_y + 1)) / viewHeight) * 100}%`,
+      width: `${(bounds.width / viewWidth) * 100}%`,
+      height: `${(bounds.height / viewHeight) * 100}%`,
+    },
+    isCapped: tileCoordinates.length > AREA_PREVIEW_MAX_TILES,
+  };
+}
+
+function ClaimAreaMiniPreview({
+  area,
+  visualTileRevisions,
+}: {
+  area: ClaimAreaListItem;
+  visualTileRevisions: Record<string, number>;
+}) {
+  const preview = useMemo(
+    () => buildAreaPreview(area, visualTileRevisions),
+    [area, visualTileRevisions],
+  );
+  const paintedRatio = area.claimed_pixels_count === 0
+    ? 0
+    : Math.round((area.painted_pixels_count / area.claimed_pixels_count) * 100);
+
+  return (
+    <div className={`owned-area-preview ${preview.isCapped ? "is-capped" : ""}`} aria-hidden="true">
+      <div className="owned-area-preview-tiles">
+        {preview.tiles.map((tile) => (
+          <span
+            className="owned-area-preview-tile"
+            key={tile.key}
+            style={{
+              height: `${tile.height}%`,
+              left: `${tile.left}%`,
+              top: `${tile.top}%`,
+              width: `${tile.width}%`,
+            }}
+          >
+            <Image
+              alt=""
+              fill
+              loading="lazy"
+              sizes="154px"
+              src={tile.src}
+              style={{ imageRendering: "pixelated", objectFit: "fill" }}
+              unoptimized
+            />
+          </span>
+        ))}
+      </div>
+      {preview.outlinePaths.length > 0 ? (
+        <svg
+          aria-hidden="true"
+          className="owned-area-preview-outline-layer"
+          preserveAspectRatio="none"
+          shapeRendering="crispEdges"
+          viewBox="0 0 100 100"
+        >
+          {preview.outlinePaths.map((path) => (
+            <path
+              className="owned-area-preview-outline-path"
+              d={path.d}
+              fill="none"
+              key={path.key}
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
+        </svg>
+      ) : (
+        <span className="owned-area-preview-outline" style={preview.outlineStyle} />
+      )}
+      <span className="owned-area-preview-progress" style={{ width: `${Math.min(100, Math.max(0, paintedRatio))}%` }} />
+    </div>
+  );
+}
+
 export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStageProps) {
   const worldRenderCountRef = useRef(0);
   const outsidePatternIdBase = useId().replace(/:/g, "");
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const buildPanelRef = useRef<HTMLDivElement | null>(null);
+  const accountMenuRef = useRef<HTMLDivElement | null>(null);
   const hoverCoordinateValueRef = useRef<HTMLSpanElement | null>(null);
   const crosshairHorizontalRef = useRef<HTMLDivElement | null>(null);
   const crosshairVerticalRef = useRef<HTMLDivElement | null>(null);
@@ -3970,11 +5592,22 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const pendingClaimPixelsRef = useRef<PixelCoordinate[]>([]);
   const pendingClaimPixelMapRef = useRef<Set<string>>(new Set());
   const pendingClaimRectanglesRef = useRef<PendingClaimRectangle[]>([]);
+  const pendingClaimCutoutRectanglesRef = useRef<PendingClaimCutoutRectangle[]>([]);
   const pendingPaintsRef = useRef<PendingPaint[]>([]);
   const pendingPaintMapRef = useRef<Map<string, PendingPaint>>(new Map());
   const pendingOverlayColorMapRef = useRef<Map<string, number>>(new Map());
   const selectedAreaOverlayColorMapRef = useRef<Map<string, number>>(new Map());
   const claimOutlineSegmentsRef = useRef<ClaimOutlineSegment[]>([]);
+  const claimOutlineDebugStatsRef = useRef<ClaimOutlineDebugStats>({
+    pathCount: 0,
+    pathChars: 0,
+    pendingPathChars: 0,
+    fetchBounds: null,
+    fetchCells: null,
+    lastFetchMs: null,
+    lastFetchSegments: 0,
+    lastFetchTruncated: false,
+  });
   const renderedWorldTilesRef = useRef<WorldTile[]>([]);
   const selectedPixelSnapshotRef = useRef<PixelCoordinate | null>(null);
   const selectedPixelFetchKeyRef = useRef<string | null>(null);
@@ -4057,9 +5690,20 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     y: 0,
     zoom: DEFAULT_ZOOM,
   });
+  const initialSharedViewportRef = useRef<SharedViewport | null>(
+    typeof window === "undefined" ? null : parseSharedViewportSearch(window.location.search),
+  );
+  const sharedViewportInspectionQueuedRef = useRef(false);
   const pointerRef = useRef<PointerPosition>({ x: 0, y: 0, inside: false });
   const activeModalRef = useRef<ActiveModal | null>(null);
+  const accountMenuOpenRef = useRef(false);
   const namePromptShownRef = useRef(false);
+  const pixelPlaceAudioRef = useRef<HTMLAudioElement | null>(null);
+  const soundMutedRef = useRef(false);
+  const lastPixelPlaceSoundAtRef = useRef(0);
+  const notificationsRef = useRef<AppNotification[]>([]);
+  const toastSequenceRef = useRef(0);
+  const errorToastSignaturesRef = useRef<Map<string, string>>(new Map());
   const [camera, setCamera] = useState<CameraState>({
     x: 0,
     y: 0,
@@ -4076,14 +5720,28 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [showGrid, setShowGrid] = useState(true);
   const [darkMode, setDarkMode] = useState(true);
   const [activeModal, setActiveModal] = useState<ActiveModal | null>(null);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [authStatus, setAuthStatus] = useState<AuthSessionStatus>(FALLBACK_AUTH_STATUS);
   const [authLoading, setAuthLoading] = useState(true);
   const [authBusy, setAuthBusy] = useState(false);
   const [profileName, setProfileName] = useState("");
   const [profileBusy, setProfileBusy] = useState(false);
   const [profileMessage, setProfileMessage] = useState<ProfileMessage | null>(null);
+  const [soundMuted, setSoundMuted] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [toastMessages, setToastMessages] = useState<AppToast[]>([]);
   const [avatarBusy, setAvatarBusy] = useState(false);
   const [avatarMessage, setAvatarMessage] = useState<ProfileMessage | null>(null);
+  const [shopBusyItem, setShopBusyItem] = useState<ShopItemId | null>(null);
+  const [shopQuantities, setShopQuantities] = useState<Record<ShopItemId, string>>({
+    pixel_pack_50: "1",
+    max_pixels_5: "1",
+  });
+  const [shopMessage, setShopMessage] = useState<ProfileMessage | null>(null);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteMessage, setDeleteMessage] = useState<ProfileMessage | null>(null);
   const [hoveredPixel, setHoveredPixel] = useState<PixelCoordinate | null>(null);
   const [selectedPixel, setSelectedPixel] = useState<PixelCoordinate | null>(null);
   const [inspectedPixel, setInspectedPixel] = useState<PixelCoordinate | null>(null);
@@ -4097,12 +5755,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [overlayPaletteOpen, setOverlayPaletteOpen] = useState(false);
   const [paintTool, setPaintTool] = useState<PaintTool>("brush");
   const [rectangleAnchor, setRectangleAnchor] = useState<PixelCoordinate | null>(null);
-  const [rectanglePlacementBusy, setRectanglePlacementBusy] = useState(false);
+  const rectanglePlacementBusy = false;
   const [buildPanelOpen, setBuildPanelOpen] = useState(false);
   const [buildPanelMinimized, setBuildPanelMinimized] = useState(false);
   const [buildPanelPosition, setBuildPanelPosition] = useState<BuildPanelPosition | null>(null);
   const [pendingClaimPixels, setPendingClaimPixels] = useState<PixelCoordinate[]>([]);
   const [pendingClaimRectangles, setPendingClaimRectangles] = useState<PendingClaimRectangle[]>([]);
+  const [pendingClaimCutoutRectangles, setPendingClaimCutoutRectangles] = useState<PendingClaimCutoutRectangle[]>([]);
   const [pendingPaints, setPendingPaints] = useState<PendingPaint[]>([]);
   const [placementBusy, setPlacementBusy] = useState(false);
   const [placementMessage, setPlacementMessage] = useState<ProfileMessage | null>(null);
@@ -4116,22 +5775,27 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const [selectedArea, setSelectedArea] = useState<ClaimAreaRecord | null>(null);
   const [areaPanelBusy, setAreaPanelBusy] = useState(false);
   const [areaDetailsBusy, setAreaDetailsBusy] = useState(false);
+  const [areaReactionBusy, setAreaReactionBusy] = useState(false);
   const [areaDraftName, setAreaDraftName] = useState("");
   const [areaDraftDescription, setAreaDraftDescription] = useState("");
   const [areaInvitePublicId, setAreaInvitePublicId] = useState("");
   const [areaEditorOpen, setAreaEditorOpen] = useState(false);
   const [areaMessage, setAreaMessage] = useState<ProfileMessage | null>(null);
+  const [areaShareMessage, setAreaShareMessage] = useState<ProfileMessage | null>(null);
   const [areaOptionsMenu, setAreaOptionsMenu] = useState<AreaOptionsMenuState | null>(null);
   const [areaPlayerOptionsMenu, setAreaPlayerOptionsMenu] = useState<AreaPlayerOptionsMenuState | null>(null);
   const [ownedAreas, setOwnedAreas] = useState<ClaimAreaListItem[]>([]);
   const [ownedAreasLoaded, setOwnedAreasLoaded] = useState(false);
   const [ownedAreasLoading, setOwnedAreasLoading] = useState(false);
   const [ownedAreasMessage, setOwnedAreasMessage] = useState<ProfileMessage | null>(null);
-
-  const setRectanglePlacementBusyState = useCallback((nextBusy: boolean): void => {
-    rectanglePlacementBusyRef.current = nextBusy;
-    setRectanglePlacementBusy(nextBusy);
-  }, []);
+  const [ownedAreaSearch, setOwnedAreaSearch] = useState("");
+  const [ownedAreaFilter, setOwnedAreaFilter] = useState<AreaListFilter>("all");
+  const [ownedAreaEditId, setOwnedAreaEditId] = useState<string | null>(null);
+  const [ownedAreaEditName, setOwnedAreaEditName] = useState("");
+  const [ownedAreaEditDescription, setOwnedAreaEditDescription] = useState("");
+  const [ownedAreaInviteId, setOwnedAreaInviteId] = useState<string | null>(null);
+  const [ownedAreaInvitePublicId, setOwnedAreaInvitePublicId] = useState("");
+  const [ownedAreaActionBusy, setOwnedAreaActionBusy] = useState<string | null>(null);
 
   const scheduleCameraUpdate = useCallback((nextCamera: CameraState): void => {
     pendingCameraUpdateRef.current = nextCamera;
@@ -4180,6 +5844,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   ownedAreasRef.current = ownedAreas;
   const worldOutsidePatternId = `${outsidePatternIdBase}-outside-pattern`;
   const worldOutsideMaskId = `${outsidePatternIdBase}-outside-mask`;
+
+  useEffect(() => {
+    setAreaShareMessage(null);
+  }, [selectedArea?.id]);
 
   const refreshAuthStatus = useCallback(async (showLoading = true): Promise<void> => {
     markPerfEvent("auth refresh start", showLoading ? "with loading" : "background");
@@ -4252,8 +5920,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           claimed_pixels_count: summary.claimed_pixels_count,
           painted_pixels_count: summary.painted_pixels_count,
           contributor_count: summary.contributor_count,
+          reactions: summary.reactions,
           viewer_can_edit: summary.viewer_can_edit,
           viewer_can_paint: summary.viewer_can_paint,
+          bounds: summary.bounds ?? area.bounds,
           created_at: summary.created_at,
           updated_at: summary.updated_at,
           last_activity_at: summary.last_activity_at,
@@ -4315,6 +5985,40 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       } else {
         setOwnedAreasMessage(message);
       }
+    }
+  }, []);
+
+  const handleAreaShare = useCallback(async (): Promise<void> => {
+    if (selectedAreaSnapshotRef.current === null || inspectedPixelSnapshotRef.current === null) {
+      return;
+    }
+
+    setAreaShareMessage(null);
+
+    try {
+      if (typeof window === "undefined" || typeof navigator === "undefined" || !navigator.clipboard) {
+        throw new Error("Clipboard API is not available.");
+      }
+
+      const targetPixel = inspectedPixelSnapshotRef.current;
+      const currentCamera = pendingCameraUpdateRef.current ?? cameraRef.current;
+      const shareUrl = new URL(window.location.href);
+      shareUrl.search = "";
+      shareUrl.hash = "";
+      shareUrl.searchParams.set("x", formatShareNumber(targetPixel.x, 0));
+      shareUrl.searchParams.set("y", formatShareNumber(targetPixel.y, 0));
+      shareUrl.searchParams.set("zoom", formatShareNumber(currentCamera.zoom, 4));
+
+      await navigator.clipboard.writeText(shareUrl.toString());
+      setAreaShareMessage({
+        tone: "success",
+        text: "Share link copied.",
+      });
+    } catch {
+      setAreaShareMessage({
+        tone: "error",
+        text: "Share link could not be copied automatically.",
+      });
     }
   }, []);
 
@@ -4465,6 +6169,36 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   }, [areaPlayerOptionsMenu]);
 
   useEffect(() => {
+    if (!accountMenuOpen) {
+      return;
+    }
+
+    const handlePointerDown = (event: PointerEvent): void => {
+      const menu = accountMenuRef.current;
+
+      if (menu !== null && event.target instanceof Node && !menu.contains(event.target)) {
+        setAccountMenuOpen(false);
+        setDeleteConfirmOpen(false);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        setAccountMenuOpen(false);
+        setDeleteConfirmOpen(false);
+      }
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [accountMenuOpen]);
+
+  useEffect(() => {
     void refreshAuthStatus();
   }, [refreshAuthStatus]);
 
@@ -4533,10 +6267,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       setOverlayPaletteOpen(false);
       setPendingClaimPixels([]);
       setPendingClaimRectangles([]);
+      setPendingClaimCutoutRectangles([]);
       setPendingPaints([]);
       pendingClaimPixelsRef.current = [];
       pendingClaimPixelMapRef.current = new Set();
       pendingClaimRectanglesRef.current = [];
+      pendingClaimCutoutRectanglesRef.current = [];
       pendingPaintsRef.current = [];
       pendingPaintMapRef.current = new Map();
       pendingOverlayDraftRef.current = null;
@@ -4566,11 +6302,14 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setProfileName(authStatus.user?.display_name ?? "");
     setProfileMessage(null);
     setAvatarMessage(null);
+    setDeleteMessage(null);
+    setDeleteConfirmOpen(false);
   }, [authStatus.user?.display_name]);
 
   useEffect(() => {
     if (authStatus.user?.needs_display_name_setup && !namePromptShownRef.current) {
-      setActiveModal("login");
+      setActiveModal(null);
+      setAccountMenuOpen(true);
       namePromptShownRef.current = true;
     }
 
@@ -4879,11 +6618,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const ownedActiveAreas = useMemo(() => {
     return ownedAreas.filter((area) => area.status === "active" && area.viewer_can_edit);
   }, [ownedAreas]);
-  const contributedActiveAreas = useMemo(() => {
-    return ownedAreas.filter((area) => area.status === "active" && !area.viewer_can_edit && area.viewer_can_paint);
-  }, [ownedAreas]);
-  const finishedVisibleAreas = useMemo(() => {
-    return ownedAreas.filter((area) => area.status === "finished");
+  const ownedAreaCount = useMemo(() => {
+    return ownedAreas.filter((area) => area.viewer_can_edit).length;
   }, [ownedAreas]);
   const hasFreeAreaSlot = currentUser === null
     ? true
@@ -4937,6 +6673,9 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const focusedClaimOutlineAreaBounds = focusedClaimOutlineArea?.bounds ?? null;
 
   currentUserRef.current = currentUser;
+  accountMenuOpenRef.current = accountMenuOpen;
+  soundMutedRef.current = soundMuted;
+  notificationsRef.current = notifications;
   activeWorldBoundsRef.current = activeWorldBounds;
   activeChunksRef.current = activeChunks;
   activeBuildModeRef.current = activeBuildMode;
@@ -5158,19 +6897,249 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return "Display name changes are temporarily unavailable.";
   }, [currentUser]);
 
+  const unreadNotificationCount = useMemo(
+    () => notifications.filter((notification) => !notification.read).length,
+    [notifications],
+  );
+  const notificationBadgeLabel = unreadNotificationCount > 0
+    ? getUnreadNotificationLabel(unreadNotificationCount)
+    : "";
+  const currentUserPublicId = currentUser?.public_id ?? null;
+
+  const pushNotification = useCallback((notification: Omit<AppNotification, "createdAt" | "read">): void => {
+    setNotifications((current) => {
+      if (current.some((existing) => existing.id === notification.id)) {
+        return current;
+      }
+
+      return [
+        {
+          ...notification,
+          createdAt: new Date().toISOString(),
+          read: false,
+        },
+        ...current,
+      ].slice(0, NOTIFICATION_LIMIT);
+    });
+  }, []);
+
+  const pushToast = useCallback((toast: Omit<AppToast, "id">): void => {
+    const id = `toast-${Date.now()}-${toastSequenceRef.current}`;
+    toastSequenceRef.current += 1;
+
+    setToastMessages((current) => [
+      {
+        ...toast,
+        id,
+      },
+      ...current,
+    ].slice(0, TOAST_LIMIT));
+
+    window.setTimeout(() => {
+      setToastMessages((current) => current.filter((message) => message.id !== id));
+    }, TOAST_DISMISS_MS);
+  }, []);
+
+  const dismissToast = useCallback((id: string): void => {
+    setToastMessages((current) => current.filter((message) => message.id !== id));
+  }, []);
+
+  const markNotificationsRead = useCallback((): void => {
+    setNotifications((current) => {
+      if (current.every((notification) => notification.read)) {
+        return current;
+      }
+
+      return current.map((notification) => ({
+        ...notification,
+        read: true,
+      }));
+    });
+  }, []);
+
+  const playPixelPlaceSound = useCallback((): void => {
+    if (soundMutedRef.current || typeof window === "undefined") {
+      return;
+    }
+
+    const now = performance.now();
+
+    if (now - lastPixelPlaceSoundAtRef.current < PIXEL_PLACE_SOUND_THROTTLE_MS) {
+      return;
+    }
+
+    lastPixelPlaceSoundAtRef.current = now;
+    const audio = pixelPlaceAudioRef.current ?? new Audio(PIXEL_PLACE_SOUND_SRC);
+    pixelPlaceAudioRef.current = audio;
+    audio.volume = 0.42;
+    audio.currentTime = 0;
+    void audio.play().catch(() => undefined);
+  }, []);
+
+  function handleNotificationsToggle(): void {
+    setNotificationsOpen((open) => {
+      const nextOpen = !open;
+
+      if (nextOpen) {
+        markNotificationsRead();
+      }
+
+      return nextOpen;
+    });
+  }
+
+  function handleSoundMuteToggle(): void {
+    setSoundMuted((muted) => !muted);
+  }
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    setSoundMuted(window.localStorage.getItem(SOUND_MUTED_STORAGE_KEY) === "1");
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    window.localStorage.setItem(SOUND_MUTED_STORAGE_KEY, soundMuted ? "1" : "0");
+  }, [soundMuted]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || currentUserPublicId === null) {
+      setNotifications([]);
+      setNotificationsOpen(false);
+      return;
+    }
+
+    try {
+      const stored = window.localStorage.getItem(`${NOTIFICATION_STORAGE_PREFIX}${currentUserPublicId}`);
+      const parsed = stored ? JSON.parse(stored) : [];
+      setNotifications(Array.isArray(parsed) ? parsed.filter(isStoredNotification).slice(0, NOTIFICATION_LIMIT) : []);
+    } catch {
+      setNotifications([]);
+    }
+
+    setNotificationsOpen(false);
+  }, [currentUserPublicId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || currentUserPublicId === null) {
+      return;
+    }
+
+    window.localStorage.setItem(
+      `${NOTIFICATION_STORAGE_PREFIX}${currentUserPublicId}`,
+      JSON.stringify(notifications.slice(0, NOTIFICATION_LIMIT)),
+    );
+  }, [currentUserPublicId, notifications]);
+
+  useEffect(() => {
+    const sources: Array<[string, string, ProfileMessage | null]> = [
+      ["profile", "Profile error", profileMessage],
+      ["avatar", "Avatar error", avatarMessage],
+      ["shop", "Shop error", shopMessage],
+      ["delete", "Account error", deleteMessage],
+      ["area", "Area error", areaMessage],
+      ["areas-list", "My Areas error", ownedAreasMessage],
+      ["placement", "Placement error", placementMessage],
+    ];
+
+    for (const [source, title, message] of sources) {
+      if (message?.tone !== "error") {
+        errorToastSignaturesRef.current.delete(source);
+        continue;
+      }
+
+      const signature = message.text;
+      if (errorToastSignaturesRef.current.get(source) === signature) {
+        continue;
+      }
+
+      errorToastSignaturesRef.current.set(source, signature);
+      pushToast({
+        tone: "error",
+        title,
+        text: signature,
+      });
+    }
+  }, [
+    areaMessage,
+    avatarMessage,
+    deleteMessage,
+    ownedAreasMessage,
+    placementMessage,
+    profileMessage,
+    pushToast,
+    shopMessage,
+  ]);
+
+  useEffect(() => {
+    if (currentUserPublicId === null || !currentUser?.needs_display_name_setup) {
+      return;
+    }
+
+    pushNotification({
+      id: `profile-setup-${currentUserPublicId}`,
+      tone: "warning",
+      title: "Profile setup",
+      body: "Choose your display name so other players can recognize you on PixelProject.",
+    });
+  }, [currentUser?.needs_display_name_setup, currentUserPublicId, pushNotification]);
+
+  useEffect(() => {
+    if (currentUserPublicId === null || !ownedAreasLoaded) {
+      return;
+    }
+
+    const joinedAreas = ownedAreas.filter((area) => !area.viewer_can_edit && area.viewer_can_paint);
+
+    if (joinedAreas.length === 0) {
+      return;
+    }
+
+    pushNotification({
+      id: `joined-areas-${currentUserPublicId}-${joinedAreas.map((area) => area.id).sort().join("-")}`,
+      tone: "info",
+      title: "Area access",
+      body: `You can now paint in ${joinedAreas.length} shared area${joinedAreas.length === 1 ? "" : "s"}.`,
+    });
+  }, [currentUserPublicId, ownedAreas, ownedAreasLoaded, pushNotification]);
+
   useEffect(() => {
     if (isCentered || viewportSize.width === 0 || viewportSize.height === 0) {
       return;
     }
 
-    const initialZoom = clampZoom(Math.min(DEFAULT_ZOOM, fitZoom), minZoom);
+    const sharedViewport = initialSharedViewportRef.current;
+    const initialZoom = sharedViewport
+      ? clampZoom(sharedViewport.zoom, minZoom)
+      : clampZoom(Math.min(DEFAULT_ZOOM, fitZoom), minZoom);
+    const centerX = sharedViewport?.x ?? activeWorldBounds.centerX;
+    const centerY = sharedViewport?.y ?? activeWorldBounds.centerY;
+
     setCamera(
       clampCamera({
-        x: viewportSize.width / 2 - activeWorldBounds.centerX * initialZoom,
-        y: viewportSize.height / 2 + activeWorldBounds.centerY * initialZoom,
+        x: viewportSize.width / 2 - centerX * initialZoom,
+        y: viewportSize.height / 2 + centerY * initialZoom,
         zoom: initialZoom,
       }),
     );
+
+    if (sharedViewport !== null) {
+      const targetPixel = {
+        x: Math.floor(sharedViewport.x),
+        y: Math.floor(sharedViewport.y),
+      };
+      setSelectedPixel(targetPixel);
+      setInspectedPixel(targetPixel);
+      setInspectedPixelRecord(null);
+      sharedViewportInspectionQueuedRef.current = true;
+    }
+
     setIsCentered(true);
   }, [
     activeWorldBounds.centerX,
@@ -5609,32 +7578,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return null;
     }
 
-    if (focusedClaimOutlineAreaId !== null) {
-      if (focusedClaimOutlineAreaBounds === null) {
-        return null;
-      }
-
-      const focusedAreaBounds = {
-        minX: Math.max(activeWorldBounds.minX, focusedClaimOutlineAreaBounds.min_x - 1),
-        maxX: Math.min(activeWorldBounds.maxX - 1, focusedClaimOutlineAreaBounds.max_x + 1),
-        minY: Math.max(activeWorldBounds.minY, focusedClaimOutlineAreaBounds.min_y - 1),
-        maxY: Math.min(activeWorldBounds.maxY - 1, focusedClaimOutlineAreaBounds.max_y + 1),
-      };
-
-      if (
-        focusedAreaBounds.minX > focusedAreaBounds.maxX ||
-        focusedAreaBounds.minY > focusedAreaBounds.maxY
-      ) {
-        return null;
-      }
-
-      return focusedAreaBounds;
-    }
-
-    if (!semanticZoomMode || fetchWorldTileDetailScale !== 1) {
-      return null;
-    }
-
     const overscanWorldX = Math.ceil(
       (viewportSize.width / Math.max(fetchCamera.zoom, ABSOLUTE_MIN_ZOOM)) *
         CLAIM_OUTLINE_FETCH_OVERSCAN_VIEWPORT_FACTOR,
@@ -5643,7 +7586,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       (viewportSize.height / Math.max(fetchCamera.zoom, ABSOLUTE_MIN_ZOOM)) *
         CLAIM_OUTLINE_FETCH_OVERSCAN_VIEWPORT_FACTOR,
     );
-
     const viewportBounds = {
       minX: Math.max(
         activeWorldBounds.minX,
@@ -5674,6 +7616,36 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         ),
       ),
     };
+
+    if (focusedClaimOutlineAreaId !== null) {
+      if (focusedClaimOutlineAreaBounds === null) {
+        return null;
+      }
+
+      const focusedAreaBounds = {
+        minX: Math.max(viewportBounds.minX, focusedClaimOutlineAreaBounds.min_x - 1),
+        maxX: Math.min(viewportBounds.maxX, focusedClaimOutlineAreaBounds.max_x + 1),
+        minY: Math.max(viewportBounds.minY, focusedClaimOutlineAreaBounds.min_y - 1),
+        maxY: Math.min(viewportBounds.maxY, focusedClaimOutlineAreaBounds.max_y + 1),
+      };
+
+      if (
+        focusedAreaBounds.minX > focusedAreaBounds.maxX ||
+        focusedAreaBounds.minY > focusedAreaBounds.maxY
+      ) {
+        return null;
+      }
+
+      if (getWorldWindowCellCount(focusedAreaBounds) > CLAIM_OUTLINE_MAX_FOCUSED_FETCH_CELLS) {
+        return null;
+      }
+
+      return focusedAreaBounds;
+    }
+
+    if (!semanticZoomMode || fetchWorldTileDetailScale !== 1) {
+      return null;
+    }
 
     if (getWorldWindowCellCount(viewportBounds) > CLAIM_OUTLINE_MAX_FREE_FETCH_CELLS) {
       return null;
@@ -5869,12 +7841,22 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   const refreshClaimOutlineNow = useCallback(async (options?: { force?: boolean }): Promise<void> => {
     if (claimOutlineFetchBounds === null) {
+      claimOutlineDebugStatsRef.current = {
+        ...claimOutlineDebugStatsRef.current,
+        fetchBounds: null,
+        fetchCells: null,
+        lastFetchMs: null,
+        lastFetchSegments: 0,
+        lastFetchTruncated: false,
+      };
       clearClaimOutlinesImmediately();
       return;
     }
 
     const bounds = claimOutlineFetchBounds;
-    const requestKey = `${getFetchBoundsKey(bounds)}:${focusedClaimOutlineAreaPublicId ?? "active"}:${currentUser?.id ?? "guest"}`;
+    const boundsKey = getFetchBoundsKey(bounds);
+    const fetchCellCount = getWorldWindowCellCount(bounds);
+    const requestKey = `${boundsKey}:${focusedClaimOutlineAreaPublicId ?? "active"}:${currentUser?.id ?? "guest"}`;
     const now = performance.now();
     const force = options?.force === true;
     const cacheHit = claimOutlineFetchLastSuccessRef.current;
@@ -5898,11 +7880,19 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     claimOutlineFetchAbortRef.current = abortController;
     claimOutlineFetchKeyRef.current = requestKey;
     const startedAt = now;
-    markPerfEvent("claim outline fetch start");
+    claimOutlineDebugStatsRef.current = {
+      ...claimOutlineDebugStatsRef.current,
+      fetchBounds: boundsKey,
+      fetchCells: fetchCellCount,
+      lastFetchMs: null,
+      lastFetchSegments: 0,
+      lastFetchTruncated: false,
+    };
+    markPerfEvent("claim outline fetch start", `${boundsKey}; ${formatCount(fetchCellCount)} cells`);
     emitDebugEvent(
       "network",
       "Claim outline fetch start",
-      `${bounds.minX}:${bounds.minY} -> ${bounds.maxX}:${bounds.maxY}`,
+      `${boundsKey}; ${formatCount(fetchCellCount)} cells; ${focusedClaimOutlineAreaPublicId === null ? "active outlines" : `focus #${focusedClaimOutlineAreaPublicId}`}`,
     );
     const result = await fetchClaimOutlinePixels(
       bounds.minX,
@@ -5937,12 +7927,21 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       setClaimOutlineSegments(result.segments);
       return true;
     }, (applied) => `${result.segments.length} segments${applied ? "" : " unchanged"}`);
-    markPerfEvent("claim outline fetch done", `${result.segments.length} segments`);
+    const fetchDuration = performance.now() - startedAt;
+    claimOutlineDebugStatsRef.current = {
+      ...claimOutlineDebugStatsRef.current,
+      fetchBounds: boundsKey,
+      fetchCells: fetchCellCount,
+      lastFetchMs: fetchDuration,
+      lastFetchSegments: result.segments.length,
+      lastFetchTruncated: result.truncated,
+    };
+    markPerfEvent("claim outline fetch done", `${result.segments.length} segments${result.truncated ? " (truncated)" : ""}; ${formatPerfTime(fetchDuration)}`);
     emitDebugEvent(
       "network",
       "Claim outline fetch done",
-      `${result.segments.length} segments`,
-      performance.now() - startedAt,
+      `${result.segments.length} segments${result.truncated ? " (truncated)" : ""}; ${boundsKey}; ${formatCount(fetchCellCount)} cells`,
+      fetchDuration,
     );
   }, [
     claimOutlineFetchBounds,
@@ -5987,6 +7986,14 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       claimOutlineFetchAbortRef.current?.abort();
       claimOutlineFetchAbortRef.current = null;
       claimOutlineFetchKeyRef.current = null;
+      claimOutlineDebugStatsRef.current = {
+        ...claimOutlineDebugStatsRef.current,
+        fetchBounds: null,
+        fetchCells: null,
+        lastFetchMs: null,
+        lastFetchSegments: 0,
+        lastFetchTruncated: false,
+      };
       claimOutlineSegmentsRef.current = [];
       setClaimOutlineSegments((current) => current.length === 0 ? current : []);
       return;
@@ -5994,9 +8001,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     let cancelled = false;
     const fetchGeneration = cameraFetchGenerationRef.current;
+    const fetchBoundsKey = getFetchBoundsKey(claimOutlineFetchBounds);
+    const fetchCellCount = getWorldWindowCellCount(claimOutlineFetchBounds);
     markPerfEvent(
       "claim outline fetch scheduled",
-      `${claimOutlineFetchBounds.minX}:${claimOutlineFetchBounds.minY} -> ${claimOutlineFetchBounds.maxX}:${claimOutlineFetchBounds.maxY}`,
+      `${fetchBoundsKey}; ${formatCount(fetchCellCount)} cells`,
     );
     const fetchTimeout = window.setTimeout(async () => {
       if (!cancelled && fetchGeneration === cameraFetchGenerationRef.current) {
@@ -6037,6 +8046,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   pendingClaimPixelsRef.current = pendingClaimPixels;
   pendingClaimPixelMapRef.current = pendingClaimPixelMap;
   pendingClaimRectanglesRef.current = pendingClaimRectangles;
+  pendingClaimCutoutRectanglesRef.current = pendingClaimCutoutRectangles;
   pendingPaintsRef.current = pendingPaints;
 
   const syncPendingClaims = useCallback((
@@ -6052,6 +8062,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     pendingClaimRectanglesRef.current = nextRectangles;
     setPendingClaimPixels(nextPixels);
     setPendingClaimRectangles(nextRectangles);
+  }, []);
+
+  const syncPendingClaimCutoutRectangles = useCallback((nextRectangles: PendingClaimCutoutRectangle[]): void => {
+    pendingClaimCutoutRectanglesRef.current = nextRectangles;
+    setPendingClaimCutoutRectangles(nextRectangles);
   }, []);
 
   const syncPendingPaints = useCallback((
@@ -6172,6 +8187,55 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     return claimAreaDetailCacheRef.current.get(areaId) ?? claimAreaCacheRef.current.get(areaId) ?? null;
   }, []);
 
+  useEffect(() => {
+    if (!isCentered || !sharedViewportInspectionQueuedRef.current || inspectedPixel === null) {
+      return;
+    }
+
+    sharedViewportInspectionQueuedRef.current = false;
+    const targetPixel = inspectedPixel;
+    const pixelKey = getPixelKey(targetPixel);
+    const abortController = new AbortController();
+    areaInspectionAbortRef.current?.abort();
+    areaInspectionAbortRef.current = abortController;
+    setAreaPanelBusy(true);
+    setAreaMessage(null);
+    markPerfEvent("area share inspect start", pixelKey);
+
+    void fetchClaimAreaAtPixel(targetPixel.x, targetPixel.y, abortController.signal).then((result) => {
+      if (abortController.signal.aborted) {
+        return;
+      }
+
+      areaInspectionAbortRef.current = null;
+      setAreaPanelBusy(false);
+
+      if (!result.ok || result.inspection === null) {
+        if (result.error === "Area inspection request aborted.") {
+          return;
+        }
+
+        setInspectedPixelRecord(null);
+        applyAreaSelection(null);
+        setAreaMessage({
+          tone: "error",
+          text: result.error ?? "Shared area details could not be loaded.",
+        });
+        return;
+      }
+
+      markPerfEvent("area share inspect done", pixelKey);
+      setInspectedPixelRecord(result.inspection.pixel);
+      applyAreaSelection(
+        result.inspection.area === null ? null : cacheClaimAreaSummary(result.inspection.area),
+      );
+    });
+
+    return () => {
+      abortController.abort();
+    };
+  }, [applyAreaSelection, cacheClaimAreaSummary, inspectedPixel, isCentered]);
+
   const handleTileLoaded = useCallback((layer: DebugTileLayer, tileKey: string, nextSrc: string): void => {
     retainedTileSrcRef.current[layer].set(tileKey, nextSrc);
   }, []);
@@ -6245,6 +8309,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     const selectedPixelSnapshot = selectedPixelSnapshotRef.current;
     const inspectedPixelSnapshot = inspectedPixelSnapshotRef.current;
     const primaryRenderedTile = renderedWorldTilesRef.current[0] ?? null;
+    const outlineDebug = claimOutlineDebugStatsRef.current;
 
     return {
       zoom: zoomRef.current,
@@ -6256,6 +8321,14 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       renderedTiles: renderedWorldTilesRef.current.length,
       visiblePixels: visiblePixelsRef.current.length,
       claimOutlineSegments: claimOutlineSegmentsRef.current.length,
+      claimOutlinePaths: outlineDebug.pathCount,
+      claimOutlinePathChars: outlineDebug.pathChars,
+      pendingClaimOutlinePathChars: outlineDebug.pendingPathChars,
+      claimOutlineFetchBounds: outlineDebug.fetchBounds,
+      claimOutlineFetchCells: outlineDebug.fetchCells,
+      claimOutlineLastFetchMs: outlineDebug.lastFetchMs,
+      claimOutlineLastFetchSegments: outlineDebug.lastFetchSegments,
+      claimOutlineLastFetchTruncated: outlineDebug.lastFetchTruncated,
       pendingClaims: getPendingClaimCount(
         pendingClaimPixelsRef.current,
         pendingClaimRectanglesRef.current,
@@ -6628,43 +8701,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }, (applied) => `${fetchedPixels.length} fetched, ${claimContextPixelIndexRef.current.size} current${applied ? "" : " unchanged"}`);
   }, []);
 
-  const hydrateClaimRectanglePixelWindow = useCallback(async (
-    rectangle: PendingClaimRectangle,
-  ): Promise<{ pixelCount: number; truncated: boolean }> => {
-    const bounds = activeWorldBoundsRef.current;
-
-    if (bounds === null) {
-      return { pixelCount: 0, truncated: false };
-    }
-
-    const fetchBounds = getClaimRectangleFetchBounds(rectangle, bounds);
-    const startedAt = performance.now();
-    emitDebugEvent(
-      "network",
-      "Rectangle claim fetch start",
-      `${fetchBounds.minX}:${fetchBounds.minY} -> ${fetchBounds.maxX}:${fetchBounds.maxY}`,
-    );
-    const result = await fetchClaimContextPixels(
-      fetchBounds.minX,
-      fetchBounds.maxX,
-      fetchBounds.minY,
-      fetchBounds.maxY,
-    );
-
-    mergeFetchedPixelsIntoClaimContext(result.pixels, "Apply rectangle claim fetch");
-    emitDebugEvent(
-      "network",
-      "Rectangle claim fetch done",
-      `${result.pixels.length} pixels${result.truncated ? " (truncated)" : ""}`,
-      performance.now() - startedAt,
-    );
-
-    return {
-      pixelCount: result.pixels.length,
-      truncated: result.truncated,
-    };
-  }, [mergeFetchedPixelsIntoClaimContext]);
-
   const prefetchRectangleAnchorWindow = useCallback(async (
     anchor: PixelCoordinate,
   ): Promise<void> => {
@@ -6929,6 +8965,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           markWorldTilesDirty(dirtyTiles);
         }
 
+        if (!payload.world_dirty && dirtyTiles.length === 0) {
+          if (payload.actor_user_id !== null && payload.actor_user_id === currentUserRef.current?.id) {
+            void refreshAuthStatusRef.current(false);
+          }
+          return;
+        }
+
         scheduleRealtimeRefresh(payload.source);
       };
 
@@ -7132,24 +9175,46 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     );
   }, [camera, pendingClaimPixels, pendingClaimRectangles]);
 
-  const pendingClaimOutlinePath = useMemo(() => {
+  const pendingClaimOutlinePaths = useMemo(() => {
     return measureDebugWork(
       "Compute pending claim outline",
-      () => buildPendingClaimOutlinePath(pendingClaimPixels, pendingClaimRectangles, camera),
-      (path) => (path === null ? "no outline" : `${path.length} path characters`),
+      () => buildClaimOutlinePaths(
+        buildPendingClaimOutlineSegments(pendingClaimPixels, pendingClaimRectangles),
+        camera,
+      ),
+      (paths) => `${paths.length} paths, ${formatCount(paths.reduce((total, path) => total + path.d.length, 0))} path characters`,
     );
   }, [camera, pendingClaimPixels, pendingClaimRectangles]);
 
-  const claimOutlinePaths = useMemo(() => {
+  const exactClaimOutlinePaths = useMemo(() => {
     return measureDebugWork(
       "Compute claim outline paths",
       () => buildClaimOutlinePaths(
         claimOutlineSegments,
         camera,
       ),
-      (paths) => `${paths.length} paths from ${claimOutlineSegments.length} segments`,
+      (paths) => `${paths.length} paths, ${formatCount(paths.reduce((total, path) => total + path.d.length, 0))} chars from ${claimOutlineSegments.length} segments`,
     );
   }, [camera, claimOutlineSegments]);
+
+  const coarseClaimOutlinePaths = useMemo(() => {
+    return measureDebugWork(
+      "Compute coarse claim outline",
+      () => buildClaimAreaBoundsOutlinePaths(focusedClaimOutlineArea, camera),
+      (paths) => `${paths.length} bounds paths`,
+    );
+  }, [camera, focusedClaimOutlineArea]);
+
+  const claimOutlinePaths = exactClaimOutlinePaths.length > 0 ? exactClaimOutlinePaths : coarseClaimOutlinePaths;
+
+  useEffect(() => {
+    claimOutlineDebugStatsRef.current = {
+      ...claimOutlineDebugStatsRef.current,
+      pathCount: claimOutlinePaths.length,
+      pathChars: claimOutlinePaths.reduce((total, path) => total + path.d.length, 0),
+      pendingPathChars: pendingClaimOutlinePaths.reduce((total, path) => total + path.d.length, 0),
+    };
+  }, [claimOutlinePaths, pendingClaimOutlinePaths]);
 
   const pendingPaintTiles = useMemo(() => {
     return measureDebugWork(
@@ -7274,7 +9339,16 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return "Contributor access";
     }
 
-    return `Claimed by #${selectedPixelRecord.owner_public_id}`;
+    if (selectedPixelRecord.owner_public_id !== null) {
+      return `Claimed by ${formatPlayerNameWithId(
+        selectedPixelRecord.owner_display_name ?? "Player",
+        selectedPixelRecord.owner_public_id,
+      )}`;
+    }
+
+    return selectedPixelRecord.owner_display_name
+      ? `Claimed by ${selectedPixelRecord.owner_display_name}`
+      : "Claimed territory";
   }, [currentUser, selectedPendingPaint, selectedPixel, selectedPixelRecord, selectedPlacementState.isPendingClaim]);
 
   const placementHelpText = useMemo(() => {
@@ -7501,7 +9575,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
   const pickPaintColorAtPixel = useCallback((
     targetPixel: PixelCoordinate,
-    options?: { activateBrush?: boolean; quiet?: boolean },
+    options?: { activateBrush?: boolean; quiet?: boolean; updateSelection?: boolean },
   ): boolean => {
     const targetState = getPlacementState(targetPixel);
 
@@ -7515,11 +9589,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return false;
     }
 
-    setSelectedPixel((current) => (
-      current !== null && current.x === targetPixel.x && current.y === targetPixel.y
-        ? current
-        : targetPixel
-    ));
+    if (options?.updateSelection !== false) {
+      setSelectedPixel((current) => (
+        current !== null && current.x === targetPixel.x && current.y === targetPixel.y
+          ? current
+          : targetPixel
+      ));
+    }
 
     const pickedColorId =
       getOverlayColorIdAtPixel(targetPixel) ??
@@ -7663,6 +9739,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     if (changed) {
       syncPendingPaints(nextPaints, nextPaintMap);
+      playPixelPlaceSound();
     }
 
     if (!options?.quiet) {
@@ -7685,7 +9762,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
 
     return stagedKeys;
-  }, [getPlacementState, syncPendingPaints]);
+  }, [getPlacementState, playPixelPlaceSound, syncPendingPaints]);
 
   const stageActiveToolPixel = useCallback((
     targetPixel: PixelCoordinate,
@@ -7840,7 +9917,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     syncPendingClaims,
   ]);
 
-  const stageClaimRectangle = useCallback(async (start: PixelCoordinate, end: PixelCoordinate): Promise<boolean> => {
+  const stageClaimRectangle = useCallback((start: PixelCoordinate, end: PixelCoordinate): boolean => {
     if (isPixelInsideActiveWorld(end)) {
       setSelectedPixel(end);
     }
@@ -7875,10 +9952,10 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     const pixelMap = claimContextPixelIndexRef.current;
     const bounds = activeWorldBoundsRef.current;
     const activeChunks = activeChunksRef.current;
-    let pendingClaimPixels = pendingClaimPixelsRef.current;
-    let pendingClaimPixelMap = pendingClaimPixelMapRef.current;
-    let pendingClaimRectangles = pendingClaimRectanglesRef.current;
-    let currentPendingClaimCount = getPendingClaimCount(pendingClaimPixels, pendingClaimRectangles);
+    const pendingClaimPixels = pendingClaimPixelsRef.current;
+    const pendingClaimPixelMap = pendingClaimPixelMapRef.current;
+    const pendingClaimRectangles = pendingClaimRectanglesRef.current;
+    const currentPendingClaimCount = getPendingClaimCount(pendingClaimPixels, pendingClaimRectangles);
 
     const displayedHolders = getCurrentDisplayedHolders(nextUser);
 
@@ -7887,7 +9964,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return false;
     }
 
-    let placementEvaluation = evaluateClaimRectanglePlacement({
+    const placementEvaluation = evaluateClaimRectanglePlacement({
       rectangle,
       pixelMap,
       bounds,
@@ -7900,52 +9977,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       startPixel: start,
     });
 
-    if (!placementEvaluation.touchesClaimRoute && placementEvaluation.unresolvedNeighborCount > 0) {
-      setPlacementMessage({
-        tone: "info",
-        text: "Checking nearby claims for this rectangle. This can take a moment while local claim data finishes loading.",
-      });
-      emitDebugEvent(
-        "action",
-        "Rectangle claim fetch fallback",
-        `${rectangle.minX}:${rectangle.minY} -> ${rectangle.maxX}:${rectangle.maxY}; unresolved neighbors ${placementEvaluation.unresolvedNeighborCount}`,
-      );
-      const resolvedBounds = getClaimRectangleFetchBounds(rectangle, bounds);
-      const fetchResult = await hydrateClaimRectanglePixelWindow(rectangle);
-      pendingClaimPixels = pendingClaimPixelsRef.current;
-      pendingClaimPixelMap = pendingClaimPixelMapRef.current;
-      pendingClaimRectangles = pendingClaimRectanglesRef.current;
-      currentPendingClaimCount = getPendingClaimCount(pendingClaimPixels, pendingClaimRectangles);
-      placementEvaluation = evaluateClaimRectanglePlacement({
-        rectangle,
-        pixelMap: claimContextPixelIndexRef.current,
-        bounds,
-        activeChunks,
-        pendingClaimPixelMap,
-        pendingClaimRectangles,
-        activeClaimMode,
-        activeClaimTargetAreaId,
-        currentUserId: nextUser.id,
-        startPixel: start,
-        resolvedBounds,
-      });
-      emitDebugEvent(
-        "action",
-        "Rectangle claim recheck",
-        `${fetchResult.pixelCount} pixels fetched${fetchResult.truncated ? " (truncated)" : ""}; touch ${placementEvaluation.touchesClaimRoute ? "yes" : "no"}; unresolved neighbors ${placementEvaluation.unresolvedNeighborCount}`,
-      );
-    }
-
     if (placementEvaluation.blockedReason === "outside-world") {
       setPlacementMessage({ tone: "error", text: "The rectangle leaves the active world." });
-      return false;
-    }
-
-    if (placementEvaluation.blockedReason === "claimed-territory") {
-      setPlacementMessage({
-        tone: "error",
-        text: "The rectangle includes already claimed territory.",
-      });
       return false;
     }
 
@@ -7954,7 +9987,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return false;
     }
 
-    if (!placementEvaluation.touchesClaimRoute) {
+    if (!placementEvaluation.touchesClaimRoute && placementEvaluation.unresolvedNeighborCount === 0) {
       setPlacementMessage({
         tone: "error",
         text: activeClaimMode === "expand"
@@ -7980,21 +10013,38 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       return false;
     }
 
-    if (!placementEvaluation.overlapsPendingClaim) {
+    if (!placementEvaluation.overlapsPendingClaim && placementEvaluation.coveredClaimedPixelCount === 0) {
       syncPendingClaims(pendingClaimPixels, [...pendingClaimRectangles, rectangle]);
     } else {
       const newPixels: PixelCoordinate[] = [];
+      const stagedPixelKeys: string[] = [];
 
       for (let y = rectangle.minY; y <= rectangle.maxY; y += 1) {
         for (let x = rectangle.minX; x <= rectangle.maxX; x += 1) {
           const pixel = { x, y };
-          if (!hasPendingClaimAtPixel(pixel, pendingClaimPixelMap, pendingClaimRectangles)) {
+          const pixelKey = getPixelKey(pixel);
+
+          if (
+            !hasPendingClaimAtPixel(pixel, pendingClaimPixelMap, pendingClaimRectangles) &&
+            !pixelMap.has(pixelKey)
+          ) {
             newPixels.push(pixel);
+            stagedPixelKeys.push(pixelKey);
           }
         }
       }
 
       syncPendingClaims([...pendingClaimPixels, ...newPixels], pendingClaimRectangles);
+
+      if (placementEvaluation.coveredClaimedPixelCount > 0 && stagedPixelKeys.length > 0) {
+        syncPendingClaimCutoutRectangles([
+          ...pendingClaimCutoutRectanglesRef.current,
+          {
+            ...rectangle,
+            stagedPixelKeys,
+          },
+        ]);
+      }
     }
 
     setPlacementMessage({
@@ -8002,7 +10052,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       text: `${placementEvaluation.newPixelCount} rectangle claim${placementEvaluation.newPixelCount === 1 ? "" : "s"} staged locally.`,
     });
     return true;
-  }, [hydrateClaimRectanglePixelWindow, isPixelInsideActiveWorld, syncPendingClaims]);
+  }, [isPixelInsideActiveWorld, syncPendingClaimCutoutRectangles, syncPendingClaims]);
 
   const stageSpaceStroke = useCallback((targetPixel: PixelCoordinate): void => {
     if (activeBuildModeRef.current === "paint" && paintToolRef.current === "picker") {
@@ -8076,7 +10126,8 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       if (
         event.code !== "Space" ||
         isEditableTarget(event.target) ||
-        activeModalRef.current !== null
+        activeModalRef.current !== null ||
+        accountMenuOpenRef.current
       ) {
         return;
       }
@@ -8254,7 +10305,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       const targetPixel = getEventPixel(event);
 
       if (isPixelInsideActiveWorld(targetPixel)) {
-        pickPaintColorAtPixel(targetPixel, { activateBrush: true });
+        pickPaintColorAtPixel(targetPixel, { activateBrush: true, updateSelection: false });
       }
 
       event.preventDefault();
@@ -8396,61 +10447,22 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       ) {
         const anchor = rectangleAnchorRef.current;
 
-        if (rectanglePlacementBusyRef.current) {
-          emitDebugEvent("action", "Rectangle claim validation ignored", "busy");
-          setPlacementMessage({
-            tone: "info",
-            text: "Still checking nearby claims for the current rectangle. Please wait a moment.",
-          });
-          return;
-        }
-
         if (anchor === null) {
           setRectangleAnchor(clickedPixel);
-          setPlacementMessage({
-            tone: "info",
-            text: "Rectangle start set. Click the opposite corner to stage the claim.",
-          });
+          setPlacementMessage(null);
           void prefetchRectangleAnchorWindow(clickedPixel);
           return;
         }
 
         const rectangleKey = `${anchor.x}:${anchor.y} -> ${clickedPixel.x}:${clickedPixel.y}`;
-        const validationStartedAt = performance.now();
-        setRectanglePlacementBusyState(true);
-        setPlacementMessage({
-          tone: "info",
-          text: "Checking nearby claims for this rectangle. This can take a moment while local claim data finishes loading.",
-        });
         emitDebugEvent("action", "Rectangle claim validation start", rectangleKey);
-        void (async () => {
-          let outcome = "blocked";
-
-          try {
-            const staged = await stageClaimRectangle(anchor, clickedPixel);
-            outcome = staged ? "staged" : "blocked";
-          } catch (error) {
-            outcome = "error";
-            emitDebugEvent(
-              "warning",
-              "Rectangle claim validation failed",
-              error instanceof Error ? error.message : "Unknown error",
-            );
-            setPlacementMessage({
-              tone: "error",
-              text: "Rectangle validation failed. Please try again.",
-            });
-          } finally {
-            setRectangleAnchor(null);
-            setRectanglePlacementBusyState(false);
-            emitDebugEvent(
-              "action",
-              "Rectangle claim validation done",
-              `${rectangleKey}; ${outcome}`,
-              performance.now() - validationStartedAt,
-            );
-          }
-        })();
+        const staged = stageClaimRectangle(anchor, clickedPixel);
+        setRectangleAnchor(null);
+        emitDebugEvent(
+          "action",
+          "Rectangle claim validation done",
+          `${rectangleKey}; ${staged ? "staged" : "blocked"}`,
+        );
         return;
       }
 
@@ -8482,6 +10494,34 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     await logoutAuthSession();
     setAuthStatus(FALLBACK_AUTH_STATUS);
     setAuthBusy(false);
+    setAccountMenuOpen(false);
+    setActiveModal(null);
+  }
+
+  async function handleDeleteAccount(): Promise<void> {
+    if (!currentUser || deleteBusy) {
+      return;
+    }
+
+    setDeleteBusy(true);
+    setDeleteMessage(null);
+
+    const result = await deleteAccount();
+
+    if (!result.ok) {
+      setDeleteMessage({
+        tone: "error",
+        text: result.error ?? "Account deletion failed.",
+      });
+      setDeleteBusy(false);
+      return;
+    }
+
+    setAuthStatus(FALLBACK_AUTH_STATUS);
+    currentUserRef.current = null;
+    setDeleteBusy(false);
+    setDeleteConfirmOpen(false);
+    setAccountMenuOpen(false);
     setActiveModal(null);
   }
 
@@ -8554,6 +10594,81 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     });
     setAvatarBusy(false);
     event.target.value = "";
+  }
+
+  function handleShopQuantityChange(itemId: ShopItemId, rawValue: string): void {
+    setShopQuantities((current) => ({
+      ...current,
+      [itemId]: sanitizeQuantityInput(rawValue),
+    }));
+  }
+
+  function handleShopQuantityBlur(itemId: ShopItemId): void {
+    setShopQuantities((current) => ({
+      ...current,
+      [itemId]: current[itemId] === "" ? "1" : current[itemId],
+    }));
+  }
+
+  function getShopQuantity(itemId: ShopItemId): number {
+    const rawQuantity = shopQuantities[itemId];
+
+    if (!/^\d+$/.test(rawQuantity)) {
+      return 0;
+    }
+
+    return Math.max(1, Math.min(999, Number.parseInt(rawQuantity, 10)));
+  }
+
+  async function handleShopPurchase(itemId: ShopItemId): Promise<void> {
+    if (!currentUser || shopBusyItem !== null) {
+      return;
+    }
+
+    const quantity = getShopQuantity(itemId);
+
+    if (quantity < 1) {
+      setShopMessage({
+        tone: "error",
+        text: "Enter a whole quantity.",
+      });
+      return;
+    }
+
+    setShopBusyItem(itemId);
+    setShopMessage(null);
+
+    const result = await purchaseShopItem(itemId, quantity);
+
+    if (!result.ok || result.user === null) {
+      setShopMessage({
+        tone: "error",
+        text: result.error ?? "Shop purchase failed.",
+      });
+      setShopBusyItem(null);
+      return;
+    }
+
+    setAuthStatus((current) => ({
+      ...current,
+      user: result.user,
+    }));
+    currentUserRef.current = result.user;
+    setShopMessage({
+      tone: "success",
+      text: itemId === "pixel_pack_50"
+        ? `${formatCount(50 * quantity)} Color Pixels added.`
+        : `Maximum Color Pixels increased by ${formatCount(5 * quantity)}.`,
+    });
+    pushNotification({
+      id: `shop-${itemId}-${Date.now()}`,
+      tone: "success",
+      title: "Shop purchase",
+      body: itemId === "pixel_pack_50"
+        ? `${formatCount(50 * quantity)} Color Pixels were added to your account.`
+        : `Your Max Pixels capacity increased by ${formatCount(5 * quantity)}.`,
+    });
+    setShopBusyItem(null);
   }
 
   function getCenteredOverlayTransform(sourceWidth: number, sourceHeight: number): ClaimOverlayTransform {
@@ -8933,11 +11048,17 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           setPendingOverlayDraft(null);
           overlaySourceRef.current = null;
           setOverlayPaletteOpen(false);
-          setPlacementMessage({
-            tone: "success",
-            text: "Overlay Claim Area saved. The private template is now attached to this area.",
-          });
-        }
+        setPlacementMessage({
+          tone: "success",
+          text: "Overlay Claim Area saved. The private template is now attached to this area.",
+        });
+        pushNotification({
+          id: `overlay-claim-${Date.now()}`,
+          tone: "success",
+          title: "Overlay saved",
+          body: "Your overlay Claim Area was saved and is ready for invited painters.",
+        });
+      }
 
         setPlacementBusy(false);
         return;
@@ -8956,12 +11077,21 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
       if (failedIndex === -1) {
         syncPendingClaims([], []);
+        syncPendingClaimCutoutRectangles([]);
         setRectangleAnchor(null);
         setPlacementMessage({
           tone: "success",
           text: claimModeAtSubmit === "expand"
             ? `${pendingClaimCountToSubmit} Claim Area cell${pendingClaimCountToSubmit === 1 ? "" : "s"} saved to ${claimTargetAreaNameAtSubmit}.`
             : `${pendingClaimCountToSubmit} Claim Area cell${pendingClaimCountToSubmit === 1 ? "" : "s"} saved. Your new active area is ready. Extend it later from Area Info.`,
+        });
+        pushNotification({
+          id: `claim-${Date.now()}`,
+          tone: "success",
+          title: claimModeAtSubmit === "expand" ? "Area extended" : "Area created",
+          body: claimModeAtSubmit === "expand"
+            ? `${pendingClaimCountToSubmit} Claim Area cell${pendingClaimCountToSubmit === 1 ? "" : "s"} were added to ${claimTargetAreaNameAtSubmit}.`
+            : "Your new active area was created and can now be painted.",
         });
       }
 
@@ -8977,6 +11107,12 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       setPlacementMessage({
         tone: "success",
         text: `${paintsToSubmit.length} pixel${paintsToSubmit.length === 1 ? "" : "s"} saved.`,
+      });
+      pushNotification({
+        id: `paint-${Date.now()}`,
+        tone: "success",
+        title: "Pixels placed",
+        body: `${paintsToSubmit.length} Color Pixel${paintsToSubmit.length === 1 ? "" : "s"} were saved to the world.`,
       });
     } else {
       syncPendingPaints(paintsToSubmit.slice(failedIndex));
@@ -9135,14 +11271,24 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     const pendingClaimCount = getPendingClaimCount(claimPixelsToSubmit, claimRectanglesToSubmit);
     const claimMode = claimAreaModeRef.current;
     const targetAreaId = claimTargetAreaIdRef.current;
+    const cutoutRectanglesToSubmit = pendingClaimCutoutRectanglesRef.current;
+    const explicitPixelsToSubmit = cutoutRectanglesToSubmit.length === 0
+      ? claimPixelsToSubmit
+      : claimPixelsToSubmit.filter((pixel) => (
+        !cutoutRectanglesToSubmit.some((rectangle) => isPixelInsidePendingClaimRectangle(pixel, rectangle))
+      ));
+    const rectanglesToSubmit = [
+      ...claimRectanglesToSubmit,
+      ...cutoutRectanglesToSubmit,
+    ];
     emitDebugEvent(
       "network",
       "Claim submit start",
       `${pendingClaimCount} claim pixel${pendingClaimCount === 1 ? "" : "s"}`,
     );
     const result = await claimWorldPixels({
-      pixels: claimPixelsToSubmit,
-      rectangles: claimRectanglesToSubmit.map((rectangle) => ({
+      pixels: explicitPixelsToSubmit,
+      rectangles: rectanglesToSubmit.map((rectangle) => ({
         minX: rectangle.minX,
         maxX: rectangle.maxX,
         minY: rectangle.minY,
@@ -9426,6 +11572,32 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     setAreaPanelBusy(false);
   }
 
+  async function handleAreaReaction(reaction: ClaimAreaReactionValue): Promise<void> {
+    if (selectedArea === null || currentUser === null || areaReactionBusy) {
+      return;
+    }
+
+    const nextReaction = selectedArea.reactions?.viewer_reaction === reaction ? null : reaction;
+    setAreaReactionBusy(true);
+    setAreaMessage(null);
+
+    const result = await updateClaimAreaReaction(selectedArea.id, nextReaction);
+
+    if (!result.ok || result.area === null) {
+      setAreaMessage({
+        tone: "error",
+        text: result.error ?? "Area reaction failed.",
+      });
+      setAreaReactionBusy(false);
+      return;
+    }
+
+    const reactedArea = cacheClaimAreaSummary(result.area);
+    syncOwnedAreaSummary(reactedArea);
+    applyAreaSelection(reactedArea, { syncDrafts: false });
+    setAreaReactionBusy(false);
+  }
+
   function openClaimBuildPanel(
     nextClaimAreaMode: ClaimAreaClaimMode,
     nextTargetAreaId: string | null,
@@ -9441,6 +11613,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
 
     if (claimContextChanged && nextPendingClaimCount > 0) {
       syncPendingClaims([], []);
+      syncPendingClaimCutoutRectangles([]);
       setRectangleAnchor(null);
       setPlacementMessage({
         tone: "info",
@@ -9523,7 +11696,153 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       tone: "success",
       text: `Player #${publicId} can now pixel in this area.`,
     });
+    pushNotification({
+      id: `area-invite-${selectedArea.id}-${publicId}-${Date.now()}`,
+      tone: "success",
+      title: "Player added",
+      body: `Player #${publicId} can now paint in ${selectedArea.name}.`,
+    });
     setAreaPanelBusy(false);
+  }
+
+  function startOwnedAreaEdit(area: ClaimAreaListItem): void {
+    if (!area.viewer_can_edit) {
+      setOwnedAreasMessage({
+        tone: "error",
+        text: "Only the owner or an area admin can edit this area.",
+      });
+      return;
+    }
+
+    setOwnedAreaEditId(area.id);
+    setOwnedAreaEditName(area.name);
+    setOwnedAreaEditDescription(area.description);
+    setOwnedAreaInviteId(null);
+    setOwnedAreasMessage(null);
+  }
+
+  function startOwnedAreaInvite(area: ClaimAreaListItem): void {
+    if (!area.viewer_can_edit) {
+      setOwnedAreasMessage({
+        tone: "error",
+        text: "Only the owner or an area admin can add players.",
+      });
+      return;
+    }
+
+    setOwnedAreaInviteId(area.id);
+    setOwnedAreaInvitePublicId("");
+    setOwnedAreaEditId(null);
+    setOwnedAreasMessage(null);
+  }
+
+  function closeOwnedAreaInlineTools(): void {
+    setOwnedAreaEditId(null);
+    setOwnedAreaEditName("");
+    setOwnedAreaEditDescription("");
+    setOwnedAreaInviteId(null);
+    setOwnedAreaInvitePublicId("");
+    setOwnedAreaActionBusy(null);
+  }
+
+  async function handleOwnedAreaSave(area: ClaimAreaListItem): Promise<void> {
+    if (ownedAreaActionBusy !== null) {
+      return;
+    }
+
+    if (ownedAreaEditName.length > AREA_NAME_MAX_LENGTH) {
+      setOwnedAreasMessage({
+        tone: "error",
+        text: `Name is limited to ${AREA_NAME_MAX_LENGTH} characters.`,
+      });
+      return;
+    }
+
+    if (ownedAreaEditDescription.length > AREA_DESCRIPTION_MAX_LENGTH) {
+      setOwnedAreasMessage({
+        tone: "error",
+        text: `Description is limited to ${AREA_DESCRIPTION_MAX_LENGTH} characters.`,
+      });
+      return;
+    }
+
+    setOwnedAreaActionBusy(`edit:${area.id}`);
+    setOwnedAreasMessage(null);
+
+    const result = await updateClaimArea(area.id, ownedAreaEditName, ownedAreaEditDescription);
+
+    if (!result.ok || result.area === null) {
+      setOwnedAreasMessage({
+        tone: "error",
+        text: result.error ?? "Area update failed.",
+      });
+      setOwnedAreaActionBusy(null);
+      return;
+    }
+
+    const updatedArea = cacheClaimAreaSummary(result.area);
+    syncOwnedAreaSummary(updatedArea);
+    if (selectedAreaSnapshotRef.current?.id === updatedArea.id) {
+      applyAreaSelection(updatedArea);
+    }
+    closeOwnedAreaInlineTools();
+    setOwnedAreasMessage({
+      tone: "success",
+      text: "Area name and description saved.",
+    });
+    pushNotification({
+      id: `area-edit-${area.id}-${Date.now()}`,
+      tone: "success",
+      title: "Area updated",
+      body: `${updatedArea.name} was updated.`,
+    });
+  }
+
+  async function handleOwnedAreaInvite(area: ClaimAreaListItem): Promise<void> {
+    if (ownedAreaActionBusy !== null) {
+      return;
+    }
+
+    const publicId = Number.parseInt(ownedAreaInvitePublicId.trim().replace(/^#/, ""), 10);
+
+    if (!Number.isFinite(publicId)) {
+      setOwnedAreasMessage({
+        tone: "error",
+        text: "Enter a valid public player number.",
+      });
+      return;
+    }
+
+    setOwnedAreaActionBusy(`invite:${area.id}`);
+    setOwnedAreasMessage(null);
+
+    const result = await inviteAreaContributor(area.id, publicId);
+
+    if (!result.ok || result.area === null) {
+      setOwnedAreasMessage({
+        tone: "error",
+        text: result.error ?? "Contributor invite failed.",
+      });
+      setOwnedAreaActionBusy(null);
+      return;
+    }
+
+    const updatedArea = cacheClaimAreaSummary(result.area);
+    syncOwnedAreaSummary(updatedArea);
+    if (selectedAreaSnapshotRef.current?.id === updatedArea.id) {
+      applyAreaSelection(updatedArea, { syncDrafts: false });
+    }
+    closeOwnedAreaInlineTools();
+    setOwnedAreasMessage({
+      tone: "success",
+      text: `Player #${publicId} can now pixel in ${updatedArea.name}.`,
+    });
+    pushNotification({
+      id: `area-list-invite-${area.id}-${publicId}-${Date.now()}`,
+      tone: "success",
+      title: "Player added",
+      body: `Player #${publicId} can now paint in ${updatedArea.name}.`,
+    });
   }
 
   async function handleAreaRemoveContributor(publicId: number, displayName: string): Promise<void> {
@@ -9550,7 +11869,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     await refreshOwnedAreas();
     setAreaMessage({
       tone: "success",
-      text: `Player #${publicId} ${displayName} was removed from this area.`,
+      text: `Player ${formatPlayerNameWithId(displayName, publicId)} was removed from this area.`,
     });
     setAreaPanelBusy(false);
   }
@@ -9579,7 +11898,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     await refreshOwnedAreas();
     setAreaMessage({
       tone: "success",
-      text: `Player #${publicId} ${displayName} is now an admin for this area.`,
+      text: `Player ${formatPlayerNameWithId(displayName, publicId)} is now an admin for this area.`,
     });
     setAreaPanelBusy(false);
   }
@@ -9656,6 +11975,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       setOverlayPaletteOpen(false);
     } else if (activeBuildMode === "claim") {
       syncPendingClaims([], []);
+      syncPendingClaimCutoutRectangles([]);
       setRectangleAnchor(null);
     } else {
       syncPendingPaints([]);
@@ -9676,6 +11996,26 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
       const selectedKey = getPixelKey(selectedPixel);
 
       if (pendingClaimPixelMapRef.current.has(selectedKey)) {
+        const matchedCutoutRectangle = pendingClaimCutoutRectanglesRef.current.find((rectangle) => (
+          rectangle.stagedPixelKeys.includes(selectedKey)
+        ));
+
+        if (matchedCutoutRectangle) {
+          const removedKeys = new Set(matchedCutoutRectangle.stagedPixelKeys);
+          const nextPendingClaimPixels = pendingClaimPixelsRef.current.filter(
+            (pixel) => !removedKeys.has(getPixelKey(pixel)),
+          );
+          syncPendingClaims(nextPendingClaimPixels, pendingClaimRectanglesRef.current);
+          syncPendingClaimCutoutRectangles(
+            pendingClaimCutoutRectanglesRef.current.filter((rectangle) => rectangle !== matchedCutoutRectangle),
+          );
+          setPlacementMessage({
+            tone: "info",
+            text: "Selected rectangle cutout removed.",
+          });
+          return;
+        }
+
         const nextPendingClaimPixels = pendingClaimPixelsRef.current.filter(
           (pixel) => getPixelKey(pixel) !== selectedKey,
         );
@@ -9790,13 +12130,6 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
     }
   }
 
-  function openMePage(): void {
-    window.open("/me", "_blank", "noopener,noreferrer");
-  }
-
-  const accountButtonLabel = currentUser
-    ? `${currentUser.display_name} #${currentUser.public_id}`
-    : "Login";
   const buildPanelStyle = buildPanelPosition
     ? {
         left: `${buildPanelPosition.x}px`,
@@ -9808,48 +12141,155 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   const claimPanelModeLabel = claimAreaMode === "expand" ? "Extend area" : "New area";
   const claimPanelModeHelp = claimAreaMode === "expand"
     ? activeClaimTargetArea === null
-      ? "Open Area Info on one of your areas to choose which territory should grow."
-      : `Extending ${activeClaimTargetAreaName}. Use Area Info to switch areas or finish this active area later.`
-    : newAreaBlockedReason ?? "Claim Area starts a new active area. Extend existing areas only from Area Info.";
+      ? "Pick target"
+      : `Target: ${activeClaimTargetAreaName}`
+    : newAreaBlockedReason ?? "";
   const buildPanelModeLabel = activeBuildMode === "claim" ? claimPanelModeLabel : BUILD_MODE_LABEL.paint;
   const buildPanelModeHelp = activeBuildMode === "claim" ? claimPanelModeHelp : BUILD_MODE_HELP.paint;
+  const claimPlacementStatus = claimAreaMode === "expand"
+    ? activeClaimTargetArea === null
+      ? "Pick target"
+      : activeClaimTargetArea.name
+    : newAreaBlockedReason;
   const newAreaButtonActive = buildPanelOpen && activeBuildMode === "claim" && claimAreaMode === "new";
   const newAreaButtonDisabled = currentUser !== null && newAreaBlockedReason !== null;
   const colorPixelProjection = useProjectedNormalPixelState(currentUser);
   const colorPixelButtonLabel = currentUser === null
     ? "Login required"
-    : `${Math.max(0, colorPixelProjection.displayedPixels - pendingPaints.length)} / ${currentUser.normal_pixel_limit} Pixel`;
+    : `${Math.max(0, colorPixelProjection.displayedPixels - pendingPaints.length)} px`;
   const colorPixelButtonHelp = "Color Pixel: You can only pixel in areas you own or where you were added.";
-  const areaSections = [
+  const accountLevelProgressPercent = getLevelProgressPercent(currentUser);
+  const accountLevelProgressLabel = `${Math.round(accountLevelProgressPercent)}%`;
+  const accountProgressStyle = {
+    "--account-level-progress": `${accountLevelProgressPercent}%`,
+  } as CSSProperties;
+  const normalPixelFullRefillText = getNormalPixelFullRefillText(currentUser);
+  const shopItems: Array<{
+    id: ShopItemId;
+    title: string;
+    detail: string;
+    cost: number;
+    artwork: ReactNode;
+  }> = [
     {
-      key: "owned-active",
-      title: "Your active artworks",
-      detail: currentUser
-        ? `${ownedActiveAreas.length} / ${currentUser.claim_area_limit} active slot${currentUser.claim_area_limit === 1 ? "" : "s"} used`
-        : `${ownedActiveAreas.length} active`,
-      empty: "You do not have an active artwork right now.",
-      areas: ownedActiveAreas,
+      id: "pixel_pack_50",
+      title: "50 Color Pixels",
+      detail: `+${formatCount(50 * getShopQuantity("pixel_pack_50"))}`,
+      cost: 500,
+      artwork: <ShopPixelPackArtwork variant={SHOP_COLOR_PIXEL_ARTWORK_VARIANT} />,
     },
     {
-      key: "contributed-active",
-      title: "Active claims you joined",
-      detail: `${contributedActiveAreas.length} active`,
-      empty: "No active contributor claims found.",
-      areas: contributedActiveAreas,
+      id: "max_pixels_5",
+      title: "Max Pixels +5",
+      detail: `${formatCount(currentUser?.normal_pixel_limit ?? 0)} max`,
+      cost: 500,
+      artwork: <ShopCapacityArtwork variant={SHOP_MAX_PIXEL_ARTWORK_VARIANT} />,
     },
-    {
-      key: "finished",
-      title: "Finished artworks",
-      detail: `${finishedVisibleAreas.length} finished`,
-      empty: "No finished artworks found yet.",
-      areas: finishedVisibleAreas,
-    },
+  ];
+  const searchedOwnedAreas = useMemo(() => {
+    const search = ownedAreaSearch.trim().toLowerCase();
+
+    if (search.length === 0) {
+      return ownedAreas;
+    }
+
+    return ownedAreas.filter((area) => {
+      const searchable = [
+        area.name,
+        area.description,
+        String(area.public_id),
+        formatClaimAreaId(area.public_id),
+        area.owner.display_name,
+        String(area.owner.public_id),
+      ].join(" ").toLowerCase();
+
+      return searchable.includes(search);
+    });
+  }, [ownedAreaSearch, ownedAreas]);
+  const searchedOwnedActiveAreas = useMemo(
+    () => searchedOwnedAreas.filter((area) => area.status === "active" && area.viewer_can_edit),
+    [searchedOwnedAreas],
+  );
+  const searchedContributedActiveAreas = useMemo(
+    () => searchedOwnedAreas.filter((area) => area.status === "active" && !area.viewer_can_edit && area.viewer_can_paint),
+    [searchedOwnedAreas],
+  );
+  const searchedFinishedVisibleAreas = useMemo(
+    () => searchedOwnedAreas.filter((area) => area.status === "finished"),
+    [searchedOwnedAreas],
+  );
+  const areaSections = useMemo(() => {
+    const sections = [
+      {
+        key: "owned-active" as const,
+        filter: "owned" as const,
+        title: "Your active artworks",
+        detail: currentUser
+          ? `${searchedOwnedActiveAreas.length} / ${currentUser.claim_area_limit} active slot${currentUser.claim_area_limit === 1 ? "" : "s"} used`
+          : `${searchedOwnedActiveAreas.length} active`,
+        empty: "You do not have an active artwork right now.",
+        areas: searchedOwnedActiveAreas,
+      },
+      {
+        key: "contributed-active" as const,
+        filter: "joined" as const,
+        title: "Active claims you joined",
+        detail: `${searchedContributedActiveAreas.length} active`,
+        empty: "No active contributor claims found.",
+        areas: searchedContributedActiveAreas,
+      },
+      {
+        key: "finished" as const,
+        filter: "finished" as const,
+        title: "Finished artworks",
+        detail: `${searchedFinishedVisibleAreas.length} finished`,
+        empty: "No finished artworks found yet.",
+        areas: searchedFinishedVisibleAreas,
+      },
+    ];
+
+    return ownedAreaFilter === "all"
+      ? sections
+      : sections.filter((section) => section.filter === ownedAreaFilter);
+  }, [
+    currentUser,
+    ownedAreaFilter,
+    searchedContributedActiveAreas,
+    searchedFinishedVisibleAreas,
+    searchedOwnedActiveAreas,
+  ]);
+  const visibleOwnedAreaCount = areaSections.reduce((sum, section) => sum + section.areas.length, 0);
+  const ownedAreaFilterOptions: Array<{ value: AreaListFilter; label: string }> = [
+    { value: "all", label: "All" },
+    { value: "owned", label: "Mine" },
+    { value: "joined", label: "Joined" },
+    { value: "finished", label: "Done" },
   ];
   const selectedAreaPaintPercent = selectedArea === null || selectedArea.claimed_pixels_count <= 0
     ? 0
     : Math.round((selectedArea.painted_pixels_count / selectedArea.claimed_pixels_count) * 100);
   const selectedAreaCanManage = selectedArea?.viewer_can_edit ?? false;
+  const selectedAreaReactions = selectedArea?.reactions ?? {
+    like_count: 0,
+    dislike_count: 0,
+    viewer_reaction: null,
+  };
+  const selectedAreaLikeCount = selectedAreaReactions.like_count;
+  const selectedAreaDislikeCount = selectedAreaReactions.dislike_count;
+  const selectedAreaReactionTotal = selectedAreaLikeCount + selectedAreaDislikeCount;
+  const selectedAreaLikeRatio = selectedAreaReactionTotal === 0
+    ? 0
+    : Math.round((selectedAreaLikeCount / selectedAreaReactionTotal) * 100);
+  const selectedAreaReactionRatioLabel = selectedAreaReactionTotal === 0
+    ? "No reactions yet"
+    : `${selectedAreaLikeRatio}% like ratio`;
   const selectedAreaContributors = isClaimAreaSummary(selectedArea) ? selectedArea.contributors : [];
+  const selectedAreaCanSeeDislikeCount = selectedArea !== null && currentUser !== null && (
+    selectedArea.viewer_can_edit ||
+    selectedArea.viewer_can_paint ||
+    selectedArea.owner.id === currentUser.id ||
+    selectedAreaContributors.some((contributor) => contributor.id === currentUser.id)
+  );
   const areaDraftNameLength = areaDraftName.length;
   const areaDraftDescriptionLength = areaDraftDescription.length;
   const areaDraftNameTooLong = areaDraftNameLength > AREA_NAME_MAX_LENGTH;
@@ -9859,6 +12299,25 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
   return (
     <main className={`world-shell ${darkMode ? "theme-dark" : "theme-light"}`}>
       <PerfDebugOverlay getSnapshot={getDebugWorldSnapshot} />
+      {toastMessages.length > 0 ? (
+        <div className="app-toast-stack" aria-live="assertive" aria-relevant="additions">
+          {toastMessages.map((toast) => (
+            <div className={`app-toast is-${toast.tone}`} key={toast.id} role="status">
+              <strong>{toast.title}</strong>
+              <span>{toast.text}</span>
+              <button
+                aria-label="Dismiss notification"
+                className="app-toast-dismiss"
+                onClick={() => dismissToast(toast.id)}
+                title="Dismiss"
+                type="button"
+              >
+                x
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
       {process.env.NODE_ENV === "development" && devRecoveryNotice !== null ? (
         <div className="dev-recovery-notice" role="status">
           <span>{devRecoveryNotice}</span>
@@ -9913,9 +12372,270 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
             </button>
           </>
         ) : null}
-        <button className="hud-login-button" onClick={() => setActiveModal("login")} type="button">
-          {accountButtonLabel}
-        </button>
+        <div className="account-menu-shell" ref={accountMenuRef}>
+          {currentUser ? (
+            <>
+              <button
+                aria-expanded={accountMenuOpen}
+                aria-label="Open profile menu"
+                className="account-launcher"
+                onClick={() => {
+                  setActiveModal(null);
+                  setAccountMenuOpen((open) => {
+                    const nextOpen = !open;
+
+                    if (!nextOpen) {
+                      setNotificationsOpen(false);
+                    }
+
+                    return nextOpen;
+                  });
+                }}
+                style={accountProgressStyle}
+                type="button"
+              >
+                <span className="account-launcher-ring">
+                  {currentUser.avatar_url ? (
+                    <Image
+                      alt=""
+                      className="account-launcher-avatar"
+                      height={44}
+                      referrerPolicy="no-referrer"
+                      src={currentUser.avatar_url}
+                      width={44}
+                    />
+                  ) : (
+                    <span className="account-launcher-avatar account-launcher-fallback" aria-hidden="true">
+                      <DefaultAvatarIcon />
+                    </span>
+                  )}
+                </span>
+                <span className="account-level-chip">{currentUser.level}</span>
+                {unreadNotificationCount > 0 ? (
+                  <span className="account-notification-badge">{notificationBadgeLabel}</span>
+                ) : null}
+              </button>
+              {accountMenuOpen ? (
+                <aside className="account-popover" aria-label="Profile menu">
+                  <input
+                    accept="image/*"
+                    className="avatar-file-input"
+                    onChange={(event) => void handleAvatarFileChange(event)}
+                    ref={avatarFileInputRef}
+                    type="file"
+                  />
+                  <div className="account-popover-head">
+                    <div className="account-popover-avatar-wrap">
+                      {currentUser.avatar_url ? (
+                        <Image
+                          alt={currentUser.display_name}
+                          className="account-popover-avatar"
+                          height={58}
+                          referrerPolicy="no-referrer"
+                          src={currentUser.avatar_url}
+                          width={58}
+                        />
+                      ) : (
+                        <div className="account-popover-avatar account-avatar-fallback" aria-hidden="true">
+                          <DefaultAvatarIcon />
+                        </div>
+                      )}
+                      <button
+                        aria-label="Upload avatar"
+                        className="account-avatar-edit-button"
+                        disabled={avatarBusy}
+                        onClick={handleAvatarUploadClick}
+                        title="Avatar"
+                        type="button"
+                      >
+                        <PencilIcon />
+                      </button>
+                    </div>
+                    <div className="account-popover-title">
+                      <strong>{currentUser.display_name}</strong>
+                      <span>#{currentUser.public_id}</span>
+                    </div>
+                    <div className="account-coin-pill" title="Coins">
+                      <CoinIcon />
+                      <strong>{formatCount(currentUser.coins)}</strong>
+                    </div>
+                  </div>
+
+                  <div
+                    className="account-level-panel"
+                    title={`${currentUser.level_progress_current} / ${currentUser.level_progress_target} XP`}
+                  >
+                    <div className="account-level-panel-top">
+                      <LevelIcon />
+                      <strong>{currentUser.level}</strong>
+                      <span>{accountLevelProgressLabel}</span>
+                    </div>
+                    <div className="account-level-bar" aria-hidden="true">
+                      <span style={{ width: `${accountLevelProgressPercent}%` }} />
+                    </div>
+                  </div>
+
+                  <div className="account-notification-block">
+                    <button
+                      aria-expanded={notificationsOpen}
+                      className="account-notification-toggle"
+                      onClick={handleNotificationsToggle}
+                      type="button"
+                    >
+                      <BellIcon className="account-mini-icon" />
+                      <span>Notifications</span>
+                      {unreadNotificationCount > 0 ? (
+                        <strong className="account-inline-badge">{notificationBadgeLabel}</strong>
+                      ) : null}
+                    </button>
+                    {notificationsOpen ? (
+                      <div className="account-notification-menu">
+                        {notifications.length === 0 ? (
+                          <p className="account-helper">No notifications yet.</p>
+                        ) : (
+                          notifications.map((notification) => (
+                            <article
+                              className={`account-notification-item is-${notification.tone} ${notification.read ? "is-read" : ""}`}
+                              key={notification.id}
+                            >
+                              <div>
+                                <strong>{notification.title}</strong>
+                                <time>{formatNotificationTime(notification.createdAt)}</time>
+                              </div>
+                              <p>{notification.body}</p>
+                            </article>
+                          ))
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="account-quick-grid">
+                    <article className="account-quick-stat">
+                      <PixelIcon />
+                      <span>Max Pixel</span>
+                      <strong>{formatCount(currentUser.normal_pixel_limit)}</strong>
+                    </article>
+                    <article className="account-quick-stat">
+                      <AreaIcon />
+                      <span>Areas</span>
+                      <strong>{formatCount(ownedAreaCount)}</strong>
+                    </article>
+                    <article className="account-quick-stat">
+                      <TimerIcon />
+                      <span>Full</span>
+                      <strong>{normalPixelFullRefillText}</strong>
+                    </article>
+                    <article className="account-quick-stat">
+                      <PixelIcon />
+                      <span>Total Placed</span>
+                      <strong>{formatCount(currentUser.pixels_placed_total)}</strong>
+                    </article>
+                  </div>
+
+                  <div className="account-inline-edit">
+                    <input
+                      aria-label="Display name"
+                      className="account-input account-popover-input"
+                      maxLength={24}
+                      onChange={(event) => setProfileName(event.target.value)}
+                      placeholder="Name"
+                      type="text"
+                      value={profileName}
+                    />
+                    <span className="account-action-tooltip" title={nameChangeHint || "Save display name"}>
+                      <button
+                        aria-label="Save display name"
+                        className="account-icon-action"
+                        disabled={
+                          authBusy ||
+                          profileBusy ||
+                          !currentUser.can_change_display_name ||
+                          !hasDisplayNameChange
+                        }
+                        onClick={() => void handleDisplayNameSave()}
+                        title={nameChangeHint || "Save display name"}
+                        type="button"
+                      >
+                        <SaveIcon />
+                      </button>
+                    </span>
+                  </div>
+                  {profileMessage ? (
+                    <p className={`account-feedback is-${profileMessage.tone}`}>{profileMessage.text}</p>
+                  ) : null}
+                  {avatarMessage ? (
+                    <p className={`account-feedback is-${avatarMessage.tone}`}>{avatarMessage.text}</p>
+                  ) : null}
+
+                  <div className="account-popover-actions">
+                    <button
+                      aria-label={soundMuted ? "Unmute sounds" : "Mute sounds"}
+                      aria-pressed={soundMuted}
+                      className={`account-icon-action ${soundMuted ? "is-muted" : ""}`}
+                      onClick={handleSoundMuteToggle}
+                      title={soundMuted ? "Unmute sounds" : "Mute sounds"}
+                      type="button"
+                    >
+                      {soundMuted ? <VolumeMutedIcon /> : <VolumeOnIcon />}
+                    </button>
+                    <button
+                      aria-label="Logout"
+                      className="account-icon-action"
+                      disabled={authBusy || profileBusy || deleteBusy}
+                      onClick={() => void handleLogout()}
+                      title="Logout"
+                      type="button"
+                    >
+                      <LogoutIcon />
+                    </button>
+                    <button
+                      aria-label="Delete account"
+                      className="account-icon-action is-danger"
+                      disabled={authBusy || profileBusy || deleteBusy}
+                      onClick={() => setDeleteConfirmOpen((open) => !open)}
+                      title="Delete"
+                      type="button"
+                    >
+                      <TrashIcon />
+                    </button>
+                  </div>
+
+                  {deleteConfirmOpen ? (
+                    <div className="account-danger-panel">
+                      <span>This action cannot be undone.</span>
+                      <div>
+                        <button
+                          className="pixel-clear-button"
+                          disabled={deleteBusy}
+                          onClick={() => setDeleteConfirmOpen(false)}
+                          type="button"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          className="google-button account-delete-button"
+                          disabled={deleteBusy}
+                          onClick={() => void handleDeleteAccount()}
+                          type="button"
+                        >
+                          {deleteBusy ? "Deleting..." : "Delete"}
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                  {deleteMessage ? (
+                    <p className={`account-feedback is-${deleteMessage.tone}`}>{deleteMessage.text}</p>
+                  ) : null}
+                </aside>
+              ) : null}
+            </>
+          ) : (
+            <button className="hud-login-button" onClick={() => setActiveModal("login")} type="button">
+              Login
+            </button>
+          )}
+        </div>
       </div>
 
       {inspectedPixel ? (
@@ -9945,7 +12665,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                   title="More options"
                   type="button"
                 >
-                  ...
+                  <MoreHorizontalIcon />
                 </button>
               ) : null}
               <button
@@ -10049,7 +12769,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                     <AreaParticipantAvatar participant={selectedArea.owner} />
                     <div className="area-participant-name">
                       <span>Owner</span>
-                      <strong>#{selectedArea.owner.public_id} {selectedArea.owner.display_name}</strong>
+                      <strong>{formatPlayerNameWithId(selectedArea.owner.display_name, selectedArea.owner.public_id)}</strong>
                     </div>
                     <span className="area-role-tag is-owner">Owner</span>
                   </div>
@@ -10061,7 +12781,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                       <div className="area-access-row" key={contributor.id}>
                         <div className="area-participant">
                           <AreaParticipantAvatar participant={contributor} />
-                          <strong>#{contributor.public_id} {contributor.display_name}</strong>
+                          <strong>{formatPlayerNameWithId(contributor.display_name, contributor.public_id)}</strong>
                           {contributor.role === "admin" ? (
                             <span className="area-role-tag is-admin">Admin</span>
                           ) : null}
@@ -10069,13 +12789,13 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                         {selectedAreaCanManage ? (
                           <div className="area-player-actions">
                             <button
-                              aria-label={`Open options for #${contributor.public_id} ${contributor.display_name}`}
+                              aria-label={`Open options for ${formatPlayerNameWithId(contributor.display_name, contributor.public_id)}`}
                               className="area-player-options-button"
                               onClick={(event) => openAreaPlayerOptionsMenu(event, contributor)}
                               title="Player options"
                               type="button"
                             >
-                              ...
+                              <MoreHorizontalIcon />
                             </button>
                           </div>
                         ) : null}
@@ -10140,6 +12860,63 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               {areaDetailsBusy ? (
                 <p className="area-description">Loading contributor access...</p>
               ) : null}
+              {areaMessage ? (
+                <p className={`account-feedback is-${areaMessage.tone}`}>{areaMessage.text}</p>
+              ) : null}
+              <div className="area-bottom-actions">
+                <div className="area-reaction-card" aria-label="Artwork reactions">
+                  <div className="area-reaction-controls">
+                    <button
+                      aria-label="Like artwork"
+                      aria-pressed={selectedAreaReactions.viewer_reaction === "like"}
+                      className={`area-reaction-button ${selectedAreaReactions.viewer_reaction === "like" ? "is-active" : ""}`}
+                      disabled={currentUser === null || areaReactionBusy}
+                      onClick={() => void handleAreaReaction("like")}
+                      title="Like"
+                      type="button"
+                    >
+                      <ThumbUpIcon />
+                      <strong>{formatCount(selectedAreaLikeCount)}</strong>
+                    </button>
+                    <button
+                      aria-label="Dislike artwork"
+                      aria-pressed={selectedAreaReactions.viewer_reaction === "dislike"}
+                      className={`area-reaction-button is-dislike ${selectedAreaReactions.viewer_reaction === "dislike" ? "is-active" : ""}`}
+                      disabled={currentUser === null || areaReactionBusy}
+                      onClick={() => void handleAreaReaction("dislike")}
+                      title="Dislike"
+                      type="button"
+                    >
+                      <ThumbDownIcon />
+                      {selectedAreaCanSeeDislikeCount ? (
+                        <strong>{formatCount(selectedAreaDislikeCount)}</strong>
+                      ) : null}
+                    </button>
+                  </div>
+                  <div className="area-reaction-meta">
+                    <span>{formatCount(selectedAreaLikeCount)} likes</span>
+                    {selectedAreaCanSeeDislikeCount ? (
+                      <>
+                        <span>{formatCount(selectedAreaDislikeCount)} dislikes</span>
+                        <strong>{selectedAreaReactionRatioLabel}</strong>
+                      </>
+                    ) : null}
+                  </div>
+                </div>
+                <div className="area-share-card">
+                  <button
+                    className="area-share-button"
+                    onClick={() => void handleAreaShare()}
+                    type="button"
+                  >
+                    <ShareIcon />
+                    <span>Share</span>
+                  </button>
+                  {areaShareMessage ? (
+                    <p className={`area-share-feedback is-${areaShareMessage.tone}`}>{areaShareMessage.text}</p>
+                  ) : null}
+                </div>
+              </div>
             </>
           ) : areaPanelBusy ? (
             <p className="area-description">Loading area details...</p>
@@ -10150,7 +12927,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           ) : (
             <p className="area-description">No claim area exists at this cell yet.</p>
           )}
-          {areaMessage ? (
+          {areaMessage && selectedArea === null ? (
             <p className={`account-feedback is-${areaMessage.tone}`}>{areaMessage.text}</p>
           ) : null}
         </aside>
@@ -10197,15 +12974,20 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         <div className="world-hud world-hud-bottom-center">
           <div className="build-taskbar" aria-label="Build tools">
             <button
-              className={`build-tool-button ${newAreaButtonActive ? "is-active" : ""}`}
+              className={`build-tool-button ${newAreaButtonActive ? "is-active" : ""} ${newAreaButtonDisabled ? "is-blocked" : ""}`}
               disabled={newAreaButtonDisabled}
               onClick={() => handleBuildModeChange("claim")}
               title={newAreaBlockedReason ?? "Start a new claim area"}
               type="button"
             >
-              <span>{BUILD_MODE_LABEL.claim}</span>
-              <small>{newAreaButtonDisabled ? "Unavailable" : "New area"}</small>
-              {pendingClaimCount > 0 ? <strong>{pendingClaimCount}</strong> : null}
+              <span className="build-tool-icon">
+                <AreaIcon className="tool-mini-icon" />
+              </span>
+              <span className="build-tool-copy">
+                <span className="build-tool-title">{BUILD_MODE_LABEL.claim}</span>
+                <small>{newAreaButtonDisabled ? "Blocked" : `${ownedActiveAreas.length}/${currentUser.claim_area_limit} active`}</small>
+              </span>
+              {pendingClaimCount > 0 ? <strong className="build-tool-badge">{pendingClaimCount}</strong> : null}
             </button>
             <button
               className={`build-tool-button ${buildPanelOpen && activeBuildMode === "paint" ? "is-active" : ""}`}
@@ -10213,9 +12995,14 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               title={colorPixelButtonHelp}
               type="button"
             >
-              <span>{BUILD_MODE_LABEL.paint}</span>
-              <small>{colorPixelButtonLabel}</small>
-              {pendingPaints.length > 0 ? <strong>{pendingPaints.length}</strong> : null}
+              <span className="build-tool-icon">
+                <PixelIcon />
+              </span>
+              <span className="build-tool-copy">
+                <span className="build-tool-title">{BUILD_MODE_LABEL.paint}</span>
+                <small>{colorPixelButtonLabel}</small>
+              </span>
+              {pendingPaints.length > 0 ? <strong className="build-tool-badge">{pendingPaints.length}</strong> : null}
             </button>
           </div>
         </div>
@@ -10226,7 +13013,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           className={`world-hud world-hud-placement ${buildPanelPosition ? "is-floating" : ""}`}
           style={buildPanelStyle}
         >
-          <div className="pixel-placement-panel" ref={buildPanelRef}>
+          <div
+            aria-description={claimPlacementStatus ?? placementHelpText}
+            className="pixel-placement-panel"
+            ref={buildPanelRef}
+          >
             <div
               className="pixel-placement-header"
               onPointerCancel={handleBuildPanelDragEnd}
@@ -10237,9 +13028,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               <div>
                 <span className="coordinate-label">{buildPanelModeLabel}</span>
                 <strong className="pixel-placement-title">
-                  {selectedPixel === null ? "No pixel selected" : `${selectedPixel.x} : ${selectedPixel.y}`}
+                  {selectedPixel === null ? "--" : `${selectedPixel.x} : ${selectedPixel.y}`}
                 </strong>
-                <span className="pixel-placement-mode-help">{buildPanelModeHelp}</span>
+                {buildPanelModeHelp ? (
+                  <span className="pixel-placement-mode-help">{buildPanelModeHelp}</span>
+                ) : null}
               </div>
               <div className="pixel-placement-header-actions">
                 <span className="pixel-placement-owner">{selectedCellLabel}</span>
@@ -10271,43 +13064,39 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               <NormalPixelPanelSummary pendingPaints={pendingPaints.length} user={currentUser} />
             )}
             {activeBuildMode === "claim" ? (
-              <p className="pixel-placement-help">
-                {claimAreaMode === "expand"
-                  ? activeClaimTargetArea === null
-                    ? "Extend mode is waiting for a target area from Area Info."
-                    : `Target area: ${activeClaimTargetArea.name} (${getClaimAreaStatusLabel(activeClaimTargetArea.status)}).`
-                  : newAreaBlockedReason ?? "New areas start from Claim Area. Existing areas grow only from Area Info."}
-              </p>
-            ) : null}
-            {activeBuildMode === "claim" ? (
               <div className="claim-tool-row" aria-label="Claim Area tools">
                 <button
+                  aria-label="Brush"
                   className={`claim-tool-button ${claimTool === "brush" ? "is-active" : ""}`}
                   onClick={() => handleClaimToolChange("brush")}
+                  title="Brush"
                   type="button"
                 >
-                  Brush
+                  <BrushToolIcon />
                 </button>
                 <button
+                  aria-label="Rectangle"
                   className={`claim-tool-button ${claimTool === "rectangle" ? "is-active" : ""}`}
                   onClick={() => handleClaimToolChange("rectangle")}
+                  title="Rectangle"
                   type="button"
                 >
-                  Rectangle
+                  <RectangleToolIcon />
                 </button>
                 <button
+                  aria-label="Overlay"
                   className={`claim-tool-button ${claimTool === "overlay" ? "is-active" : ""}`}
                   disabled={claimAreaMode !== "new"}
                   onClick={() => handleClaimToolChange("overlay")}
                   title={claimAreaMode !== "new" ? "Overlay creates a new Claim Area." : "Upload an image overlay"}
                   type="button"
                 >
-                  Overlay
+                  <OverlayToolIcon />
                 </button>
                 {rectanglePlacementBusy ? (
-                  <span>Checking...</span>
+                  <span className="tool-status-pill">Checking</span>
                 ) : rectangleAnchor ? (
-                  <span>{rectangleAnchor.x} : {rectangleAnchor.y}</span>
+                  <span className="tool-status-pill">{rectangleAnchor.x} : {rectangleAnchor.y}</span>
                 ) : null}
               </div>
             ) : null}
@@ -10480,44 +13269,31 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               <div className="pixel-palette-grid">
                 <div className="paint-tool-row" aria-label="Color Pixel tools">
                   <button
+                    aria-label="Brush"
                     className={`claim-tool-button paint-tool-button ${paintTool === "brush" ? "is-active" : ""}`}
                     onClick={() => handlePaintToolChange("brush")}
+                    title="Brush"
                     type="button"
                   >
-                    Brush
+                    <BrushToolIcon />
                   </button>
                   <button
+                    aria-label="Erase staged pixels"
                     className={`claim-tool-button paint-tool-button ${paintTool === "eraser" ? "is-active" : ""}`}
                     onClick={() => handlePaintToolChange("eraser")}
                     title="Only removes locally staged Color Pixels. It does not submit transparent pixels."
                     type="button"
                   >
-                    Eraser
+                    <EraserToolIcon />
                   </button>
                   <button
+                    aria-label="Pick color"
                     className={`claim-tool-button paint-tool-button ${paintTool === "picker" ? "is-active" : ""}`}
                     onClick={() => handlePaintToolChange("picker")}
                     title="Pick the exact color from the canvas or overlay. Middle-click triggers the picker too."
                     type="button"
                   >
-                    <svg aria-hidden="true" className="paint-tool-button-icon" viewBox="0 0 24 24">
-                      <path
-                        d="M4 20l4.5-1 8.2-8.2-3.5-3.5L5 15.5 4 20z"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth="1.8"
-                      />
-                      <path
-                        d="M12 5.5l3.5 3.5"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeLinecap="round"
-                        strokeWidth="1.8"
-                      />
-                    </svg>
-                    <span>Pick</span>
+                    <PickerToolIcon />
                   </button>
                 </div>
                 {PIXEL_PALETTE_DISPLAY_ROWS.map((row, rowIndex) => (
@@ -10563,14 +13339,11 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                   </button>
                 </div>
               </div>
-              <p className="pixel-placement-help">{placementHelpText}</p>
-              {placementMessage ? (
-                <p className={`account-feedback is-${placementMessage.tone}`}>{placementMessage.text}</p>
-              ) : null}
               <button
                 className="google-button pixel-place-button"
                 disabled={placementBusy || activePendingCount === 0}
                 onClick={() => void handlePlacementAction()}
+                title={placementHelpText}
                 type="button"
               >
                 {placementLabel}
@@ -10618,7 +13391,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               onTileLoaded={handleTileLoaded}
               outsideArtPatternImages={outsideArtPatternImages}
               pendingPaintTiles={pendingPaintTiles}
-              pendingClaimOutlinePath={pendingClaimOutlinePath}
+              pendingClaimOutlinePaths={pendingClaimOutlinePaths}
               renderedPendingClaims={renderedPendingClaims}
               renderedWorldTiles={renderedWorldTiles}
           retainedVisualTileSrcs={retainedTileSrcRef.current.visual}
@@ -10771,7 +13544,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         <div className="modal-backdrop" onClick={() => setActiveModal(null)} role="presentation">
           <section
             aria-labelledby="areas-title"
-            className="modal-window login-modal"
+            className="modal-window areas-modal"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="modal-header">
@@ -10786,13 +13559,16 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
             <div className="modal-scroll-area">
               <div className="modal-card owned-area-card">
                 <div className="owned-area-toolbar">
-                  <span>
-                    {ownedAreasLoading
-                      ? "Loading..."
-                      : currentUser
-                        ? `${ownedActiveAreas.length} / ${currentUser.claim_area_limit} active area slot${currentUser.claim_area_limit === 1 ? "" : "s"} used`
-                        : `${ownedAreas.length} area${ownedAreas.length === 1 ? "" : "s"}`}
-                  </span>
+                  <div>
+                    <span>
+                      {ownedAreasLoading
+                        ? "Loading..."
+                        : currentUser
+                          ? `${ownedActiveAreas.length} / ${currentUser.claim_area_limit} active area slot${currentUser.claim_area_limit === 1 ? "" : "s"} used`
+                          : `${ownedAreas.length} area${ownedAreas.length === 1 ? "" : "s"}`}
+                    </span>
+                    <strong>{visibleOwnedAreaCount} shown</strong>
+                  </div>
                   <button
                     className="pixel-clear-button"
                     disabled={ownedAreasLoading}
@@ -10805,8 +13581,33 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                 {ownedAreasMessage ? (
                   <p className={`account-feedback is-${ownedAreasMessage.tone}`}>{ownedAreasMessage.text}</p>
                 ) : null}
+                <div className="owned-area-controls">
+                  <input
+                    aria-label="Search areas"
+                    className="account-input owned-area-search"
+                    onChange={(event) => setOwnedAreaSearch(event.target.value)}
+                    placeholder="Search name, ID, owner"
+                    type="search"
+                    value={ownedAreaSearch}
+                  />
+                  <div className="owned-area-filter-row" aria-label="Area filters">
+                    {ownedAreaFilterOptions.map((option) => (
+                      <button
+                        className={`owned-area-filter-button ${ownedAreaFilter === option.value ? "is-active" : ""}`}
+                        key={option.value}
+                        onClick={() => setOwnedAreaFilter(option.value)}
+                        type="button"
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 {!ownedAreasLoading && ownedAreas.length === 0 ? (
                   <p className="account-helper">No claim areas found.</p>
+                ) : null}
+                {!ownedAreasLoading && ownedAreas.length > 0 && visibleOwnedAreaCount === 0 ? (
+                  <p className="account-helper">No areas match this search.</p>
                 ) : null}
                 <div className="owned-area-sections">
                   {areaSections.map((section) => (
@@ -10825,16 +13626,23 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                             : Math.round((area.painted_pixels_count / area.claimed_pixels_count) * 100);
                           const areaRole = area.viewer_can_edit
                             ? "Owner"
-                            : `Contributor to #${area.owner.public_id}`;
+                            : `Contributor to ${formatPlayerNameWithId(area.owner.display_name, area.owner.public_id)}`;
 
                           return (
                             <article className="owned-area-item" key={`${section.key}-${area.id}`}>
+                              <ClaimAreaMiniPreview area={area} visualTileRevisions={visualTileRevisions} />
                               <div className="owned-area-main">
-                                <strong>{area.name}</strong>
+                                <div className="owned-area-title-row">
+                                  <strong>{area.name}</strong>
+                                  <span className={`area-role-tag ${area.viewer_can_edit ? "is-owner" : "is-admin"}`}>
+                                    {areaRole}
+                                  </span>
+                                </div>
                                 <span>
                                   {formatCount(area.claimed_pixels_count)} claims - {paintedRatio}% painted
                                 </span>
-                                <small>{getClaimAreaStatusLabel(area.status)} - {areaRole}</small>
+                                <small>{getClaimAreaStatusLabel(area.status)} - {formatClaimAreaId(area.public_id)}</small>
+                                {area.description ? <small>{area.description}</small> : null}
                                 <small>
                                   {area.bounds.min_x}:{area.bounds.min_y} to {area.bounds.max_x}:{area.bounds.max_y}
                                 </small>
@@ -10842,21 +13650,130 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
                               <div className="owned-area-meta">
                                 <small>{area.bounds.width} x {area.bounds.height}</small>
                                 <small>{formatDateTime(area.last_activity_at)}</small>
+                              </div>
+                              <div className="owned-area-actions">
                                 <button
-                                  className="area-options-button owned-area-options-button"
-                                  onClick={(event) => openAreaOptionsMenu(event, area.public_id, "areas-list")}
+                                  className="google-button owned-area-jump"
+                                  onClick={() => focusClaimArea(area)}
                                   type="button"
                                 >
-                                  Options
+                                  Jump
+                                </button>
+                                <button
+                                  className="pixel-clear-button owned-area-action-button"
+                                  onClick={() => {
+                                    applyAreaSelection(cacheClaimAreaPreview(area));
+                                    setInspectedPixel({
+                                      x: Math.floor(area.bounds.center_x),
+                                      y: Math.floor(area.bounds.center_y),
+                                    });
+                                    setInspectedPixelRecord(null);
+                                    setAreaPanelBusy(false);
+                                    setActiveModal(null);
+                                  }}
+                                  type="button"
+                                >
+                                  Info
+                                </button>
+                                <button
+                                  className="area-options-button owned-area-options-button"
+                                  onClick={(event) => openAreaOptionsMenu(event, area.public_id, "areas-list", area.viewer_can_edit)}
+                                  aria-label={`Open options for ${area.name}`}
+                                  title="More options"
+                                  type="button"
+                                >
+                                  <MoreHorizontalIcon />
                                 </button>
                               </div>
-                              <button
-                                className="google-button owned-area-jump"
-                                onClick={() => focusClaimArea(area)}
-                                type="button"
-                              >
-                                Jump
-                              </button>
+                              {ownedAreaEditId === area.id ? (
+                                <div className="owned-area-inline-panel">
+                                  <div className="area-field-stack">
+                                    <label className="account-label" htmlFor={`owned-area-name-${area.id}`}>Name</label>
+                                    <input
+                                      aria-describedby={`owned-area-name-limit-${area.id}`}
+                                      aria-invalid={ownedAreaEditName.length > AREA_NAME_MAX_LENGTH}
+                                      className="account-input area-input"
+                                      id={`owned-area-name-${area.id}`}
+                                      onChange={(event) => setOwnedAreaEditName(event.target.value)}
+                                      value={ownedAreaEditName}
+                                    />
+                                    <span
+                                      className={`area-field-limit ${ownedAreaEditName.length > AREA_NAME_MAX_LENGTH ? "is-error" : ""}`}
+                                      id={`owned-area-name-limit-${area.id}`}
+                                    >
+                                      {ownedAreaEditName.length} / {AREA_NAME_MAX_LENGTH}
+                                    </span>
+                                  </div>
+                                  <div className="area-field-stack">
+                                    <label className="account-label" htmlFor={`owned-area-description-${area.id}`}>Description</label>
+                                    <textarea
+                                      aria-describedby={`owned-area-description-limit-${area.id}`}
+                                      aria-invalid={ownedAreaEditDescription.length > AREA_DESCRIPTION_MAX_LENGTH}
+                                      className="account-input area-textarea"
+                                      id={`owned-area-description-${area.id}`}
+                                      onChange={(event) => setOwnedAreaEditDescription(event.target.value)}
+                                      value={ownedAreaEditDescription}
+                                    />
+                                    <span
+                                      className={`area-field-limit ${ownedAreaEditDescription.length > AREA_DESCRIPTION_MAX_LENGTH ? "is-error" : ""}`}
+                                      id={`owned-area-description-limit-${area.id}`}
+                                    >
+                                      {ownedAreaEditDescription.length} / {AREA_DESCRIPTION_MAX_LENGTH}
+                                    </span>
+                                  </div>
+                                  <div className="area-inline-actions">
+                                    <button
+                                      className="google-button area-action-button"
+                                      disabled={ownedAreaActionBusy !== null}
+                                      onClick={() => void handleOwnedAreaSave(area)}
+                                      type="button"
+                                    >
+                                      {ownedAreaActionBusy === `edit:${area.id}` ? "Saving..." : "Save"}
+                                    </button>
+                                    <button
+                                      className="pixel-clear-button"
+                                      disabled={ownedAreaActionBusy !== null}
+                                      onClick={closeOwnedAreaInlineTools}
+                                      type="button"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : null}
+                              {ownedAreaInviteId === area.id ? (
+                                <div className="owned-area-inline-panel is-invite">
+                                  <label className="account-label" htmlFor={`owned-area-invite-${area.id}`}>Player public number</label>
+                                  <div className="area-invite-row">
+                                    <input
+                                      className="account-input area-input"
+                                      id={`owned-area-invite-${area.id}`}
+                                      inputMode="numeric"
+                                      onChange={(event) => setOwnedAreaInvitePublicId(event.target.value)}
+                                      placeholder="#123"
+                                      value={ownedAreaInvitePublicId}
+                                    />
+                                    <button
+                                      aria-label="Invite player"
+                                      className="area-add-player-button"
+                                      disabled={ownedAreaActionBusy !== null}
+                                      onClick={() => void handleOwnedAreaInvite(area)}
+                                      title="Invite player"
+                                      type="button"
+                                    >
+                                      +
+                                    </button>
+                                  </div>
+                                  <button
+                                    className="pixel-clear-button"
+                                    disabled={ownedAreaActionBusy !== null}
+                                    onClick={closeOwnedAreaInlineTools}
+                                    type="button"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              ) : null}
                             </article>
                           );
                         })}
@@ -10870,7 +13787,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
         </div>
       ) : null}
 
-      {activeModal === "login" ? (
+      {activeModal === "login" && !currentUser ? (
         <div className="modal-backdrop" onClick={() => setActiveModal(null)} role="presentation">
           <section
             aria-labelledby="login-title"
@@ -10880,224 +13797,34 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
             <div className="modal-header">
               <div>
                 <p className="modal-eyebrow">Account</p>
-                <h2 id="login-title">
-                  {authStatus.authenticated ? "Account profile" : "Continue with Google"}
-                </h2>
+                <h2 id="login-title">Continue with Google</h2>
               </div>
               <button className="modal-close" onClick={() => setActiveModal(null)} type="button">
                 Close
               </button>
             </div>
             <div className="modal-scroll-area">
-              {currentUser ? (
-                <div className="modal-card account-card">
-                  <div className="account-header">
-                    <div className="account-avatar-stack">
-                      {currentUser.avatar_url ? (
-                        <Image
-                          alt={currentUser.display_name}
-                          className="account-avatar"
-                          height={72}
-                          referrerPolicy="no-referrer"
-                          src={currentUser.avatar_url}
-                          width={72}
-                        />
-                      ) : (
-                        <div className="account-avatar account-avatar-fallback" aria-hidden="true">
-                          <DefaultAvatarIcon />
-                        </div>
-                      )}
-                      <button
-                        aria-label="Edit avatar"
-                        className="account-avatar-edit-button"
-                        onClick={() => setActiveModal("avatar")}
-                        type="button"
-                      >
-                        <PencilIcon />
-                      </button>
-                    </div>
-                    <div className="account-details">
-                      <h3>{currentUser.display_name}</h3>
-                      <p className="account-tag">#{currentUser.public_id}</p>
-                      <p>
-                        <HolderAccountCount user={currentUser} />
-                      </p>
-                      <p>Use the pencil button under your profile image to open avatar editing.</p>
-                    </div>
-                  </div>
-                  {currentUser.needs_display_name_setup ? (
-                    <div className="account-onboarding">
-                      <strong>Welcome aboard.</strong>
-                      <span>New registrations must choose a real display name before settling in.</span>
-                    </div>
-                  ) : null}
-                  <div className="account-stat-grid">
-                    <article className="account-stat-card">
-                      <span className="account-stat-label">Level</span>
-                      <strong>{currentUser.level}</strong>
-                      <small>
-                        {currentUser.level_progress_current} / {currentUser.level_progress_target}
-                      </small>
-                    </article>
-                    <article className="account-stat-card">
-                      <span className="account-stat-label">Placed Holders</span>
-                      <strong>{currentUser.holders_placed_total}</strong>
-                      <small>{currentUser.claimed_pixels_count} claimed pixels</small>
-                    </article>
-                    <article className="account-stat-card">
-                      <span className="account-stat-label">Color Pixels</span>
-                      <NormalPixelAccountCount user={currentUser} />
-                      <NormalPixelAccountStatus user={currentUser} />
-                    </article>
-                    <article className="account-stat-card">
-                      <span className="account-stat-label">Last Login</span>
-                      <strong>{formatDateTime(currentUser.last_login_at)}</strong>
-                      <small>Created {formatDateTime(currentUser.created_at)}</small>
-                    </article>
-                  </div>
-                  <div className="account-name-editor">
-                    <label className="account-label" htmlFor="display-name-input">
-                      Display name
-                    </label>
-                    <input
-                      className="account-input"
-                      id="display-name-input"
-                      maxLength={24}
-                      onChange={(event) => setProfileName(event.target.value)}
-                      placeholder="Enter a display name"
-                      type="text"
-                      value={profileName}
-                    />
-                    <p className="account-helper">{nameChangeHint}</p>
-                    {profileMessage ? (
-                      <p className={`account-feedback is-${profileMessage.tone}`}>{profileMessage.text}</p>
-                    ) : null}
-                  </div>
-                  <div className="account-actions">
-                    <button
-                      className="google-button google-button-secondary"
-                      disabled={authBusy || profileBusy}
-                      onClick={openMePage}
-                      type="button"
-                    >
-                      Open /me JSON
-                    </button>
-                    <button
-                      className="google-button"
-                      disabled={
-                        authBusy ||
-                        profileBusy ||
-                        !currentUser.can_change_display_name ||
-                        !hasDisplayNameChange
-                      }
-                      onClick={() => void handleDisplayNameSave()}
-                      type="button"
-                    >
-                      {profileBusy ? "Saving..." : currentUser.needs_display_name_setup ? "Save my name" : "Save display name"}
-                    </button>
-                    <button
-                      className="google-button google-button-secondary"
-                      disabled={authBusy || profileBusy}
-                      onClick={() => void handleLogout()}
-                      type="button"
-                    >
-                      {authBusy ? "Signing out..." : "Logout"}
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="modal-card">
-                  <p>
-                    Google OAuth is the account entry point for PixelProject. The first successful
-                    login now creates the player account and redirects brand-new users into the
-                    required display-name setup flow.
-                  </p>
-                  <button
-                    className="google-button"
-                    disabled={
-                      authLoading ||
-                      authBusy ||
-                      authStatus.request_failed === true ||
-                      !authStatus.google_oauth_configured
-                    }
-                    onClick={handleGoogleLogin}
-                    type="button"
-                  >
-                    {authLoading
-                      ? "Checking auth..."
-                      : authStatus.request_failed === true
-                        ? "Auth service unavailable"
-                        : authStatus.google_oauth_configured
-                        ? "Continue with Google"
-                        : "Google OAuth not configured"}
-                  </button>
-                </div>
-              )}
-            </div>
-          </section>
-        </div>
-      ) : null}
-
-      {activeModal === "avatar" && currentUser ? (
-        <div className="modal-backdrop" onClick={() => setActiveModal("login")} role="presentation">
-          <section
-            aria-labelledby="avatar-title"
-            className="modal-window login-modal"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="modal-header">
-              <div>
-                <p className="modal-eyebrow">Profile Edit</p>
-                <h2 id="avatar-title">Avatar upload</h2>
-              </div>
-              <button className="modal-close" onClick={() => setActiveModal("login")} type="button">
-                Back
-              </button>
-            </div>
-            <div className="modal-scroll-area">
-              <div className="modal-card avatar-editor-card">
-                <input
-                  accept="image/*"
-                  className="avatar-file-input"
-                  onChange={(event) => void handleAvatarFileChange(event)}
-                  ref={avatarFileInputRef}
-                  type="file"
-                />
-                <div className="avatar-editor-current">
-                  {currentUser.avatar_url ? (
-                    <Image
-                      alt={currentUser.display_name}
-                      className="account-avatar avatar-editor-preview"
-                      height={88}
-                      referrerPolicy="no-referrer"
-                      src={currentUser.avatar_url}
-                      width={88}
-                    />
-                  ) : (
-                    <div className="account-avatar account-avatar-fallback avatar-editor-preview" aria-hidden="true">
-                      <DefaultAvatarIcon />
-                    </div>
-                  )}
-                  <div>
-                    <h3>Current avatar</h3>
-                    <p className="account-helper">
-                      Upload your own image. We crop it to a square and resize it automatically for the profile UI.
-                    </p>
-                    <div className="avatar-upload-actions">
-                      <button
-                        className="google-button"
-                        disabled={avatarBusy}
-                        onClick={handleAvatarUploadClick}
-                        type="button"
-                      >
-                        {avatarBusy ? "Uploading..." : "Upload custom avatar"}
-                      </button>
-                    </div>
-                    {avatarMessage ? (
-                      <p className={`account-feedback is-${avatarMessage.tone}`}>{avatarMessage.text}</p>
-                    ) : null}
-                  </div>
-                </div>
+              <div className="modal-card">
+                <p>Google OAuth creates the player account and keeps sessions cookie-based.</p>
+                <button
+                  className="google-button"
+                  disabled={
+                    authLoading ||
+                    authBusy ||
+                    authStatus.request_failed === true ||
+                    !authStatus.google_oauth_configured
+                  }
+                  onClick={handleGoogleLogin}
+                  type="button"
+                >
+                  {authLoading
+                    ? "Checking auth..."
+                    : authStatus.request_failed === true
+                      ? "Auth service unavailable"
+                      : authStatus.google_oauth_configured
+                      ? "Continue with Google"
+                      : "Google OAuth not configured"}
+                </button>
               </div>
             </div>
           </section>
@@ -11114,19 +13841,78 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
             <div className="modal-header">
               <div>
                 <p className="modal-eyebrow">Shop</p>
-                <h2 id="shop-title">Player shop placeholder</h2>
+                <h2 id="shop-title">Pixel shop</h2>
               </div>
               <button className="modal-close" onClick={() => setActiveModal(null)} type="button">
                 Close
               </button>
             </div>
             <div className="modal-scroll-area">
-              <div className="modal-card">
-                <p>
-                  The shop entry point now exists for signed-in players. We can fill it with holder
-                  upgrades, perks, cosmetics or supporter packs in the next steps.
-                </p>
-              </div>
+              {currentUser ? (
+                <div className="shop-content">
+                  <div className="shop-balance">
+                    <span>Coins</span>
+                    <strong>{formatCount(currentUser.coins)}</strong>
+                  </div>
+                  {shopMessage ? (
+                    <p className={`account-feedback is-${shopMessage.tone}`}>{shopMessage.text}</p>
+                  ) : null}
+                  <div className="shop-perk-list">
+                    {shopItems.map((item) => {
+                      const quantity = getShopQuantity(item.id);
+                      const totalCost = item.cost * quantity;
+                      const canBuy = quantity > 0 && shopBusyItem === null && currentUser.coins >= totalCost;
+
+                      return (
+                        <article className="shop-perk" key={item.id}>
+                          <div className="shop-item-artwork" aria-hidden="true">
+                            {item.artwork}
+                          </div>
+                          <div className="shop-perk-copy">
+                            <span className="account-stat-label">{item.id === "pixel_pack_50" ? "Pack" : "Upgrade"}</span>
+                            <h3>{item.title}</h3>
+                            <p>{item.detail}</p>
+                          </div>
+                          <div className="shop-perk-actions">
+                            <label className="shop-quantity-label">
+                              <span>Qty</span>
+                              <input
+                                aria-label={`${item.title} quantity`}
+                                className="shop-quantity-input"
+                                inputMode="numeric"
+                                maxLength={3}
+                                onBlur={() => handleShopQuantityBlur(item.id)}
+                                onChange={(event) => handleShopQuantityChange(item.id, event.target.value)}
+                                onKeyDown={(event) => {
+                                  if ([",", ".", "e", "E", "+", "-"].includes(event.key)) {
+                                    event.preventDefault();
+                                  }
+                                }}
+                                pattern="[0-9]*"
+                                type="text"
+                                value={shopQuantities[item.id]}
+                              />
+                            </label>
+                            <span className="shop-price">{formatCount(totalCost)} Coins</span>
+                            <button
+                              className="google-button"
+                              disabled={!canBuy}
+                              onClick={() => void handleShopPurchase(item.id)}
+                              type="button"
+                            >
+                              {shopBusyItem === item.id ? "Buying..." : "Buy"}
+                            </button>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div className="modal-card">
+                  <p>Login required.</p>
+                </div>
+              )}
             </div>
           </section>
         </div>
@@ -11152,17 +13938,50 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
               <strong>{formatClaimAreaId(areaOptionsMenu.publicId)}</strong>
             </div>
             {areaOptionsMenu.canEdit ? (
-              <button
-                className="area-context-menu-item"
-                onClick={() => {
-                  setAreaEditorOpen(true);
-                  setAreaOptionsMenu(null);
-                }}
-                role="menuitem"
-                type="button"
-              >
-                Edit name / description
-              </button>
+              <>
+                <button
+                  className="area-context-menu-item"
+                  onClick={() => {
+                    if (areaOptionsMenu.messageTarget === "areas-list") {
+                      const listArea = ownedAreas.find((area) => area.public_id === areaOptionsMenu.publicId);
+
+                      if (listArea !== undefined) {
+                        startOwnedAreaEdit(listArea);
+                      }
+                    } else {
+                      setAreaEditorOpen(true);
+                    }
+                    setAreaOptionsMenu(null);
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  Edit name / description
+                </button>
+                <button
+                  className="area-context-menu-item"
+                  onClick={() => {
+                    if (areaOptionsMenu.messageTarget === "areas-list") {
+                      const listArea = ownedAreas.find((area) => area.public_id === areaOptionsMenu.publicId);
+
+                      if (listArea !== undefined) {
+                        startOwnedAreaInvite(listArea);
+                      }
+                    } else {
+                      setAreaEditorOpen(false);
+                      setAreaMessage({
+                        tone: "info",
+                        text: "Use the player number field in Area access to add someone.",
+                      });
+                    }
+                    setAreaOptionsMenu(null);
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  Add player
+                </button>
+              </>
             ) : null}
             <button
               className="area-context-menu-item"
@@ -11202,7 +14021,7 @@ export function WorldStage({ outsideArtAssets, world: initialWorld }: WorldStage
           >
             <div className="area-context-menu-header">
               <span>Player options</span>
-              <strong>#{areaPlayerOptionsMenu.publicId} {areaPlayerOptionsMenu.displayName}</strong>
+              <strong>{formatPlayerNameWithId(areaPlayerOptionsMenu.displayName, areaPlayerOptionsMenu.publicId)}</strong>
             </div>
             <button
               className="area-context-menu-item"

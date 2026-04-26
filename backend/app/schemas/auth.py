@@ -1,7 +1,20 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field, StrictInt
+
+
+class ShopItemPurchaseSummary(BaseModel):
+    purchased: int
+    item_size: int
+    total_received: int
+
+
+class ShopItemsPurchasedSummary(BaseModel):
+    pixel_pack_50: ShopItemPurchaseSummary
+    max_pixels_5: ShopItemPurchaseSummary
 
 
 class AuthUserSummary(BaseModel):
@@ -13,6 +26,7 @@ class AuthUserSummary(BaseModel):
     avatar_url: str | None
     role: str
     is_banned: bool
+    is_deactivated: bool
     holders: int
     holders_unlimited: bool
     holder_limit: int
@@ -30,9 +44,13 @@ class AuthUserSummary(BaseModel):
     needs_display_name_setup: bool
     can_change_display_name: bool
     next_display_name_change_at: datetime | None = None
+    xp: int
     level: int
     level_progress_current: int
     level_progress_target: int
+    coins: int
+    shop_items_purchased: ShopItemsPurchasedSummary
+    pixels_placed_total: int
     holders_placed_total: int
     claimed_pixels_count: int
 
@@ -49,3 +67,11 @@ class LogoutResponse(BaseModel):
 
 class UpdateDisplayNameRequest(BaseModel):
     display_name: str
+
+
+ShopItemId = Literal["pixel_pack_50", "max_pixels_5"]
+
+
+class ShopPurchaseRequest(BaseModel):
+    item_id: ShopItemId
+    quantity: StrictInt = Field(default=1, ge=1, le=999)

@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(case_sensitive=False)
 
     app_name: str = "PixelProject API"
-    app_version: str = "0.2.2"
+    app_version: str = "0.3.0"
     app_env: str = "development"
     secret_key: str = "change-me"
     api_v1_prefix: str = "/api/v1"
@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     normal_pixel_start_limit: int = 64
     normal_pixel_regeneration_interval_seconds: int = 30
     level_up_holders_step: int = 256
+    level_xp_start: int = 60
+    level_xp_increment: int = 10
+    level_up_coin_reward: int = 750
+    level_up_normal_pixel_limit_bonus: int = 2
+    shop_pixel_pack_cost: int = 500
+    shop_pixel_pack_amount: int = 50
+    shop_normal_pixel_limit_cost: int = 500
+    shop_normal_pixel_limit_amount: int = 5
     world_origin_x: int = -2000
     world_origin_y: int = -2000
     world_chunk_size: int = 4000
@@ -47,6 +55,15 @@ class Settings(BaseSettings):
         centered_origin = -(self.world_chunk_size // 2)
         self.world_origin_x = centered_origin
         self.world_origin_y = centered_origin
+
+        self.level_xp_start = max(1, self.level_xp_start)
+        self.level_xp_increment = max(1, self.level_xp_increment)
+        self.level_up_coin_reward = max(0, self.level_up_coin_reward)
+        self.level_up_normal_pixel_limit_bonus = max(0, self.level_up_normal_pixel_limit_bonus)
+        self.shop_pixel_pack_cost = max(0, self.shop_pixel_pack_cost)
+        self.shop_pixel_pack_amount = max(1, self.shop_pixel_pack_amount)
+        self.shop_normal_pixel_limit_cost = max(0, self.shop_normal_pixel_limit_cost)
+        self.shop_normal_pixel_limit_amount = max(1, self.shop_normal_pixel_limit_amount)
 
         if self.is_production:
             if self.secret_key in {"change-me", "change-me-in-local-dev"} or len(self.secret_key) < 32:

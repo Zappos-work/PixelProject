@@ -15,6 +15,7 @@ from app.schemas.world import (
     ClaimAreaMutationResponse,
     ClaimContextPixelWindow,
     ClaimAreaPreviewWindow,
+    ClaimAreaReactionRequest,
     ClaimOutlineWindow,
     ClaimAreaSummary,
     ClaimAreaUpdateRequest,
@@ -52,6 +53,7 @@ from app.services.pixels import (
     paint_world_pixel,
     promote_area_contributor,
     remove_area_contributor,
+    update_claim_area_reaction,
     update_claim_area_metadata,
     get_world_tile_key,
 )
@@ -76,6 +78,8 @@ def ensure_reasonable_world_window(min_x: int, max_x: int, min_y: int, max_y: in
 def ensure_active_player(user) -> None:
     if user.is_banned:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is banned.")
+    if user.is_deactivated:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated.")
 
 
 async def publish_world_mutation(
@@ -351,6 +355,7 @@ async def paint_pixels(
 @router.get("/areas/mine", response_model=ClaimAreaListResponse)
 async def my_areas(
     request: Request,
+    include_outlines: bool = Query(default=False),
     session: AsyncSession = Depends(get_db),
 ) -> ClaimAreaListResponse:
     settings = get_settings()
@@ -359,7 +364,7 @@ async def my_areas(
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
 
-    return await list_owned_claim_areas(session, user)
+    return await list_owned_claim_areas(session, user, include_outlines=include_outlines)
 
 
 @router.get("/areas/by-pixel", response_model=ClaimAreaInspection)
@@ -434,6 +439,26 @@ async def patch_area(
             claim_tiles=result.claim_tiles,
         )
         return result
+    except PixelPlacementError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+
+@router.patch("/areas/{area_id}/reaction", response_model=ClaimAreaSummary)
+async def patch_area_reaction(
+    area_id: UUID,
+    payload: ClaimAreaReactionRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> ClaimAreaSummary:
+    settings = get_settings()
+    user = await resolve_authenticated_user(request, session, settings)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    ensure_active_player(user)
+
+    try:
+        return await update_claim_area_reaction(session, area_id, user, payload.reaction)
     except PixelPlacementError as error:
         raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import Integer, and_, case, delete, func, insert, or_, select, text, tuple_, update
+from sqlalchemy import Integer, and_, case, delete, func, insert, literal, or_, select, text, tuple_, union_all, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -16,6 +16,7 @@ from app.core.config import Settings, get_settings
 from app.models.area_contributor import AreaContributor
 from app.models.claim_area import ClaimArea
 from app.models.claim_area_overlay import ClaimAreaOverlay
+from app.models.claim_area_reaction import ClaimAreaReaction
 from app.models.user import User
 from app.models.world_chunk import WorldChunk
 from app.models.world_pixel import WorldPixel
@@ -23,6 +24,7 @@ from app.modules.auth.service import (
     UserStateError,
     apply_normal_pixel_regeneration,
     build_auth_user_summary,
+    grant_pixel_placement_rewards,
     spend_holders,
     spend_normal_pixels,
 )
@@ -45,6 +47,8 @@ from app.schemas.world import (
     ClaimAreaMutationResponse,
     ClaimOutlineSegment,
     ClaimOutlineWindow,
+    ClaimAreaReactionSummary,
+    ClaimAreaReactionValue,
     AreaOwnerSummary,
     ClaimAreaSummary,
     WorldTileCoordinate,
@@ -93,6 +97,7 @@ PIXEL_PALETTE = [
 VALID_COLOR_IDS = {color["id"] for color in PIXEL_PALETTE}
 MAX_VISIBLE_PIXELS = 50_000
 MAX_CLAIM_OUTLINE_PIXELS = 100_000
+MAX_CLAIM_AREA_LIST_OUTLINE_EDGES = 100_000
 WORLD_TILE_SIZE = 1000
 WORLD_LOW_TILE_DETAIL_SCALE = 2
 WORLD_LOW_TILE_SIZE = WORLD_TILE_SIZE * WORLD_LOW_TILE_DETAIL_SCALE
@@ -122,6 +127,8 @@ CLAIM_AREA_MODE_NEW = "new"
 CLAIM_AREA_MODE_EXPAND = "expand"
 AREA_CONTRIBUTOR_ROLE_MEMBER = "member"
 AREA_CONTRIBUTOR_ROLE_ADMIN = "admin"
+CLAIM_AREA_REACTION_LIKE = 1
+CLAIM_AREA_REACTION_DISLIKE = -1
 STARTER_FRONTIER_COORDINATES = [
     (0, 0),
 ]
@@ -591,6 +598,89 @@ def _get_claim_region_key(
     return None
 
 
+def _claim_area_reaction_label(value: int | None) -> ClaimAreaReactionValue | None:
+    if value == CLAIM_AREA_REACTION_LIKE:
+        return "like"
+    if value == CLAIM_AREA_REACTION_DISLIKE:
+        return "dislike"
+    return None
+
+
+def _claim_area_reaction_value(reaction: ClaimAreaReactionValue) -> int:
+    return CLAIM_AREA_REACTION_LIKE if reaction == "like" else CLAIM_AREA_REACTION_DISLIKE
+
+
+def _viewer_has_area_access(
+    area: ClaimArea,
+    viewer: User | None,
+    contributor_area_ids: set[UUID],
+) -> bool:
+    return viewer is not None and (
+        viewer.id == area.owner_user_id or area.id in contributor_area_ids
+    )
+
+
+async def _get_claim_area_reaction_summaries(
+    session: AsyncSession,
+    areas: list[ClaimArea],
+    viewer: User | None = None,
+) -> dict[UUID, ClaimAreaReactionSummary]:
+    if not areas:
+        return {}
+
+    area_ids = [area.id for area in areas]
+    count_rows = await session.execute(
+        select(
+            ClaimAreaReaction.area_id,
+            func.coalesce(
+                func.sum(case((ClaimAreaReaction.value == CLAIM_AREA_REACTION_LIKE, 1), else_=0)),
+                0,
+            ).label("like_count"),
+            func.coalesce(
+                func.sum(case((ClaimAreaReaction.value == CLAIM_AREA_REACTION_DISLIKE, 1), else_=0)),
+                0,
+            ).label("dislike_count"),
+        )
+        .where(ClaimAreaReaction.area_id.in_(area_ids))
+        .group_by(ClaimAreaReaction.area_id)
+    )
+    counts = {
+        area_id: (int(like_count or 0), int(dislike_count or 0))
+        for area_id, like_count, dislike_count in count_rows.all()
+    }
+
+    viewer_contributor_area_ids = await _get_viewer_contributor_area_ids(session, viewer, set(area_ids))
+    viewer_reactions: dict[UUID, int] = {}
+    if viewer is not None:
+        viewer_rows = await session.execute(
+            select(ClaimAreaReaction.area_id, ClaimAreaReaction.value)
+            .where(
+                ClaimAreaReaction.area_id.in_(area_ids),
+                ClaimAreaReaction.user_id == viewer.id,
+            )
+        )
+        viewer_reactions = {
+            area_id: int(value)
+            for area_id, value in viewer_rows.all()
+        }
+
+    summaries: dict[UUID, ClaimAreaReactionSummary] = {}
+    for area in areas:
+        like_count, dislike_count = counts.get(area.id, (0, 0))
+        viewer_has_dislike_access = _viewer_has_area_access(area, viewer, viewer_contributor_area_ids)
+        viewer_reaction = _claim_area_reaction_label(viewer_reactions.get(area.id))
+        if not viewer_has_dislike_access:
+            dislike_count = 0
+
+        summaries[area.id] = ClaimAreaReactionSummary(
+            like_count=like_count,
+            dislike_count=dislike_count,
+            viewer_reaction=viewer_reaction,
+        )
+
+    return summaries
+
+
 def build_claim_area_preview(
     area: ClaimArea,
     owner: User,
@@ -599,6 +689,8 @@ def build_claim_area_preview(
     viewer_contributor_area_ids: set[UUID] | None = None,
     viewer_admin_area_ids: set[UUID] | None = None,
     bounds: ClaimAreaBounds | None = None,
+    reactions: ClaimAreaReactionSummary | None = None,
+    include_owner_avatar: bool = False,
 ) -> ClaimAreaPreview:
     resolved_viewer_contributor_area_ids = viewer_contributor_area_ids or set()
     resolved_viewer_admin_area_ids = viewer_admin_area_ids or set()
@@ -607,6 +699,11 @@ def build_claim_area_preview(
     )
     viewer_can_paint = area.status == CLAIM_AREA_STATUS_ACTIVE and (
         viewer_can_edit or area.id in resolved_viewer_contributor_area_ids
+    )
+    resolved_reactions = reactions or ClaimAreaReactionSummary(
+        like_count=0,
+        dislike_count=0,
+        viewer_reaction=None,
     )
 
     return ClaimAreaPreview(
@@ -619,11 +716,12 @@ def build_claim_area_preview(
             id=owner.id,
             public_id=owner.public_id,
             display_name=owner.display_name,
-            avatar_url=owner.avatar_url,
+            avatar_url=owner.avatar_url if include_owner_avatar else None,
         ),
         claimed_pixels_count=area.claimed_pixels_count,
         painted_pixels_count=area.painted_pixels_count,
         contributor_count=contributor_count,
+        reactions=resolved_reactions,
         viewer_can_edit=viewer_can_edit,
         viewer_can_paint=viewer_can_paint,
         created_at=area.created_at,
@@ -819,15 +917,19 @@ async def build_claim_area_summary(
             select(ClaimAreaOverlay).where(ClaimAreaOverlay.area_id == area.id)
         )
 
+    reaction_summaries = await _get_claim_area_reaction_summaries(session, [area], viewer)
+
     return ClaimAreaSummary(
         **build_claim_area_preview(
-            area,
-            owner,
-            len(contributor_records),
-            viewer,
-            viewer_contributor_area_ids,
-            viewer_admin_area_ids,
-            await _get_claim_area_bounds(session, area.id),
+            area=area,
+            owner=owner,
+            contributor_count=len(contributor_records),
+            viewer=viewer,
+            viewer_contributor_area_ids=viewer_contributor_area_ids,
+            viewer_admin_area_ids=viewer_admin_area_ids,
+            bounds=await _get_claim_area_bounds(session, area.id),
+            reactions=reaction_summaries.get(area.id),
+            include_owner_avatar=True,
         ).model_dump(),
         contributors=[
             AreaContributorSummary(
@@ -1095,16 +1197,16 @@ async def get_claim_context_pixels(
 
 def _build_claim_outline_segments(
     orientation: str,
-    edges_by_line: dict[tuple[str, int], list[tuple[int, int, str]]],
+    edges_by_line: dict[tuple[str, str, int], list[tuple[int, int, str, str]]],
 ) -> list[ClaimOutlineSegment]:
     segments: list[ClaimOutlineSegment] = []
 
-    for (status, line), edges in edges_by_line.items():
+    for (status, side, line), edges in edges_by_line.items():
         edges.sort(key=lambda edge: edge[0])
         current_start: int | None = None
         current_end: int | None = None
 
-        for start, end, _status in edges:
+        for start, end, _status, _side in edges:
             if current_start is not None and current_end == start:
                 current_end = end
                 continue
@@ -1117,6 +1219,7 @@ def _build_claim_outline_segments(
                         start=current_start,
                         end=current_end,
                         status=status,
+                        side=side,
                     )
                 )
 
@@ -1131,10 +1234,128 @@ def _build_claim_outline_segments(
                     start=current_start,
                     end=current_end,
                     status=status,
+                    side=side,
                 )
             )
 
     return segments
+
+
+async def _get_claim_area_list_outline_segments(
+    session: AsyncSession,
+    area_ids: list[UUID],
+) -> dict[UUID, list[ClaimOutlineSegment]]:
+    outlines: dict[UUID, list[ClaimOutlineSegment]] = {area_id: [] for area_id in area_ids}
+
+    if not area_ids:
+        return outlines
+
+    edge_queries = []
+    edge_specs = (
+        ("horizontal", "south", 0, -1, 0, 0),
+        ("horizontal", "north", 0, 1, 0, 1),
+        ("vertical", "west", -1, 0, 0, 0),
+        ("vertical", "east", 1, 0, 1, 0),
+    )
+
+    for orientation, side, neighbor_dx, neighbor_dy, line_offset_x, line_offset_y in edge_specs:
+        pixel = aliased(WorldPixel)
+        neighbor = aliased(WorldPixel)
+        neighbor_exists = (
+            select(neighbor.id)
+            .where(
+                neighbor.area_id == pixel.area_id,
+                neighbor.x == pixel.x + neighbor_dx,
+                neighbor.y == pixel.y + neighbor_dy,
+            )
+            .exists()
+        )
+        line_expression = pixel.y + line_offset_y if orientation == "horizontal" else pixel.x + line_offset_x
+        start_expression = pixel.x if orientation == "horizontal" else pixel.y
+
+        edge_queries.append(
+            select(
+                pixel.area_id.label("area_id"),
+                literal(orientation).label("orientation"),
+                literal(side).label("side"),
+                line_expression.label("line"),
+                start_expression.label("start"),
+                (start_expression + 1).label("end"),
+            )
+            .where(
+                pixel.area_id.in_(area_ids),
+                ~neighbor_exists,
+            )
+        )
+
+    edge_rows = union_all(*edge_queries).subquery()
+    ranked_edges = (
+        select(
+            edge_rows.c.area_id,
+            edge_rows.c.orientation,
+            edge_rows.c.side,
+            edge_rows.c.line,
+            edge_rows.c.start,
+            edge_rows.c.end,
+            func.row_number()
+            .over(
+                partition_by=edge_rows.c.area_id,
+                order_by=(edge_rows.c.orientation, edge_rows.c.side, edge_rows.c.line, edge_rows.c.start),
+            )
+            .label("edge_rank"),
+        )
+        .subquery()
+    )
+    rows = (
+        await session.execute(
+            select(
+                ranked_edges.c.area_id,
+                ranked_edges.c.orientation,
+                ranked_edges.c.side,
+                ranked_edges.c.line,
+                ranked_edges.c.start,
+                ranked_edges.c.end,
+                ranked_edges.c.edge_rank,
+            )
+            .where(ranked_edges.c.edge_rank <= MAX_CLAIM_AREA_LIST_OUTLINE_EDGES + 1)
+            .order_by(
+                ranked_edges.c.area_id,
+                ranked_edges.c.orientation,
+                ranked_edges.c.side,
+                ranked_edges.c.line,
+                ranked_edges.c.start,
+            )
+        )
+    ).all()
+
+    horizontal_edges_by_area: dict[UUID, dict[tuple[str, str, int], list[tuple[int, int, str, str]]]] = {}
+    vertical_edges_by_area: dict[UUID, dict[tuple[str, str, int], list[tuple[int, int, str, str]]]] = {}
+    truncated_area_ids: set[UUID] = set()
+
+    for area_id, orientation, side, line, start, end, edge_rank in rows:
+        if int(edge_rank) > MAX_CLAIM_AREA_LIST_OUTLINE_EDGES:
+            truncated_area_ids.add(area_id)
+            continue
+
+        if area_id in truncated_area_ids:
+            continue
+
+        status = "owner"
+        edge = (int(start), int(end), status, str(side))
+        edges_by_area = horizontal_edges_by_area if orientation == "horizontal" else vertical_edges_by_area
+        edges_by_line = edges_by_area.setdefault(area_id, {})
+        edges_by_line.setdefault((status, str(side), int(line)), []).append(edge)
+
+    for area_id in area_ids:
+        if area_id in truncated_area_ids:
+            continue
+
+        outlines[area_id] = [
+            *_build_claim_outline_segments("horizontal", horizontal_edges_by_area.get(area_id, {})),
+            *_build_claim_outline_segments("vertical", vertical_edges_by_area.get(area_id, {})),
+        ]
+
+    return outlines
 
 
 async def _get_focused_claim_outline_pixels(
@@ -1147,23 +1368,18 @@ async def _get_focused_claim_outline_pixels(
     area_id: UUID,
 ) -> ClaimOutlineWindow:
     contributor_area_ids = await _get_viewer_contributor_area_ids(session, viewer, {area_id})
-    horizontal_edges: dict[tuple[str, int], list[tuple[int, int, str]]] = {}
-    vertical_edges: dict[tuple[str, int], list[tuple[int, int, str]]] = {}
-    edge_count = 0
-    truncated = False
+    horizontal_edges: dict[tuple[str, str, int], list[tuple[int, int, str, str]]] = {}
+    vertical_edges: dict[tuple[str, str, int], list[tuple[int, int, str, str]]] = {}
 
     edge_specs = (
-        ("horizontal", 0, -1, 0, 0),
-        ("horizontal", 0, 1, 0, 1),
-        ("vertical", -1, 0, 0, 0),
-        ("vertical", 1, 0, 1, 0),
+        ("horizontal", "south", 0, -1, 0, 0),
+        ("horizontal", "north", 0, 1, 0, 1),
+        ("vertical", "west", -1, 0, 0, 0),
+        ("vertical", "east", 1, 0, 1, 0),
     )
+    edge_queries = []
 
-    for orientation, neighbor_dx, neighbor_dy, line_offset_x, line_offset_y in edge_specs:
-        if edge_count > MAX_CLAIM_OUTLINE_PIXELS:
-            truncated = True
-            break
-
+    for orientation, side, neighbor_dx, neighbor_dy, line_offset_x, line_offset_y in edge_specs:
         pixel = aliased(WorldPixel)
         neighbor = aliased(WorldPixel)
         neighbor_exists = (
@@ -1175,48 +1391,65 @@ async def _get_focused_claim_outline_pixels(
             )
             .exists()
         )
-        rows = (
-            await session.execute(
-                select(pixel.x, pixel.y, pixel.owner_user_id)
-                .where(
-                    pixel.area_id == area_id,
-                    pixel.x >= low_x,
-                    pixel.x <= high_x,
-                    pixel.y >= low_y,
-                    pixel.y <= high_y,
-                    ~neighbor_exists,
-                )
-                .order_by(pixel.y, pixel.x)
-                .limit(MAX_CLAIM_OUTLINE_PIXELS + 1 - edge_count)
+        line_expression = pixel.y + line_offset_y if orientation == "horizontal" else pixel.x + line_offset_x
+        start_expression = pixel.x if orientation == "horizontal" else pixel.y
+
+        edge_queries.append(
+            select(
+                literal(orientation).label("orientation"),
+                literal(side).label("side"),
+                line_expression.label("line"),
+                start_expression.label("start"),
+                (start_expression + 1).label("end"),
+                pixel.owner_user_id.label("owner_user_id"),
             )
-        ).all()
-
-        if edge_count + len(rows) > MAX_CLAIM_OUTLINE_PIXELS:
-            truncated = True
-            rows = rows[: MAX_CLAIM_OUTLINE_PIXELS - edge_count]
-
-        for x, y, owner_user_id in rows:
-            relation = _get_claim_viewer_relation(
-                owner_user_id,
-                area_id,
-                False,
-                viewer,
-                contributor_area_ids,
+            .where(
+                pixel.area_id == area_id,
+                pixel.x >= low_x,
+                pixel.x <= high_x,
+                pixel.y >= low_y,
+                pixel.y <= high_y,
+                ~neighbor_exists,
             )
-            status = relation if relation in {"owner", "contributor", "blocked", "starter"} else "blocked"
+        )
 
-            if orientation == "horizontal":
-                line = int(y) + line_offset_y
-                start = int(x)
-                end = start + 1
-                horizontal_edges.setdefault((status, line), []).append((start, end, status))
-            else:
-                line = int(x) + line_offset_x
-                start = int(y)
-                end = start + 1
-                vertical_edges.setdefault((status, line), []).append((start, end, status))
+    edge_rows = union_all(*edge_queries).subquery()
+    rows = (
+        await session.execute(
+            select(
+                edge_rows.c.orientation,
+                edge_rows.c.side,
+                edge_rows.c.line,
+                edge_rows.c.start,
+                edge_rows.c.end,
+                edge_rows.c.owner_user_id,
+            )
+            .order_by(
+                edge_rows.c.orientation,
+                edge_rows.c.side,
+                edge_rows.c.line,
+                edge_rows.c.start,
+            )
+            .limit(MAX_CLAIM_OUTLINE_PIXELS + 1)
+        )
+    ).all()
+    truncated = len(rows) > MAX_CLAIM_OUTLINE_PIXELS
 
-        edge_count += len(rows)
+    for orientation, side, line, start, end, owner_user_id in rows[:MAX_CLAIM_OUTLINE_PIXELS]:
+        relation = _get_claim_viewer_relation(
+            owner_user_id,
+            area_id,
+            False,
+            viewer,
+            contributor_area_ids,
+        )
+        status = relation if relation in {"owner", "contributor", "blocked", "starter"} else "blocked"
+        edge = (int(start), int(end), status, str(side))
+
+        if orientation == "horizontal":
+            horizontal_edges.setdefault((status, str(side), int(line)), []).append(edge)
+        else:
+            vertical_edges.setdefault((status, str(side), int(line)), []).append(edge)
 
     return ClaimOutlineWindow(
         min_x=low_x,
@@ -1331,17 +1564,18 @@ async def get_claim_outline_pixels(
             "status": status,
         }
 
-    horizontal_edges: dict[tuple[str, int], list[tuple[int, int, str]]] = {}
-    vertical_edges: dict[tuple[str, int], list[tuple[int, int, str]]] = {}
+    horizontal_edges: dict[tuple[str, str, int], list[tuple[int, int, str, str]]] = {}
+    vertical_edges: dict[tuple[str, str, int], list[tuple[int, int, str, str]]] = {}
 
     def add_edge(
-        target: dict[tuple[str, int], list[tuple[int, int, str]]],
+        target: dict[tuple[str, str, int], list[tuple[int, int, str, str]]],
         status: str,
+        side: str,
         line: int,
         start: int,
         end: int,
     ) -> None:
-        target.setdefault((status, line), []).append((start, end, status))
+        target.setdefault((status, side, line), []).append((start, end, status, side))
 
     for (x, y), state in outline_pixels.items():
         if x < low_x or x > high_x or y < low_y or y > high_y:
@@ -1350,66 +1584,24 @@ async def get_claim_outline_pixels(
         region_key = state["region_key"]
         status = str(state["status"])
         neighbors = (
-            ("horizontal", y, x, x + 1, outline_pixels.get((x, y - 1))),
-            ("horizontal", y + 1, x, x + 1, outline_pixels.get((x, y + 1))),
-            ("vertical", x, y, y + 1, outline_pixels.get((x - 1, y))),
-            ("vertical", x + 1, y, y + 1, outline_pixels.get((x + 1, y))),
+            ("horizontal", "south", y, x, x + 1, outline_pixels.get((x, y - 1))),
+            ("horizontal", "north", y + 1, x, x + 1, outline_pixels.get((x, y + 1))),
+            ("vertical", "west", x, y, y + 1, outline_pixels.get((x - 1, y))),
+            ("vertical", "east", x + 1, y, y + 1, outline_pixels.get((x + 1, y))),
         )
 
-        for orientation, line, start, end, neighbor in neighbors:
+        for orientation, side, line, start, end, neighbor in neighbors:
             if neighbor is not None and neighbor["region_key"] == region_key:
                 continue
 
             add_edge(
                 horizontal_edges if orientation == "horizontal" else vertical_edges,
                 status,
+                side,
                 line,
                 start,
                 end,
             )
-
-    def build_segments(
-        orientation: str,
-        edges_by_line: dict[tuple[str, int], list[tuple[int, int, str]]],
-    ) -> list[ClaimOutlineSegment]:
-        segments: list[ClaimOutlineSegment] = []
-
-        for (status, line), edges in edges_by_line.items():
-            edges.sort(key=lambda edge: edge[0])
-            current_start: int | None = None
-            current_end: int | None = None
-
-            for start, end, _status in edges:
-                if current_start is not None and current_end == start:
-                    current_end = end
-                    continue
-
-                if current_start is not None and current_end is not None:
-                    segments.append(
-                        ClaimOutlineSegment(
-                            orientation=orientation,
-                            line=line,
-                            start=current_start,
-                            end=current_end,
-                            status=status,
-                        )
-                    )
-
-                current_start = start
-                current_end = end
-
-            if current_start is not None and current_end is not None:
-                segments.append(
-                    ClaimOutlineSegment(
-                        orientation=orientation,
-                        line=line,
-                        start=current_start,
-                        end=current_end,
-                        status=status,
-                    )
-                )
-
-        return segments
 
     return ClaimOutlineWindow(
         min_x=low_x,
@@ -1418,8 +1610,8 @@ async def get_claim_outline_pixels(
         max_y=high_y,
         truncated=truncated,
         segments=[
-            *build_segments("horizontal", horizontal_edges),
-            *build_segments("vertical", vertical_edges),
+            *_build_claim_outline_segments("horizontal", horizontal_edges),
+            *_build_claim_outline_segments("vertical", vertical_edges),
         ],
     )
 
@@ -2012,6 +2204,71 @@ def _validate_connected_pixels(pixels: list[tuple[int, int]]) -> None:
 
     if len(visited) != len(pixel_set):
         raise PixelPlacementError("Claim batches must be one connected shape.", 422)
+
+
+def _claim_route_touches_pixel(
+    pixel: WorldPixel,
+    user: User,
+    claim_mode: str,
+    target_area_id: UUID | None,
+) -> bool:
+    if claim_mode == CLAIM_AREA_MODE_EXPAND:
+        return (
+            target_area_id is not None
+            and pixel.owner_user_id == user.id
+            and pixel.area_id == target_area_id
+        )
+
+    return pixel.is_starter or pixel.owner_user_id is not None
+
+
+def _validate_claim_components_touch_route(
+    pixels: list[tuple[int, int]],
+    adjacent_pixels: list[WorldPixel],
+    user: User,
+    claim_mode: str,
+    target_area_id: UUID | None,
+) -> None:
+    pixel_set = set(pixels)
+    unvisited = set(pixels)
+    adjacent_pixel_map = {(pixel.x, pixel.y): pixel for pixel in adjacent_pixels}
+
+    while unvisited:
+        start = next(iter(unvisited))
+        stack = [start]
+        component_touches_route = False
+
+        while stack:
+            x, y = stack.pop()
+
+            if (x, y) not in unvisited:
+                continue
+
+            unvisited.remove((x, y))
+
+            for neighbor in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if neighbor in pixel_set:
+                    if neighbor in unvisited:
+                        stack.append(neighbor)
+                    continue
+
+                adjacent_pixel = adjacent_pixel_map.get(neighbor)
+                if adjacent_pixel is not None and _claim_route_touches_pixel(
+                    adjacent_pixel,
+                    user,
+                    claim_mode,
+                    target_area_id,
+                ):
+                    component_touches_route = True
+
+        if not component_touches_route:
+            if claim_mode == CLAIM_AREA_MODE_EXPAND:
+                raise PixelPlacementError("Extend mode must touch the selected area.", 422)
+
+            raise PixelPlacementError(
+                "Claims must touch an existing claimed pixel or the starter frontier.",
+                422,
+            )
 
 
 def _get_neighbor_coordinates(pixels: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -2612,6 +2869,12 @@ async def get_visible_claim_area_previews(
         .where(ClaimArea.id.in_(area_ids))
         .order_by(ClaimArea.last_activity_at.desc(), ClaimArea.created_at.desc())
     )
+    area_rows = rows.all()
+    reaction_summaries = await _get_claim_area_reaction_summaries(
+        session,
+        [area for area, _owner in area_rows],
+        viewer,
+    )
 
     return ClaimAreaPreviewWindow(
         min_x=min_x,
@@ -2626,8 +2889,9 @@ async def get_visible_claim_area_previews(
                 viewer,
                 viewer_contributor_area_ids,
                 viewer_admin_area_ids,
+                reactions=reaction_summaries.get(area.id),
             )
-            for area, owner in rows.all()
+            for area, owner in area_rows
         ],
     )
 
@@ -2635,6 +2899,7 @@ async def get_visible_claim_area_previews(
 async def list_owned_claim_areas(
     session: AsyncSession,
     user: User,
+    include_outlines: bool = False,
 ) -> ClaimAreaListResponse:
     owned_area_ids = set(
         (
@@ -2705,9 +2970,22 @@ async def list_owned_claim_areas(
         .where(ClaimArea.id.in_(visible_area_id_list))
         .order_by(ClaimArea.last_activity_at.desc(), ClaimArea.created_at.desc())
     )
+    area_rows = rows.all()
+    reaction_summaries = await _get_claim_area_reaction_summaries(
+        session,
+        [row[0] for row in area_rows],
+        user,
+    )
+    outline_segments_by_area = {row[0].id: [] for row in area_rows}
+
+    if include_outlines:
+        outline_segments_by_area = await _get_claim_area_list_outline_segments(
+            session,
+            [row[0].id for row in area_rows],
+        )
     areas: list[ClaimAreaListItem] = []
 
-    for area, owner, min_x, max_x, min_y, max_y, contributor_count in rows.all():
+    for area, owner, min_x, max_x, min_y, max_y, contributor_count in area_rows:
         resolved_min_x = int(min_x)
         resolved_max_x = int(max_x)
         resolved_min_y = int(min_y)
@@ -2730,11 +3008,12 @@ async def list_owned_claim_areas(
                     id=owner.id,
                     public_id=owner.public_id,
                     display_name=owner.display_name,
-                    avatar_url=owner.avatar_url,
+                    avatar_url=None,
                 ),
                 claimed_pixels_count=area.claimed_pixels_count,
                 painted_pixels_count=area.painted_pixels_count,
                 contributor_count=int(contributor_count or 0),
+                reactions=reaction_summaries.get(area.id) or ClaimAreaReactionSummary(),
                 viewer_can_edit=viewer_can_edit,
                 viewer_can_paint=viewer_can_paint,
                 bounds=ClaimAreaBounds(
@@ -2747,6 +3026,7 @@ async def list_owned_claim_areas(
                     center_x=resolved_min_x + width / 2,
                     center_y=resolved_min_y + height / 2,
                 ),
+                outline_segments=outline_segments_by_area.get(area.id, []),
                 created_at=area.created_at,
                 updated_at=area.updated_at,
                 last_activity_at=area.last_activity_at,
@@ -2869,6 +3149,56 @@ async def update_claim_area_metadata(
         area=await build_claim_area_summary(session, area, owner, user),
         claim_tiles=claim_tiles,
     )
+
+
+async def update_claim_area_reaction(
+    session: AsyncSession,
+    area_id: UUID,
+    user: User,
+    reaction: ClaimAreaReactionValue | None,
+) -> ClaimAreaSummary:
+    row = await session.execute(
+        select(ClaimArea, User)
+        .join(User, User.id == ClaimArea.owner_user_id)
+        .where(ClaimArea.id == area_id)
+    )
+    result = row.first()
+
+    if result is None:
+        raise PixelPlacementError("Area not found.", 404)
+
+    area, owner = result
+
+    if reaction is None:
+        await session.execute(
+            delete(ClaimAreaReaction).where(
+                ClaimAreaReaction.area_id == area.id,
+                ClaimAreaReaction.user_id == user.id,
+            )
+        )
+    else:
+        reaction_value = _claim_area_reaction_value(reaction)
+        existing = await session.scalar(
+            select(ClaimAreaReaction).where(
+                ClaimAreaReaction.area_id == area.id,
+                ClaimAreaReaction.user_id == user.id,
+            )
+        )
+
+        if existing is None:
+            session.add(
+                ClaimAreaReaction(
+                    area_id=area.id,
+                    user_id=user.id,
+                    value=reaction_value,
+                )
+            )
+        elif existing.value != reaction_value:
+            existing.value = reaction_value
+
+    await session.commit()
+    await session.refresh(area)
+    return await build_claim_area_summary(session, area, owner, user)
 
 
 async def invite_area_contributor(
@@ -3048,20 +3378,44 @@ async def claim_world_pixels(
 ) -> PixelBatchClaimResponse:
     resolved_settings = settings or get_settings()
     now = datetime.now(timezone.utc)
-    normalized_pixels = _normalize_batch_pixels(pixels, rectangles)
+    requested_pixels = _normalize_batch_pixels(pixels, rectangles)
+    explicit_pixels = set(_normalize_batch_pixels(pixels, None)) if pixels else set()
+    has_rectangle_input = bool(rectangles)
 
     if overlay is not None and claim_mode != CLAIM_AREA_MODE_NEW:
         raise PixelPlacementError("Overlay claims must create a new area.", 422)
 
-    _validate_connected_pixels(normalized_pixels)
     active_chunk_coordinates = await _get_active_world_chunk_coordinates(session)
-    _validate_pixels_inside_active_world(normalized_pixels, active_chunk_coordinates, resolved_settings)
+    _validate_pixels_inside_active_world(requested_pixels, active_chunk_coordinates, resolved_settings)
+
+    existing_requested_pixels = await _get_existing_pixels_at(session, requested_pixels)
+    existing_requested_coordinates = {
+        (pixel.x, pixel.y)
+        for pixel in existing_requested_pixels
+    }
+
+    if explicit_pixels & existing_requested_coordinates:
+        raise PixelPlacementError("This claim includes territory that is already claimed.", 409)
+
+    normalized_pixels = (
+        [
+            pixel
+            for pixel in requested_pixels
+            if pixel not in existing_requested_coordinates
+        ]
+        if has_rectangle_input
+        else requested_pixels
+    )
+
+    if not normalized_pixels:
+        raise PixelPlacementError("No unclaimed claim pixels were submitted.", 422)
+
     normalized_overlay_pixels: list[dict[str, int]] | None = None
 
     if overlay is not None:
         normalized_overlay_pixels = _normalize_claim_area_overlay_payload(overlay, normalized_pixels)
 
-    if await _has_existing_pixels_at(session, normalized_pixels):
+    if not has_rectangle_input and existing_requested_coordinates:
         raise PixelPlacementError("This claim includes territory that is already claimed.", 409)
 
     adjacent_pixels = await _get_adjacent_claim_pixels(session, normalized_pixels)
@@ -3072,6 +3426,17 @@ async def claim_world_pixels(
             "Claims must touch an existing claimed pixel or the starter frontier.",
             422,
         )
+
+    if has_rectangle_input:
+        _validate_claim_components_touch_route(
+            normalized_pixels,
+            adjacent_pixels,
+            user,
+            claim_mode,
+            target_area_id,
+        )
+    else:
+        _validate_connected_pixels(normalized_pixels)
 
     try:
         await spend_holders(session, user, len(normalized_pixels), resolved_settings, now)
@@ -3241,9 +3606,13 @@ async def paint_world_pixels(
     )
     chunk_painted_deltas: dict[tuple[int, int], int] = {}
     pixel_updates: list[tuple[int, int, int | None]] = []
+    rewarded_pixel_count = 0
 
     for pixel, previous_color_id, next_color_id in changes:
         pixel_updates.append((pixel.x, pixel.y, next_color_id))
+
+        if next_color_id is not None:
+            rewarded_pixel_count += 1
 
         if pixel.area_id is None:
             continue
@@ -3267,6 +3636,7 @@ async def paint_world_pixels(
 
     await _bulk_update_world_pixel_colors(session, pixel_updates, now)
     await _apply_world_chunk_painted_deltas(session, chunk_painted_deltas)
+    grant_pixel_placement_rewards(user, rewarded_pixel_count, resolved_settings)
     await session.commit()
     await sync_world_growth(session, resolved_settings)
 
@@ -3356,6 +3726,7 @@ async def paint_world_pixel(
         area.last_activity_at = now
         await _apply_world_chunk_painted_deltas(session, {(pixel.chunk_x, pixel.chunk_y): chunk_delta})
 
+    grant_pixel_placement_rewards(user, 1 if normalized_color_id is not None else 0, resolved_settings)
     await session.commit()
     await sync_world_growth(session, resolved_settings)
 

@@ -134,6 +134,7 @@ class ClaimOutlineSegment(BaseModel):
     start: int
     end: int
     status: str
+    side: str | None = None
 
 
 class ClaimOutlineWindow(BaseModel):
@@ -264,6 +265,15 @@ class ClaimAreaBounds(BaseModel):
     center_y: float
 
 
+ClaimAreaReactionValue = Literal["like", "dislike"]
+
+
+class ClaimAreaReactionSummary(BaseModel):
+    like_count: int = 0
+    dislike_count: int = 0
+    viewer_reaction: ClaimAreaReactionValue | None = None
+
+
 class ClaimAreaPreview(BaseModel):
     id: UUID
     public_id: int
@@ -274,6 +284,7 @@ class ClaimAreaPreview(BaseModel):
     claimed_pixels_count: int
     painted_pixels_count: int
     contributor_count: int
+    reactions: ClaimAreaReactionSummary = Field(default_factory=ClaimAreaReactionSummary)
     viewer_can_edit: bool
     viewer_can_paint: bool
     created_at: datetime
@@ -310,9 +321,11 @@ class ClaimAreaListItem(BaseModel):
     claimed_pixels_count: int
     painted_pixels_count: int
     contributor_count: int
+    reactions: ClaimAreaReactionSummary = Field(default_factory=ClaimAreaReactionSummary)
     viewer_can_edit: bool
     viewer_can_paint: bool
     bounds: ClaimAreaBounds
+    outline_segments: list[ClaimOutlineSegment] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
     last_activity_at: datetime
@@ -340,6 +353,10 @@ class ClaimAreaUpdateRequest(BaseModel):
     name: str | None = None
     description: str | None = None
     status: ClaimAreaStatus | None = None
+
+
+class ClaimAreaReactionRequest(BaseModel):
+    reaction: ClaimAreaReactionValue | None = None
 
 
 class AreaContributorInviteRequest(BaseModel):
